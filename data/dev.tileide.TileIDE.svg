@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- The TileIDE canvas in miniature: rail with launcher and workspace pill, three tiles. -->
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#0E1013"/>
+  <circle cx="22" cy="26" r="6" fill="#4FD1D9"/>
+  <rect x="19" y="40" width="6" height="18" rx="3" fill="#4FD1D9"/>
+  <circle cx="22" cy="68" r="2.5" fill="#9AA1AD"/>
+  <rect x="38" y="16" width="40" height="96" rx="9" fill="#1B1F26" stroke="#4FD1D9" stroke-width="3"/>
+  <rect x="84" y="16" width="28" height="45" rx="9" fill="#1B1F26"/>
+  <rect x="84" y="67" width="28" height="45" rx="9" fill="#1B1F26"/>
+  <path d="M47 34h20M47 44h14M53 54h16M47 64h10" stroke="#E6E8EC" stroke-width="4" stroke-linecap="round"/>
+</svg>

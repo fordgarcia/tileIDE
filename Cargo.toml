@@ -1,0 +1,21 @@
+[package]
+name = "tileide"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A tiling, riceable code editor for Hyprland (v0.0 preview)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/fordgarcia/tileIDE"
+readme = "README.md"
+publish = false
+
+[dependencies]
+gtk4 = { version = "0.11.5", features = ["v4_12"] }
+sourceview5 = "0.11.2"
+vte4 = "0.10.0"
+pangocairo = "0.22.9"
+# Same version gtk4 uses; only adds PNG export for the offscreen `render` command.
+cairo-rs = { version = "0.22.9", features = ["png"] }
+
+[profile.release]
+strip = true

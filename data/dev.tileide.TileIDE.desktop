@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=TileIDE
+GenericName=Code Editor
+Comment=A tiling, riceable code editor
+Exec=tileide %f
+Icon=dev.tileide.TileIDE
+Terminal=false
+Categories=Development;IDE;TextEditor;
+Keywords=editor;ide;code;tiling;hyprland;
+StartupWMClass=dev.tileide.TileIDE
+Actions=windowed;
+
+[Desktop Action windowed]
+Name=Open Windowed
+Exec=tileide --windowed
