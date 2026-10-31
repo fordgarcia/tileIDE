@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" width="800" height="200" role="img" aria-labelledby="t d">
+  <title id="t">Running pixel dino</title>
+  <desc id="d">A pixel-art dinosaur runs along the ground and jumps over cacti, with clouds drifting by.</desc>
+  <style>
+    :root { --bg: #f4efe6; --fg: #3b3630; --soft: #cfc6b8; --accent: #c8553d; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #1f1d1a; --fg: #e9e2d4; --soft: #4a453d; --accent: #e8895f; }
+    }
+    .bg { fill: var(--bg); }
+    .fg { fill: var(--fg); }
+    .soft { fill: var(--soft); }
+    .accent { fill: var(--accent); }
+    .groundline { stroke: var(--fg); stroke-width: 3; }
+    .dashes { stroke: var(--soft); stroke-width: 3; fill: none;
+              stroke-dasharray: 30 50 10 70; animation: ground 0.711s linear infinite; }
+
+    .jump   { animation: jump 4s linear infinite; }
+    .cactus { animation: run 4s linear infinite; }
+    .cloud1 { animation: drift 16s linear infinite; animation-delay: -3s; }
+    .cloud2 { animation: drift 16s linear infinite; animation-delay: -11s; }
+    .frameA { animation: flipA 0.3s step-end infinite; }
+    .frameB { opacity: 0; animation: flipB 0.3s step-end infinite; }
+
+    /* ground speed 160px / 0.711s = cactus speed 900px / 4s = 225 px/s */
+    @keyframes run    { from { transform: translateX(0); } to { transform: translateX(-900px); } }
+    @keyframes drift  { from { transform: translateX(0); } to { transform: translateX(-950px); } }
+    @keyframes ground { to { stroke-dashoffset: -160; } }
+    @keyframes flipA  { 0% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 0; } }
+    @keyframes flipB  { 0% { opacity: 0; } 50% { opacity: 1; } 100% { opacity: 1; } }
+    @keyframes jump {
+      0%, 66% { transform: translateY(0); animation-timing-function: ease-out; }
+      72%     { transform: translateY(-56px); animation-timing-function: ease-out; }
+      80%     { transform: translateY(-64px); animation-timing-function: ease-in; }
+      88%     { transform: translateY(-56px); animation-timing-function: ease-in; }
+      94%, 100% { transform: translateY(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .jump, .cactus, .cloud1, .cloud2, .frameA, .frameB, .dashes { animation: none; }
+    }
+  </style>
+
+  <rect class="bg" width="800" height="200" rx="12"/>
+
+  <g class="cloud1"><g class="soft" transform="translate(850,40)"><rect x="30" y="0" width="20" height="5"/><rect x="10" y="5" width="50" height="5"/><rect x="65" y="5" width="10" height="5"/><rect x="0" y="10" width="80" height="5"/><rect x="5" y="15" width="70" height="5"/></g></g>
+  <g class="cloud2"><g class="soft" transform="translate(850,75)"><rect x="30" y="0" width="20" height="5"/><rect x="10" y="5" width="50" height="5"/><rect x="65" y="5" width="10" height="5"/><rect x="0" y="10" width="80" height="5"/><rect x="5" y="15" width="70" height="5"/></g></g>
+
+  <line class="groundline" x1="0" y1="150" x2="800" y2="150"/>
+  <line class="dashes" x1="0" y1="162" x2="800" y2="162"/>
+
+  <g class="cactus"><g class="fg" transform="translate(830,110)"><rect x="15" y="0" width="10" height="5"/><rect x="15" y="5" width="10" height="5"/><rect x="5" y="10" width="5" height="5"/><rect x="15" y="10" width="10" height="5"/><rect x="30" y="10" width="5" height="5"/><rect x="5" y="15" width="5" height="5"/><rect x="15" y="15" width="10" height="5"/><rect x="30" y="15" width="5" height="5"/><rect x="5" y="20" width="30" height="5"/><rect x="15" y="25" width="10" height="5"/><rect x="15" y="30" width="10" height="5"/><rect x="15" y="35" width="10" height="5"/></g></g>
+
+  <g class="jump">
+    <g class="fg" transform="translate(60,80)">
+      <rect x="50" y="0" width="30" height="5"/><rect x="50" y="5" width="10" height="5"/><rect x="65" y="5" width="20" height="5"/><rect x="50" y="10" width="35" height="5"/><rect x="50" y="15" width="35" height="5"/><rect x="50" y="20" width="20" height="5"/><rect x="0" y="25" width="5" height="5"/><rect x="45" y="25" width="25" height="5"/><rect x="0" y="30" width="10" height="5"/><rect x="40" y="30" width="30" height="5"/><rect x="75" y="30" width="5" height="5"/><rect x="0" y="35" width="15" height="5"/><rect x="35" y="35" width="35" height="5"/><rect x="75" y="35" width="5" height="5"/><rect x="5" y="40" width="50" height="5"/><rect x="10" y="45" width="45" height="5"/><rect x="15" y="50" width="35" height="5"/>
+      <g class="accent"><g transform="translate(0,20)"><rect x="50" y="0" width="20" height="5"/></g></g>
+      <g class="frameA"><g transform="translate(0,55)"><rect x="20" y="0" width="10" height="5"/><rect x="40" y="0" width="10" height="5"/><rect x="20" y="5" width="10" height="5"/><rect x="40" y="5" width="5" height="5"/><rect x="20" y="10" width="15" height="5"/></g><g class="accent"><g transform="translate(0,20)"><rect x="35" y="0" width="15" height="5"/></g></g></g>
+      <g class="frameB"><g transform="translate(0,55)"><rect x="20" y="0" width="10" height="5"/><rect x="40" y="0" width="10" height="5"/><rect x="20" y="5" width="5" height="5"/><rect x="40" y="5" width="10" height="5"/><rect x="40" y="10" width="15" height="5"/></g><g class="accent"><g transform="translate(0,15)"><rect x="35" y="0" width="15" height="5"/></g></g></g>
+    </g>
+  </g>
+</svg>
