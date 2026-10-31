@@ -1,0 +1,22 @@
+[package]
+name = "tileide-lua-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "v0.0 spike 2: embedded, sandboxed Lua config. Throwaway; deleted after Gate 1."
+
+# Exactly one Lua flavour per build, e.g.
+#   cargo build --no-default-features --features luau
+[features]
+default = ["lua54"]
+lua54 = ["mlua/lua54"]
+lua55 = ["mlua/lua55"]
+luajit = ["mlua/luajit"]
+luau = ["mlua/luau"]
+
+[dependencies]
+mlua = { version = "0.12.2", features = ["vendored"] }
+notify = "8"
+
+[profile.release]
+strip = true

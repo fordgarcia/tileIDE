@@ -1,14 +1,14 @@
-# DESIGN.md — Veil IDE (working title)
+# DESIGN.md — TileIDE
 
-> Companion to `project_context.md` (features) and `versions/` (what ships when). This file is the **brief and rulebook for Claude Design**. Nothing is built from it until **you approve** each stage (§10).
+> Companion to `../project_context.md` (features) and `../versions/` (what ships when). This file is the **brief and rulebook for Claude Design**. Nothing is built from it until **you approve** each stage (§10).
 > **Status:** Draft 1 · 2026-10-31 · Linux, Hyprland-first, dark-first.
-> **Always attach with this file:** `assets/annotated_layout.png`.
+> **Always attach with this file:** `annotated_layout.png`.
 
 ---
 
 ## 1. How to use this file
 
-1. Attach this file **and** `assets/annotated_layout.png` when starting a design session.
+1. Attach this file **and** `annotated_layout.png` when starting a design session.
 2. Claude works in the **stages in §10**, in order, and stops at the end of every stage for your verdict.
 3. Approved decisions are written into the **Design System** artifact (tokens, components). Later screens may use only those tokens.
 4. Rejected directions go in §13 so they are never proposed again.
@@ -17,20 +17,20 @@
 
 ## 2. Reference image and what it means
 
-![annotated layout](assets/annotated_layout.png)
+![annotated layout](annotated_layout.png)
 
 The image is your Zen Browser on Hyprland with Caelestia's bar, annotated. **Region numbers below are the vocabulary for every design conversation.**
 
-| # | Region in the image | Becomes in Veil | Design rule |
+| # | Region in the image | Becomes in TileIDE | Design rule |
 |---|---|---|---|
-| **0** | Canvas | **The whole screen is Veil's surface** (dashed white border in the image) | Everything inside is designed by us; transparent where nothing is drawn |
+| **0** | Canvas | **The whole screen is TileIDE's surface** (dashed white border in the image) | Everything inside is designed by us; transparent where nothing is drawn |
 | **1** | Caelestia bar (≈ 50px wide at 1920×1080) | **Sidebar.** Collapsed = looks like this bar. Expandable. | Collapsed state must be recognisably Caelestia's bar. |
 | 1a | Launcher / logo | Sidebar toggle | Top of rail |
-| 1b | Workspace indicators | Veil workspaces 1–9 | Active workspace clearly distinct; Hyprland-style dots/pills |
+| 1b | Workspace indicators | TileIDE workspaces 1–9 | Active workspace clearly distinct; Hyprland-style dots/pills |
 | 1c | Vertical rotated label | Active workspace / project name | Rotated text, as in the image |
 | 1d / 1e | Clock/date, system data | **Read-only data modules.** No buttons. Each toggleable in config. | Design as small text/glyph readouts, not icon buttons |
 | ~~1f~~ | Power button | **Removed** | Do not design power, wifi or bluetooth buttons anywhere in the rail |
-| **2** | Gap ring around the window | **Owned by Veil on all four sides.** | Wallpaper visible through it |
+| **2** | Gap ring around the window | **Owned by TileIDE on all four sides.** | Wallpaper visible through it |
 | 2a | Left gap, rail ⇄ window (≈ 24px) | Token `gap.rail` | Measured from the screenshot |
 | 2b | Outer gap, top / right / bottom (≈ 30px) | Token `gap.outer` | Measured from the screenshot |
 | **3** | Window outline: 1px cyan/teal | Same | Accent at low alpha; brighter when focused |
@@ -39,7 +39,7 @@ The image is your Zen Browser on Hyprland with Caelestia's bar, annotated. **Reg
 | 4b | **Background layer** | User-changeable: see-through (default), desktop, image, gradient, solid, per-workspace | Visible in every gap, margin and behind translucent tiles. See §4.6 |
 | **5** | Blurred desktop wallpaper | Compositor blur | Mockups simulate it (§4.2) |
 
-**The whole image is Veil's canvas.** Rail, gap ring and window are all part of the IDE's design; the only thing that isn't ours is the wallpaper behind it.
+**The whole image is TileIDE's canvas.** Rail, gap ring and window are all part of the IDE's design; the only thing that isn't ours is the wallpaper behind it.
 
 Observed in the screenshot (facts, not interpretation): single window floating over a blurred wallpaper; dark translucent surface; a 1px cyan outline; a narrow vertical bar outside the window; almost no chrome (no title bar, no menu bar, no toolbar clutter); soft rounding on the content panel.
 
@@ -65,7 +65,8 @@ Terminology (use exactly these words in designs and code):
 - **Window**: the outlined, translucent rectangle (region 3).
 - **Code region**: the inside of the window (region 4), made of the **tiles layer** (4a) over the **background layer** (4b).
 - **Tile**: one pane inside the code region.
-- **Fillet (`f`)**: a **concave** curve where two shapes merge so the outline flows from one into the next. **Used only between rail and drawer.**
+- **Frame** (decided 2026-10-31, reference `caelestia-reference.png`): the rail plus a thin solid border along the top, right and bottom canvas edges, drawn as **one shape**: the canvas minus a rounded hole. The rail is the frame's wide left side; the **drawer is the rail widening**, and the hole's rounded corners move with it. This replaces the earlier separate rail-and-drawer fillet design.
+- **Fillet (`f`)**: a **concave** curve where two shapes merge. In the frame model, the hole's rounded corners *are* the fillets.
 - **Radius (`r`)**: convex rounding.
 - **Gaps**: four distinct ones: `gap.rail` (2a), `gap.outer` (2b), `gap.tile.in`, `gap.tile.out` (§4.1 table). Don't conflate them.
 
@@ -90,13 +91,14 @@ Terminology (use exactly these words in designs and code):
 | `rail.width` | 50px | measured from the screenshot |
 | `drawer.width` | 280px | Zen's sidebar was ~272px; tune in Stage 2 |
 | `gap.rail` (2a) | 24px | measured; between rail/drawer and window |
-| `gap.outer` (2b) | 30px | measured; window to screen edge on top, right and bottom |
+| `frame.border` | 10px | border on the top, right and bottom canvas edges (Caelestia reference) |
+| `frame.radius` | 25px | rounded corners of the frame's inner edge (Caelestia reference) |
+| `frame.opacity` | 0.95 | the frame is near-solid, like Caelestia's |
+| `gap.outer` (2b) | 20px | frame's inner edge to the window on top, right and bottom (was 30px from the screen edge before the frame existed) |
 | `gap.tile.in` | 8px | between tiles |
 | `gap.tile.out` | 12px | tiles to window edge |
 | `outline.width` | 1px | accent ≈ 35% alpha; brighter on focus |
 | `window.radius` | 20px | outer corners |
-| `rail.radius` | 20px | rail outer corners (the rail is a pill in the image) |
-| `drawer.fillet` | 20px | concave join rail ⇄ drawer |
 | `tile.radius` | 10px | **smaller than window radius**: nested shapes need smaller radii |
 | `region.padding` | 12px | inside the drawer |
 | `background.mode` | see-through | see-through / desktop / image / gradient / solid |
@@ -116,7 +118,7 @@ Terminology (use exactly these words in designs and code):
 | L3 | **Editor tile surface** | 88–96% (most opaque) |
 | L4 | Floating (palette, menus, tooltips) | 92–98% |
 
-Mockups **simulate** blur with a wallpaper image + `backdrop-filter`. The real app gets blur from the compositor (T3 in `project_context.md`). Every screen also ships a **solid fallback** variant.
+Mockups **simulate** blur with a wallpaper image + `backdrop-filter`. The real app gets blur from the compositor (T3 in `../project_context.md`). Every screen also ships a **solid fallback** variant.
 
 ### 4.3 Colour
 
@@ -140,7 +142,7 @@ Semantic tokens to define in Stage 1: `success`, `warning`, `error`, `info`, `se
 ### 4.4 Typography
 
 - **Editor:** monospace for code legibility and ligatures. Claude proposes **2 candidates** with real code samples; you choose.
-- **UI:** one humanist/neutral sans, 12–13px base. Claude proposes **2 candidates**, not the reflex family.
+- **UI: Space Grotesk** (decided 2026-10-31), 12–13px base. Code stays monospace.
 - **Scale:** 11 / 12 / 13 / 14 / 16 / 20. Sentence case; no ALL-CAPS labels by default.
 - Line height: editor 1.5, UI 1.35.
 - **Vertical label (1c):** rotated text is a deliberate Caelestia trait; choose weight/tracking so it stays legible at small size.
@@ -153,6 +155,7 @@ Two modes, both tokens: **Compact** (default, 24px rows) and **Comfortable** (28
 ### 4.6 Background layer (region 4b) design rules
 
 - It is a **layer**, not a wallpaper. It lives between the desktop and the tiles and is shown through **gaps, margins and translucent tiles**.
+- **Windowed mode has no app background** (transparent, blends with the user's desktop). **Full-screen mode** draws the chosen background across the whole canvas (`../project_context.md` §4.4). Mockups of S1 need both.
 - Default is **see-through**: the compositor's blurred desktop wallpaper, as in the reference screenshot.
 - App-drawn modes (image, gradient, solid) must work **without compositor blur**; they are also the solid fallback (§4.2).
 - Every custom background ships with **dim, tint and tile-opacity controls** and a visible **legibility warning**.
@@ -171,7 +174,7 @@ Two modes, both tokens: **Compact** (default, 24px rows) and **Comfortable** (28
 | S1f | **Background picker** (inside Themes) | Choose and preview the background layer | Modes as swatches; sliders for dim/blur/tint/tile opacity; legibility warning; per-workspace toggle |
 | S1e | **Sidebar expanded: Config → Config workspace** | Edit the app's config | Code region shows config files with live preview and inline errors |
 | S2 | **Command palette** | Do anything | Also file switcher; L4 floating |
-| S3 | **Workspace overview** | `Super+N` navigation | Grid of workspaces 1–9, must feel like Hyprland's overview |
+| S3 | **Workspace overview** | `Mod+N` (TileIDE modifier) navigation | Grid of workspaces 1–9, must feel like Hyprland's overview |
 | S5 | **Weight meter** | Keep it light | Per-extension startup/RAM/CPU, suspend |
 | S7 | **Run / Debug** | F5 workflows | Variables, call stack, output as **tiles** |
 | S8 | **Toolchain manager** | Compilers/runtimes | Detected, pin per workspace, friendly "missing" state |
@@ -264,7 +267,7 @@ On a **Design** canvas, using the same content skeleton, show **three** expansio
 - **B. Push drawer:** the drawer grows, the window shrinks, `gap.rail` stays 24px; tiles reflow.
 - **C. Push, gap collapses:** the drawer merges with the window (Caelestia-style full merge) while expanded; the gap returns on collapse.
 - For each: one thing it does better and one worse, then ask me one question to choose.
-- ✅ Gate: pick A, B, C or a mix; tune `rail.width`, `drawer.width`, `gap.rail`, `drawer.fillet`.
+- ✅ Gate: pick A, B, C or a mix; tune `rail.width`, `drawer.width`, `gap.rail`, `frame.border`, `frame.radius`.
 
 ### Stage 3: Main window, collapsed (S1)
 - Real Python file, terminal tile, three tiles total; **blur-simulated** and **solid fallback**; two wallpapers (bright and dark).
@@ -296,7 +299,7 @@ On a **Design** canvas, using the same content skeleton, show **three** expansio
 
 ## 11. Prompt templates (copy/paste)
 
-**Start:** "Read `design.md` and `project_context.md`, and look at `assets/annotated_layout.png`. Do Stage 0 only. Tell me what you understood using the region numbers, what you're unsure about, and what you'd need to look up. Don't design anything yet."
+**Start:** "Read `project_contexts/design/design.md` and `project_contexts/project_context.md`, and look at `project_contexts/design/annotated_layout.png`. Do Stage 0 only. Tell me what you understood using the region numbers, what you're unsure about, and what you'd need to look up. Don't design anything yet."
 
 **Stage 2:** "Do Stage 2 only. Build options A/B/C for the rail ⇄ drawer behaviour on one Design canvas, same content, four states each. For each, one thing it does better and one worse. Then ask me one question that would help me choose."
 
@@ -328,10 +331,10 @@ _(empty; Claude appends rejected directions with a one-line reason)_
 
 1. Collapsed rail: copy Caelestia's modules exactly, or only the *shape and spacing*?
 2. Does the expanded drawer push or overlay (Stage 2 decides), and does it keep the 24px gap?
-3. Does each tile have a title strip/tab, or is tile = buffer with no chrome (Q5 in `project_context.md`)?
+3. Does each tile have a title strip/tab, or is tile = buffer with no chrome (Q5 in `../project_context.md`)?
 4. Which read-only data belongs in 1e (network, bluetooth, battery, CPU/RAM), and is each text, a glyph or a tiny graph?
 5. Light theme: required, or optional? (Translucent light themes are hard to keep legible.)
 6. Gap ring: one value for 2a and 2b, or two? Should `gap.outer` be allowed to go to 0 (flush window)?
-7. Background: should the custom picture also run behind the rail and gap (one continuous picture) or stay inside the window only?
+7. ~~Background scope~~ **Decided:** full-screen = one continuous app background behind rail, gap and tiles; windowed = no app background (`../project_context.md` §4.4).
 8. Which background modes ship first? (Suggested: see-through, image, solid.)
 9. What is the one moment a rice user would screenshot and post? That becomes the single boldest element.
