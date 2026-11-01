@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.4.0-alpha.4 (2026-11-01): notebooks, debugging, toolchains
+
+### Added
+- **Jupyter notebooks:** `.ipynb` files open as a notebook tile: Markdown and code cells, each with its outputs underneath (text, results, errors with tracebacks, images such as plots). `Shift+Enter` runs a cell and moves on, `Ctrl+Enter` runs it in place, `Alt+R` (or *Run all*) runs every cell; *Interrupt*, *Restart*, *+ Code*, *+ Text*, and per cell: run, move up/down, code ⇄ text, delete. The kernel starts on the first run, using your Jupyter (the workspace's `.venv` first, then `python3`). `Ctrl+S` saves valid nbformat 4 that opens in Jupyter and VS Code; unknown fields are kept.
+- **Debugging:** `F9` sets a breakpoint (a dot in the gutter), `F5` builds the focused file with debug info and starts its debugger, or continues; `F10` step over, `F11` step into, `Shift+F11` step out, `Shift+F5` stop. A debug tile opens beside the code with the call stack (click a frame to go there), variables (click to expand) and the program's output; the paused line is highlighted. C, C++ and single-file Rust use gdb's built-in debugger (gdb 14+); Python uses debugpy. Actions: `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`.
+- **Settings → Toolchains** (action `toolchains`): which interpreters, compilers, debuggers and Jupyter this machine has (version and path), and the `pacman` command for the missing ones.
+
+### Changed
+- The file-tree button at the top of the rail shows a **file-tree icon**; the TileIDE **logo** now sits in the middle of the rail where the workspace name was (Settings → Sidebar → Logo; the audio visualizer still takes its place while music plays).
+
+### Known limits
+- Notebooks: Markdown cells are edited as text (not rendered); rich HTML outputs show their text form; no language server inside cells.
+- Debugging: no Java or JavaScript adapter yet; Cargo projects aren't debugged (single `.rs` files are); Python debugging uses `python3` on PATH, not the workspace's `.venv`.
+
+## 0.4.0-alpha.3 (2026-11-01): audio visualizer, sidebar size
+
+### Added
+- **Audio visualizer:** while something plays, a symmetrical waveform (frequency bands mirrored around the middle, each bar drawn equally on both sides of a centre line) takes the place of the workspace name in the rail; with the drawer open it sits under the file tree instead. It appears only while there is sound and fades out a few seconds after it stops. Nothing is captured while nothing plays: `pactl subscribe` reports playback, and only then does `parec` read the speakers' monitor. Turn it off in Settings → Sidebar or with `tileide.sidebar { show_visualizer = false }`.
+- **Sidebar size** and **Icon size** in Settings → Sidebar (`tileide.sidebar { scale = 1.2, icon_scale = 1.1 }`): the rail's width with everything on it (80–150%), and its icons and dots within it (80–125%). The drawer, peek and banner move with the rail.
+- `tileide render … --visualizer --rail-scale N --icon-scale N` previews them offscreen.
+
+### Changed
+- The Config workspace's rail entry is a **folder with a cog** instead of a second gear, so it can't be mistaken for Settings (the gear above the clock).
+
+### Known limits
+- The visualizer's capture is an input stream: status bars that show "recording" for any input may light up while music plays.
+
+## 0.4.0-alpha.2 (2026-11-01): run, empty workspace
+
+### Added
+- **Run** (`Alt+R`, action `run`): runs the focused file (saved first) and shows its output on a large card over a dimmed window, with padding, a status chip (Running… / Exit 0 · 0.42 s / Exit 2 / Stopped) and the keys always in view: `Ctrl+C` stop, `Alt+R` run again, `Esc` close (stops a running program). Built in: Python, JavaScript (Node), shell, Lua, Ruby, Go, Java (single file), C and C++ (compile, then run), Rust (`rustc`, or `cargo run` inside a Cargo project). With no file focused it runs the workspace's Cargo project, or the last run again.
+- `tileide.runner(".ext", "command {file}")` adds or replaces a runner (`{file}`, `{dir}`, `{stem}`, `{out}`; run by `sh -c`).
+- A missing compiler or interpreter says which package to install (`sudo pacman -S …`); nothing is installed for you.
+
+### Changed
+- **An empty workspace looks like an empty editor:** one tile fills the code region with a faded logo and the main keys centred in it (like VS Code with no file open), instead of a small card.
+
+### Known limits
+- Programs get no input (stdin): run interactive ones in a terminal tile. Output is plain text (colours are removed); stdout and stderr share one stream so lines stay in order.
+
+## 0.4.0-alpha.1 (2026-11-01): Settings, keybinds card, rail rework
+
+### Added
+- **Settings** (`Alt+,`, action `settings`, or the gear above the clock): a large card in the quick-open style. Search on top filters every setting; sections on the left. Everything applies live and is kept in `state.lua`:
+  - Appearance: interface font and size, code font and size.
+  - Layout: rounded corners, gaps between tiles and at the edge.
+  - Motion: animations on/off, style (**Fluid**, the new default: soft spring glides and eased fades, iOS-like; or **Snappy**, the previous timing) and speed (0.5–2×).
+  - Sidebar: show or hide each rail item; start with the files open.
+  - **Themes & background** and **Extensions** are pages of Settings now (`Alt+Shift+T` / `Alt+Shift+X` open them there).
+  - A key `tileide.lua` sets wins and shows "Set in tileide.lua" (locked). The sample config leaves these keys commented for that reason.
+- New `tileide.appearance` keys: `motion`, `motion_speed`, `ui_font`, `ui_scale`, `code_font`, `code_size`.
+- **Keybinds card** (`Alt+K`, action `keybinds`): every active key, filtered as you type. Esc closes.
+- **`Alt+=` / `Alt+-`** (action `font_size`, `up`/`down`): the code font of every editor and terminal, one point at a time (saved).
+- The workspace peek has an **×** that removes that workspace (asks first if it holds work).
+
+### Changed
+- **Focus, resize and move use the arrow keys:** `Alt+←↑↓→`, `Alt+Shift+arrows`, `Alt+Ctrl+Shift+arrows` (were H/J/K/L), so `Alt+K` is free for the keybinds card. Binds in your `tileide.lua` still win.
+- **The Config workspace's gear sits under the workspace dots** (above `+`); the gear above the clock opens Settings.
+- **Hovering a workspace dot shows its peek;** a click goes to the workspace (it used to take a click to peek and a second to go).
+- The drawer holds only Files; its Files | Themes | Extensions switcher is gone (both moved into Settings).
+- The drawer's open/close follows the motion style too.
+
+## 0.3.0 (2026-11-01): extensions, drawer fixes
+
+### Added
+- **Extensions**: programs in any language that TileIDE starts only when needed and talks to over stdin/stdout (JSON-RPC, the framing language servers use). Each runs as its own process, so a crash or a slow one can't take TileIDE down. Format and protocol: [docs/extensions.md](docs/extensions.md); an example in `examples/extensions/word-count/`.
+- **Extensions section in the drawer** (`Alt+Shift+X`, action `extensions_section`, or the Extensions tab): search, install from a folder or a git URL, remove, an on/off switch, and a per-workspace mode (On demand, Always here, Off here). Choices are saved in `state.lua`.
+- **Weight meter:** startup time, memory and CPU of every running extension, live while the section is open, with Suspend/Resume and Stop. Extensions that ask to start with TileIDE are marked.
+- Run an extension command from a key: `tileide.bind("ALT", "Y", "extension", "word-count.count")`.
+- [docs/compatibility.md](docs/compatibility.md): what imports and extensions work, and what doesn't.
+
+### Fixed
+- The drawer's content no longer spills over the code region: the panel is exactly as wide as the drawer, rows of buttons wrap onto a second line, and long file names are shortened inside it (checked at 200, 220 and 600 px).
+- The Themes section is filled whenever it shows. Opened from its tab it showed an empty theme list, every background row at once, red placeholder colours and sliders at 0.
+
 ## 0.3.0-alpha.9 (2026-11-01): Themes section, background picker, VS Code themes
 
 ### Added

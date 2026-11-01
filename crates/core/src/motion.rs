@@ -1,31 +1,142 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Motion timing (design.md §8). Things that move glide with ease-out cubic; things that
-//! appear or leave fade with a gentler ease-out quad, so opacity never pops. Leaving is
-//! quicker than arriving, so nothing waits on an exit.
+//! Motion timing (design.md §8), in two styles chosen in Settings or with
+//! `tileide.appearance { motion = "fluid" | "snappy", motion_speed = 1.0 }`:
+//! - **Fluid** (default, Apple-like): things that move follow a critically damped spring
+//!   that leaves already moving (no hesitation, no overshoot, a long soft settle); fades
+//!   ease out, so what appears shows at once and what leaves goes at once.
+//! - **Snappy**: shorter ease-out cubic moves and ease-out quad fades.
+//!
+//! In both, leaving is quicker than arriving, so nothing waits on an exit. The speed
+//! multiplier divides every duration.
+
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::tiles::Rect;
 
-/// Tile glide: open, close, resize, move, `Alt+V`, columns scroll.
-pub const MOVE_US: f64 = 220_000.0;
-/// Fade-in: new tiles, workspace switch, overlays, theme crossfade.
-pub const FADE_IN_US: f64 = 180_000.0;
-/// Fade-out: closing tiles and overlays, the workspace being left.
-pub const FADE_OUT_US: f64 = 120_000.0;
-
-/// Ease-out cubic, for movement.
-pub fn ease(t: f64) -> f64 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Curve {
+    #[default]
+    Fluid,
+    Snappy,
 }
 
-/// Ease-out quad, for opacity: cubic reaches half opacity in a fifth of the time,
-/// which reads as a pop rather than a fade.
+impl Curve {
+    pub const ALL: [Curve; 2] = [Curve::Fluid, Curve::Snappy];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Curve::Fluid => "fluid",
+            Curve::Snappy => "snappy",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Curve> {
+        Curve::ALL.into_iter().find(|c| c.key() == key)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Curve::Fluid => "Fluid",
+            Curve::Snappy => "Snappy",
+        }
+    }
+
+    /// (move, fade in, fade out, drawer) in µs at speed 1.
+    fn durations(self) -> [f64; 4] {
+        match self {
+            Curve::Fluid => [380_000.0, 240_000.0, 160_000.0, 340_000.0],
+            Curve::Snappy => [220_000.0, 180_000.0, 120_000.0, 200_000.0],
+        }
+    }
+}
+
+pub const MIN_SPEED: f64 = 0.5;
+pub const MAX_SPEED: f64 = 2.0;
+
+static CURVE: AtomicU8 = AtomicU8::new(0);
+static SPEED: AtomicU64 = AtomicU64::new(0x3FF0_0000_0000_0000); // 1.0
+
+/// Sets the style for every animation from now on.
+pub fn set_profile(curve: Curve, speed: f64) {
+    CURVE.store(curve as u8, Ordering::Relaxed);
+    SPEED.store(speed.clamp(MIN_SPEED, MAX_SPEED).to_bits(), Ordering::Relaxed);
+}
+
+pub fn curve() -> Curve {
+    if CURVE.load(Ordering::Relaxed) == Curve::Snappy as u8 { Curve::Snappy } else { Curve::Fluid }
+}
+
+pub fn speed() -> f64 {
+    f64::from_bits(SPEED.load(Ordering::Relaxed))
+}
+
+fn duration(i: usize) -> f64 {
+    curve().durations()[i] / speed()
+}
+
+/// Tile glide: open, close, resize, move, `Alt+V`, columns scroll.
+pub fn move_us() -> f64 {
+    duration(0)
+}
+
+/// Fade-in: new tiles, workspace switch, overlays, theme crossfade.
+pub fn fade_in_us() -> f64 {
+    duration(1)
+}
+
+/// Fade-out: closing tiles and overlays, the workspace being left.
+pub fn fade_out_us() -> f64 {
+    duration(2)
+}
+
+/// Drawer expand/collapse.
+pub fn drawer_us() -> f64 {
+    duration(3)
+}
+
+/// Critically damped spring that starts at 70% of its natural speed (a spring from rest
+/// hesitates first, which reads as lag), scaled to settle within 0.1% at t = 1. With a
+/// start speed at most ω it never overshoots.
+fn spring(t: f64) -> f64 {
+    const OMEGA: f64 = 8.4;
+    const START: f64 = 0.7 * OMEGA;
+    if t >= 1.0 {
+        return 1.0;
+    }
+    1.0 - (1.0 + (OMEGA - START) * t) * (-OMEGA * t).exp()
+}
+
+/// Movement curve of `curve`.
+pub fn ease_with(curve: Curve, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    match curve {
+        Curve::Fluid => spring(t),
+        Curve::Snappy => 1.0 - (1.0 - t).powi(3),
+    }
+}
+
+/// Opacity curve of `curve`: ease-out, so a fade answers at once. Fluid uses sine (a
+/// little softer than Snappy's quad over a longer time); cubic would reach half opacity
+/// in a fifth of the time, which reads as a pop.
+pub fn ease_fade_with(curve: Curve, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    match curve {
+        Curve::Fluid => (std::f64::consts::FRAC_PI_2 * t).sin(),
+        Curve::Snappy => 1.0 - (1.0 - t).powi(2),
+    }
+}
+
+pub fn ease(t: f64) -> f64 {
+    ease_with(curve(), t)
+}
+
 pub fn ease_fade(t: f64) -> f64 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(2)
+    ease_fade_with(curve(), t)
 }
 
 /// Eased glide progress of an animation started at `start_us`, and whether it has finished.
 pub fn progress(start_us: i64, now_us: i64) -> (f64, bool) {
-    let t = (now_us - start_us) as f64 / MOVE_US;
+    let t = (now_us - start_us) as f64 / move_us();
     (ease(t), t >= 1.0)
 }
 
@@ -45,7 +156,7 @@ pub struct Fade {
 
 impl Fade {
     pub fn new(from: f64, to: f64) -> Fade {
-        Fade::with_duration(from, to, if to >= from { FADE_IN_US } else { FADE_OUT_US })
+        Fade::with_duration(from, to, if to >= from { fade_in_us() } else { fade_out_us() })
     }
 
     /// `duration_us` is for a full 0 ⇄ 1 fade.
@@ -117,29 +228,48 @@ mod tests {
         assert_eq!(ease(0.0), 0.0);
         assert_eq!(ease(1.0), 1.0);
         assert!(ease(0.5) > 0.5, "ease-out moves fast first");
-        assert_eq!(progress(0, MOVE_US as i64 * 2), (1.0, true), "clamped past the end");
+        assert_eq!(progress(0, move_us() as i64 * 2), (1.0, true), "clamped past the end");
         assert!(!progress(0, 1).1);
     }
 
     #[test]
     fn fades_are_gentler_than_moves() {
-        assert!(ease_fade(0.2) < ease(0.2));
-        assert_eq!(ease_fade(1.0), 1.0);
+        for c in Curve::ALL {
+            assert!(ease_fade_with(c, 0.2) < ease_with(c, 0.2), "{c:?}");
+            assert_eq!(ease_fade_with(c, 1.0), 1.0);
+            assert_eq!(ease_with(c, 0.0), 0.0);
+            assert_eq!(ease_with(c, 1.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn fluid_springs_without_overshoot() {
+        let mut last = 0.0;
+        for i in 1..=100 {
+            let v = ease_with(Curve::Fluid, i as f64 / 100.0);
+            assert!(v >= last && v <= 1.0, "monotonic, never past the target");
+            last = v;
+        }
+        assert!(ease_with(Curve::Fluid, 0.08) > 0.3, "leaves at once (a spring from rest hesitated: 0.16 here)");
+        assert!(ease_fade_with(Curve::Fluid, 0.15) > 0.2, "a new tile shows at once");
+        assert!((ease_with(Curve::Fluid, 0.99) - 1.0).abs() < 0.002, "settled at the end");
+        assert_eq!(Curve::from_key("fluid"), Some(Curve::Fluid));
+        assert_eq!(Curve::from_key("bouncy"), None);
     }
 
     #[test]
     fn fade_out_is_quicker_than_fade_in() {
-        let quarter = (FADE_OUT_US / 4.0) as i64;
+        let quarter = (fade_out_us() / 4.0) as i64;
         assert!(Fade::new(1.0, 0.0).at(quarter).0 < 1.0 - Fade::new(0.0, 1.0).at(quarter).0);
-        assert_eq!(Fade::new(1.0, 0.0).at(FADE_OUT_US as i64), (0.0, true));
-        assert_eq!(Fade::new(0.0, 1.0).at(FADE_IN_US as i64), (1.0, true));
+        assert_eq!(Fade::new(1.0, 0.0).at(fade_out_us() as i64), (0.0, true));
+        assert_eq!(Fade::new(0.0, 1.0).at(fade_in_us() as i64), (1.0, true));
     }
 
     #[test]
     fn interrupted_fade_continues_from_where_it_is() {
         let fade = Fade::new(0.4, 1.0);
         assert_eq!(fade.at(0), (0.4, false));
-        assert!(fade.at((FADE_IN_US * 0.6) as i64).1, "only the remaining 60% is played");
+        assert!(fade.at((fade_in_us() * 0.6) as i64).1, "only the remaining 60% is played");
         assert_eq!(Fade::new(1.0, 1.0).at(0), (1.0, true), "nothing to do");
     }
 
@@ -149,11 +279,11 @@ mod tests {
         p.sync(&[1, 2], 0, true);
         assert_eq!(p.at(0), [(1, 1.0), (2, 1.0)], "no fade-in at startup");
         p.sync(&[1, 3], 1_000, true);
-        let mid = p.at(1_000 + (FADE_OUT_US / 2.0) as i64);
+        let mid = p.at(1_000 + (fade_out_us() / 2.0) as i64);
         assert_eq!(mid.iter().map(|i| i.0).collect::<Vec<_>>(), [1, 2, 3], "2 is still leaving");
         assert!(mid[1].1 > 0.0 && mid[1].1 < 1.0 && mid[2].1 > 0.0 && mid[2].1 < 1.0);
         assert!(p.animating(1_000));
-        let end = 1_000 + FADE_IN_US as i64;
+        let end = 1_000 + fade_in_us() as i64;
         assert_eq!(p.at(end), [(1, 1.0), (3, 1.0)], "2 is gone once faded");
         assert!(!p.animating(end));
     }
@@ -163,7 +293,7 @@ mod tests {
         let mut p = Presence::default();
         p.sync(&[1, 2], 0, true);
         p.sync(&[1], 0, true);
-        let t = (FADE_OUT_US / 2.0) as i64;
+        let t = (fade_out_us() / 2.0) as i64;
         let leaving = p.at(t)[1].1;
         p.sync(&[1, 2], t, true);
         assert_eq!(p.at(t)[1].1, leaving, "comes back from where it was");

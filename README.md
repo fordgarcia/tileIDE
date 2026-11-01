@@ -29,9 +29,14 @@ Tired of switching tiling window managers and customizing configs of IDE per swi
 
 <br>
 
-> **Status: v0.2.0.** Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes, and a Lua config that applies as you save it. Language features (completion, debugger) aren't in the UI yet. Install details: [docs/install-arch.md](docs/install-arch.md).
+> **Status: v0.4.0-alpha.4** (Settings, Run, notebooks, debugger, audio visualizer). Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes (and VS Code theme import), language servers, extensions, and a Lua config that applies as you save it. No debugger yet. Install details: [docs/install-arch.md](docs/install-arch.md).
 
-![TileIDE with three tiles]()
+![TileIDE](docs/1.png)
+![TileIDE](docs/2.png)
+![TileIDE](docs/3.png)
+![TileIDE](docs/4.png)
+@creadits to the artist of the wallpaper
+
 
 # Quick Start
 Arch
@@ -67,17 +72,26 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 | `Alt+Return` / `Alt+E` | new terminal / open a file in a new tile (search; Enter on an empty search = blank file) |
 | `Alt+F` | open a file in the focused tile (search) |
 | `Alt+W` / `Ctrl+S` | close tile (asks if unsaved) / save |
-| `Alt+H/J/K/L` (+`Shift`) | move focus (resize) |
-| `Alt+Ctrl+Shift+H/J/K/L` | move the tile (column) |
+| `Alt+←↑↓→` (+`Shift`) | move focus (resize) |
+| `Alt+Ctrl+Shift+←↑↓→` | move the tile (column) |
 | `Alt+V` / `Alt+S` | dwindle ⇄ scrolling columns / next tile opens below |
 | `Alt+T` / `Alt+O` | theme tray / workspace overview |
 | `Alt+1…9, 0` | workspaces |
 | `Alt+B` / `Alt+C` | files drawer / config workspace |
+| `Alt+D` / `Alt+Shift+W` | pick the workspace's folder / remove the workspace |
+| `Alt+R` | run the focused file (output card; `Ctrl+C` stop, `Esc` close); in a notebook, run all cells |
+| `F9` / `F5` | breakpoint / debug (start or continue); `F10` over, `F11` into, `Shift+F11` out, `Shift+F5` stop |
+| `Alt+,` / `Alt+K` | settings / keybinds |
+| `Alt+=` / `Alt+-` | code font bigger / smaller |
+| `Alt+Shift+T` / `Alt+Shift+X` | settings: themes & background / extensions |
+| `Alt+I` / `F12` / `Ctrl+Space` | hover info / go to definition / complete (language servers) |
 | `Alt+Z` / `Alt+Escape` | word wrap / quit (asks if unsaved) |
 
-Mouse: the top circle opens the files drawer, a workspace dot previews its files, the palette opens the theme tray, the gear opens the config.
+Mouse: hovering a workspace dot previews its files (click to go, × to remove it); the file-tree button at the top opens the drawer; the folder-with-a-cog under the dots is the config workspace; the palette opens the theme tray; the gear above the clock opens Settings.
 
-Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`.
+Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
+
+Extensions are programs in any language that run in their own process and start only when needed; the Extensions section shows what each one costs. See [docs/extensions.md](docs/extensions.md) and [docs/compatibility.md](docs/compatibility.md).
 
 **Known limits:** tested on Hyprland only; on Hyprland, opening another app on TileIDE's workspace takes it out of full-screen.
 

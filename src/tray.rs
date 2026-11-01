@@ -212,8 +212,8 @@ fn draw_caption(cr: &gtk::cairo::Context, st: &State, w: f64, h: f64) -> Result<
         .map(|(text, bold, key)| {
             let layout = pangocairo::functions::create_layout(cr);
             let mut font = pango::FontDescription::new();
-            font.set_family(if *key { "monospace" } else { token::UI_FONT });
-            font.set_absolute_size(13.0 * pango::SCALE as f64);
+            font.set_family(&if *key { "monospace".to_string() } else { token::ui_font() });
+            font.set_absolute_size(13.0 * if *key { 1.0 } else { token::ui_scale() } * pango::SCALE as f64);
             if *bold {
                 font.set_weight(pango::Weight::Bold);
             }

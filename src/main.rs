@@ -11,20 +11,29 @@
 //!   to focus it.
 
 mod background;
+mod audio;
 mod bench;
 mod cli;
 mod completion;
+mod debug;
 mod dialog;
 mod draw;
+mod extensions;
+mod extensions_panel;
+mod keybinds_card;
 mod file_tree;
 mod logo;
 mod lsp;
 mod motion;
+mod notebook_view;
 mod overview;
 mod quick_open;
+mod run_card;
 mod settings;
+mod settings_ui;
 mod themes_panel;
 mod tile_view;
+mod toolchains;
 mod tray;
 mod workspaces;
 
@@ -62,11 +71,15 @@ const PEEK_HEIGHT: i32 = 360;
 const PEEK_GAP: f64 = 6.0;
 /// Editors save in bursts (temp file, rename); wait for the burst before reloading.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(60);
+/// Settings changes are written to `state.lua` once a slider rests this long.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// The panel a workspace dot opens: that workspace's file tree, without switching to it.
 struct Peek {
     widget: gtk::Box,
     go: gtk::Button,
+    /// Removes the peeked workspace.
+    close: gtk::Button,
     tree: Rc<RefCell<file_tree::FileTree>>,
     /// The workspace shown, and its dot's centre y; `None` while hidden.
     target: Rc<Cell<Option<(u8, f64)>>>,
@@ -110,10 +123,17 @@ struct App {
     quick_open: Rc<QuickOpen>,
     /// A still of the old frame that fades away when the theme changes (`motion::crossfade`).
     cover: gtk::Picture,
-    /// The drawer's sections ("files", "themes") and their switcher tabs.
-    sections: gtk::Stack,
-    tabs: (gtk::ToggleButton, gtk::ToggleButton),
+    settings_card: Rc<settings_ui::SettingsCard>,
+    keybinds_card: Rc<keybinds_card::KeybindsCard>,
+    run_card: Rc<run_card::RunCard>,
+    visualizer: Rc<audio::Visualizer>,
+    /// The visualizer under the file tree (drawer open).
+    wave: gtk::DrawingArea,
+    /// The config as `tileide.lua` gives it; `config` is it with the GUI settings applied.
+    raw_config: RefCell<Config>,
+    save_timer: RefCell<Option<glib::SourceId>>,
     themes_panel: Rc<themes_panel::ThemesPanel>,
+    extensions_panel: Rc<extensions_panel::ExtensionsPanel>,
     /// The workspace the Themes section was last filled for.
     panel_for: Cell<Option<Option<u8>>>,
     /// A Themes section row shown over the applied theme while hovered or selected.
@@ -277,9 +297,10 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     };
     let files = file_tree::FileTree::new(options.folder.clone(), open_file);
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    panel.set_halign(gtk::Align::Start);
+    // Fill: its width is set exactly by the overlay (`connect_get_child_position`).
+    panel.set_halign(gtk::Align::Fill);
     panel.set_valign(gtk::Align::Fill);
-    panel.set_margin_start(token::RAIL_WIDTH as i32);
+    panel.set_margin_start(token::rail_width() as i32);
     panel.set_margin_top(token::FRAME_BORDER as i32);
     panel.set_margin_bottom(token::FRAME_BORDER as i32);
     panel.set_overflow(gtk::Overflow::Hidden);
@@ -287,31 +308,15 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     panel.add_css_class("drawer");
     let tree_widget = files.borrow().widget().clone();
     tree_widget.set_vexpand(true);
-    // Files and Themes share the drawer; the switcher picks one (Alt+B / Alt+Shift+T too).
-    let sections = gtk::Stack::new();
-    sections.set_transition_type(gtk::StackTransitionType::Crossfade);
-    sections.set_transition_duration((tileide_core::motion::FADE_IN_US / 1000.0) as u32);
-    sections.set_vexpand(true);
-    sections.add_named(&tree_widget, Some("files"));
-    let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    switcher.add_css_class("switcher");
-    switcher.add_css_class("themes");
-    let files_tab = gtk::ToggleButton::with_label("Files");
-    let themes_tab = gtk::ToggleButton::with_label("Themes");
-    themes_tab.set_group(Some(&files_tab));
-    files_tab.set_active(true);
-    for (tab, page) in [(&files_tab, "files"), (&themes_tab, "themes")] {
-        tab.add_css_class("pill");
-        let s = sections.clone();
-        tab.connect_toggled(move |t| {
-            if t.is_active() {
-                s.set_visible_child_name(page);
-            }
-        });
-        switcher.append(tab);
-    }
-    panel.append(&switcher);
-    panel.append(&sections);
+    panel.append(&tree_widget);
+    let wave = gtk::DrawingArea::new();
+    wave.set_content_height(44);
+    wave.set_margin_start(14);
+    wave.set_margin_end(14);
+    wave.set_margin_bottom(10);
+    wave.set_margin_top(6);
+    wave.set_visible(false);
+    panel.append(&wave);
     overlay.add_overlay(&panel);
     let peek = build_peek(&overlay, &workspaces);
 
@@ -321,7 +326,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     banner.set_valign(gtk::Align::Start);
     banner.set_margin_top((token::FRAME_BORDER + 10.0) as i32);
     // Over the stage, never over the rail's buttons.
-    banner.set_margin_start((token::RAIL_WIDTH + 16.0) as i32);
+    banner.set_margin_start((token::rail_width() + 16.0) as i32);
     banner.set_margin_end(16);
     banner.set_wrap(true);
     banner.set_max_width_chars(100);
@@ -361,9 +366,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 app.open_picked(target, path);
             }
         });
-        let quick_open = QuickOpen::new(&overlay, on_file, on_close);
-        // Last, so confirmations sit above every other layer.
-        dialog::install(&overlay);
+        let quick_open = QuickOpen::new(&overlay, on_file, on_close.clone());
         let (m5, m6, m7, m8) = (me.clone(), me.clone(), me.clone(), me.clone());
         let themes_panel = themes_panel::ThemesPanel::new(themes_panel::Callbacks {
             preview: Rc::new(move |key| {
@@ -387,7 +390,80 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 }
             }),
         });
-        sections.add_named(themes_panel.widget(), Some("themes"));
+        let (m9, m10) = (me.clone(), me.clone());
+        let extensions_panel = extensions_panel::ExtensionsPanel::new(
+            window.upcast_ref(),
+            extensions_panel::Callbacks {
+                run: Rc::new(move |command| {
+                    if let Some(app) = m9.upgrade() {
+                        app.run_extension_command(&command);
+                    }
+                }),
+                save: Rc::new(move || {
+                    if let Some(app) = m10.upgrade() {
+                        app.state.borrow_mut().extensions = extensions::picks();
+                        app.save_state();
+                    }
+                }),
+            },
+        );
+        let (m11, m12, m13, m14) = (me.clone(), me.clone(), me.clone(), me.clone());
+        let settings_card = settings_ui::SettingsCard::new(
+            &overlay,
+            themes_panel.widget(),
+            extensions_panel.widget(),
+            settings_ui::Callbacks {
+                change: Rc::new(move |key, value| {
+                    if let Some(app) = m11.upgrade() {
+                        app.change_setting(key, value);
+                    }
+                }),
+                open_config: Rc::new(move || {
+                    if let Some(app) = m12.upgrade()
+                        && app.workspaces.borrow().active() != Active::Config
+                    {
+                        app.workspaces.borrow_mut().toggle_config();
+                    }
+                }),
+                show_keybinds: Rc::new(move || {
+                    if let Some(app) = m13.upgrade() {
+                        app.open_keybinds();
+                    }
+                }),
+                page_shown: Rc::new(move |page| {
+                    let me = m14.clone();
+                    // After the open/selection call returns (the panels read the app).
+                    glib::idle_add_local_once(move || {
+                        let Some(app) = me.upgrade() else { return };
+                        match page {
+                            settings_ui::Page::Themes => {
+                                app.refresh_themes_panel();
+                                app.themes_panel.focus();
+                            }
+                            settings_ui::Page::Extensions => {
+                                app.extensions_panel.refresh();
+                                app.extensions_panel.focus();
+                            }
+                            settings_ui::Page::General | settings_ui::Page::Toolchains => {}
+                        }
+                        app.area.queue_draw();
+                    });
+                }),
+                on_close: on_close.clone(),
+            },
+        );
+        let keybinds_card = keybinds_card::KeybindsCard::new(&overlay, on_close.clone());
+        let run_card = run_card::RunCard::new(&overlay, on_close.clone());
+        let m15 = me.clone();
+        let visualizer = audio::Visualizer::new(Rc::new(move || {
+            let Some(app) = m15.upgrade() else { return };
+            let shown = app.visualizer.shown().is_some() && app.config.borrow().sidebar.show_visualizer;
+            app.wave.set_visible(shown);
+            app.wave.queue_draw();
+            app.area.queue_draw();
+        }));
+        // Last, so confirmations sit above every other layer.
+        dialog::install(&overlay);
         let cover = gtk::Picture::new();
         cover.set_can_target(false);
         cover.set_can_shrink(true);
@@ -422,9 +498,15 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             overview,
             quick_open,
             cover,
-            sections,
-            tabs: (files_tab, themes_tab),
+            settings_card,
+            keybinds_card,
+            run_card,
+            visualizer,
+            wave: wave.clone(),
+            raw_config: RefCell::new(Config::default()),
+            save_timer: RefCell::new(None),
             themes_panel,
+            extensions_panel,
             panel_for: Cell::new(None),
             preview_theme: RefCell::new(None),
             session_background: RefCell::new(None),
@@ -435,11 +517,36 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     });
 
     {
+        // The drawer panel is exactly as wide as the drawer: a size request is only a
+        // minimum, and wide rows would push it over the code region.
+        let me = Rc::downgrade(&app_state);
+        overlay.connect_get_child_position(move |overlay, child| {
+            let app = me.upgrade()?;
+            if child != app.panel.upcast_ref::<gtk::Widget>() {
+                return None;
+            }
+            let extension = app.drawer.try_borrow().map_or(0.0, |d| d.extension());
+            Some(gdk::Rectangle::new(0, 0, (token::rail_width() + extension).round() as i32, overlay.height()))
+        });
+        // The peek's ×: removes that workspace (asks first if it holds work).
+        let me = Rc::downgrade(&app_state);
+        app_state.peek.close.connect_clicked(move |_| {
+            let Some(app) = me.upgrade() else { return };
+            if let Some((n, _)) = app.peek.target.get() {
+                hide_peek(&app.peek.widget, &app.peek.target);
+                app.close_workspace(n);
+            }
+        });
+    }
+    {
         let me = Rc::downgrade(&app_state);
         app_state.workspaces.borrow_mut().set_on_switch(Rc::new(move |info: &workspaces::Switch| me.upgrade().and_then(|app| app.on_switch(info))));
     }
     let start_expanded = config.sidebar.start_expanded && config.sidebar.show_files;
+    problems.extend(init_extensions(&app_state));
+    init_debug(&app_state);
     app_state.apply_config(config, problems);
+    extensions::event(tileide_extensions::Event::Startup);
     if start_expanded {
         app_state.toggle_drawer();
     }
@@ -450,6 +557,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
 
     watch_config(&app_state);
     connect_drawing(&app_state, started);
+    connect_wave(&app_state);
     connect_mouse(&app_state);
     connect_keys(&app_state);
     connect_close(&app_state);
@@ -473,6 +581,46 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             glib::idle_add_local_once(move || state.workspaces.borrow().current().borrow().grab_focused());
         });
     }
+    for (name, at) in options.test_actions.clone() {
+        let (arg, name) = match name.split_once(':') {
+            Some((n, a)) => (Some(a.to_string()), n.to_string()),
+            None => (None, name),
+        };
+        let me = Rc::downgrade(&app_state);
+        let window = window.clone();
+        glib::timeout_add_local_once(Duration::from_secs_f64(at), move || match (me.upgrade(), tileide_config::api::parse_action(&name, arg.as_deref())) {
+            // `open-here:<path>`: as if picked with Alt+F (replaces the focused editor).
+            (Some(app), _) if name == "open-here" => {
+                app.open_picked(quick_open::Target::Focused, arg.as_ref().map(PathBuf::from));
+            }
+            // `open:<path>`: as if picked in quick open (Alt+E, Enter).
+            (Some(app), _) if name == "open" => {
+                app.open_picked(quick_open::Target::NewTile, arg.as_ref().map(PathBuf::from));
+            }
+            // `cursor:<line>`: the focused editor's cursor to a 1-based line.
+            (Some(app), _) if name == "cursor" => {
+                let editor = app.workspaces.borrow().current().borrow().focused_editor();
+                if let (Some(editor), Some(line)) = (editor, arg.as_deref().and_then(|l| l.parse::<i32>().ok())) {
+                    let buffer = editor.buffer();
+                    if let Some(it) = buffer.iter_at_line(line - 1) {
+                        buffer.place_cursor(&it);
+                    }
+                }
+            }
+            // `screenshot:<file.png>`: the window as rendered (headless checks).
+            _ if name == "screenshot" => {
+                if let Err(e) = screenshot(window.upcast_ref(), arg.as_deref().unwrap_or("tileide.png")) {
+                    eprintln!("test action: screenshot: {e}");
+                }
+            }
+            (Some(app), Ok(action)) => {
+                println!("test action: {name}");
+                app.run(&action);
+            }
+            (_, Err(e)) => eprintln!("test action: {e}"),
+            _ => {}
+        });
+    }
     if let Some(seconds) = options.seconds {
         let app = app.clone();
         glib::timeout_add_seconds_local_once(seconds, move || app.quit());
@@ -488,7 +636,7 @@ fn folder_name(path: &Path) -> String {
 }
 
 impl App {
-    fn scene<'a>(&self, numbers: &'a [(u8, f64)], label: &'a str, clock: &'a (String, String)) -> draw::Scene<'a> {
+    fn scene<'a>(&self, numbers: &'a [(u8, f64)], clock: &'a (String, String)) -> draw::Scene<'a> {
         let workspaces = self.workspaces.borrow();
         let config = self.config.borrow();
         let s = &config.sidebar;
@@ -504,8 +652,11 @@ impl App {
                 clock: s.show_clock,
                 themes: s.show_themes,
                 config: s.show_config,
+                icon_backgrounds: s.icon_backgrounds,
             },
             themes_open: self.tray.is_open(),
+            visualizer: None,
+            settings_open: self.settings_card.is_open(),
             solid: self.options.solid,
             drawer: self.drawer.borrow().extension(),
             push: self.options.push,
@@ -514,14 +665,13 @@ impl App {
                 Active::Number(n) => Some(n),
                 Active::Config => None,
             },
-            label,
             clock: (&clock.0, &clock.1),
             empty: workspaces.current().borrow().is_empty(),
             placeholder_tiles: false,
             background: None,
             frosted: None,
             tile_rects: &[],
-            tile_opacity: token::TILE_OPACITY,
+            tile_opacity: self.tile_opacity(),
         }
     }
 
@@ -543,17 +693,6 @@ impl App {
         dots.at(now)
     }
 
-    fn label(&self) -> String {
-        let workspaces = self.workspaces.borrow();
-        match workspaces.active() {
-            Active::Number(n) => {
-                let name = workspaces.name(n).unwrap_or_else(|| workspaces.folder(Active::Number(n)).map_or_else(|| "no folder".into(), |f| folder_name(&f)));
-                format!("{name} · {}", workspaces::display(n))
-            }
-            Active::Config => "config".into(),
-        }
-    }
-
     /// Applies a freshly loaded config (or the defaults at startup after an error).
     fn apply_config(&self, config: Config, mut problems: Vec<String>) {
         let (binds, key_problems) = settings::key_binds(&config.effective_binds());
@@ -573,22 +712,38 @@ impl App {
         let me = self.me.clone();
         let notice: Rc<dyn Fn(String)> = Rc::new(move |message| {
             if let Some(app) = me.upgrade() {
-                let mut problems = app.problems.borrow_mut();
-                if !problems.contains(&message) {
-                    problems.push(message);
-                }
-                drop(problems);
-                app.show_problems();
+                app.notice(message);
             }
         });
         problems.extend(lsp::configure(&config.lsp, notice));
-        motion::set_enabled(config.appearance.animations);
-        let (tiling, per_workspace) = (config.tiling.clone(), config.workspaces.clone());
-        *self.config.borrow_mut() = config;
+        *self.raw_config.borrow_mut() = config;
         *self.problems.borrow_mut() = problems;
+        self.refresh_config();
+    }
+
+    /// The config with the GUI's settings applied (`state.lua`), made live.
+    fn refresh_config(&self) {
+        let config = tileide_config::settings::apply(self.raw_config.borrow().clone(), &self.state.borrow().settings);
+        let a = &config.appearance;
+        motion::set_enabled(a.animations);
+        tileide_core::motion::set_profile(a.motion, a.motion_speed);
+        token::set_ui_font(&a.ui_font, a.ui_scale);
+        token::set_rail(config.sidebar.scale, config.sidebar.icon_scale);
+        self.visualizer.set_enabled(config.sidebar.show_visualizer);
+        // Widgets placed beside the rail follow its width.
+        let rail = token::rail_width();
+        self.panel.set_margin_start(rail as i32);
+        self.banner.set_margin_start((rail + 16.0) as i32);
+        self.peek.widget.set_margin_start((rail + PEEK_GAP) as i32);
+        let (tiling, per_workspace) = (config.tiling.clone(), config.workspaces.clone());
+        if self.settings_card.is_open() {
+            self.settings_card.refresh(&config);
+        }
+        *self.config.borrow_mut() = config;
         // Re-roots the tree and refreshes theme, background, CSS and banner (`on_switch`).
         self.workspaces.borrow_mut().configure(tiling, per_workspace);
         self.sync();
+        self.area.queue_draw();
     }
 
     fn reload(&self) {
@@ -611,6 +766,7 @@ impl App {
     /// it must not touch `self.workspaces`; a changed theme is returned for it to apply.
     fn on_switch(&self, info: &workspaces::Switch) -> Option<Rc<Theme>> {
         self.files.borrow_mut().set_root(info.root.as_deref().unwrap_or(Path::new("")));
+        extensions::set_workspace(info.number, info.root.clone());
         if info.ask_folder {
             // After the switch's borrow ends; the new workspace's fade-in runs under it.
             let me = self.me.clone();
@@ -725,10 +881,12 @@ impl App {
     fn reload_css(&self) {
         let theme = self.theme.borrow();
         let t = &**theme;
-        self.css.load_from_string(&format!(
+        let config = self.config.borrow();
+        let css = format!(
             "window, window.background {{ background: transparent; font-family: \"{font}\"; }}
 .banner {{ background-color: {bg}; color: {text}; border: 1px solid {edge}; border-radius: 10px; padding: 8px 14px; font-size: 13px; }}
-{tiles}\n{files}\n{overview}\n{quick_open}\n{dialog}\n{lsp}\n{completion}\n{themes}",
+{tiles}\n{files}\n{overview}\n{quick_open}\n{dialog}\n{lsp}\n{completion}\n{themes}\n{extensions}\n{settings}\n{run}\n{notebook}\n{debug}
+.tile textview, .tile vte-terminal {{ font-family: \"{code_font}\"; font-size: {code_size}pt; }}",
             font = token::UI_FONT,
             bg = theme::css(t.surface, 0.96),
             text = theme::css(t.text, 1.0),
@@ -741,7 +899,27 @@ impl App {
             lsp = lsp::css(t),
             completion = completion::css(t),
             themes = themes_panel::css(t),
-        ));
+            extensions = extensions_panel::css(t),
+            settings = settings_ui::css(t),
+            run = run_card::css(t),
+            notebook = notebook_view::css(t),
+            debug = debug::css(t),
+            code_font = config.appearance.code_font.replace('"', ""),
+            code_size = config.appearance.code_size,
+        );
+        self.css.load_from_string(&interface_css(&css, &config.appearance.ui_font, config.appearance.ui_scale));
+        self.run_card.set_theme(t);
+        debug::set_theme(t);
+    }
+
+    /// A message on the banner (kept with the config problems until clicked away).
+    fn notice(&self, message: String) {
+        let mut problems = self.problems.borrow_mut();
+        if !problems.contains(&message) {
+            problems.push(message);
+        }
+        drop(problems);
+        self.show_problems();
     }
 
     fn show_problems(&self) {
@@ -787,28 +965,105 @@ impl App {
     }
 
     fn themes_shown(&self) -> bool {
-        self.drawer.borrow().target > 0.5 && self.sections.visible_child_name().as_deref() == Some("themes")
+        self.settings_card.page() == Some(settings_ui::Page::Themes)
     }
 
-    /// Alt+Shift+T: the drawer on its Themes section (closes it if that is showing).
-    fn toggle_themes_section(&self) {
-        if self.themes_shown() {
-            self.toggle_drawer();
+    /// Settings on `page`; closes it when it already shows that page.
+    fn toggle_settings(&self, page: settings_ui::Page) {
+        if self.settings_card.page() == Some(page) {
+            self.settings_card.close();
             return;
         }
-        self.tabs.1.set_active(true);
-        self.refresh_themes_panel();
-        if self.drawer.borrow().target < 0.5 {
-            self.drawer.borrow_mut().toggle();
-            self.area.queue_draw();
+        self.settings_card.open(page, &self.config.borrow());
+        self.area.queue_draw();
+    }
+
+    fn toggle_extensions_section(&self) {
+        self.toggle_settings(settings_ui::Page::Extensions);
+    }
+
+    fn open_keybinds(&self) {
+        let binds = self.config.borrow().effective_binds();
+        self.keybinds_card.open(&binds);
+    }
+
+    /// A Settings control changed: applied at once, saved shortly after.
+    fn change_setting(&self, key: &str, value: tileide_config::settings::Value) {
+        self.state.borrow_mut().settings.insert(key.to_string(), value);
+        self.schedule_save();
+        self.refresh_config();
+    }
+
+    fn schedule_save(&self) {
+        if let Some(t) = self.save_timer.borrow_mut().take() {
+            t.remove();
         }
-        // Once the panel is shown (it appears as the drawer opens).
         let me = self.me.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis((tileide_core::motion::MOVE_US / 1000.0) as u64), move || {
+        let timer = glib::timeout_add_local_once(SAVE_DEBOUNCE, move || {
             if let Some(app) = me.upgrade() {
-                app.themes_panel.focus();
+                app.save_timer.borrow_mut().take();
+                app.save_state();
             }
         });
+        *self.save_timer.borrow_mut() = Some(timer);
+    }
+
+    /// `Alt+R`: runs the focused file (saved first), or the workspace's Cargo project,
+    /// on the run card. With nothing to run, runs the last plan again.
+    fn run_focused(&self) {
+        let view = self.workspaces.borrow().current();
+        // A notebook runs its cells in its own kernel.
+        let notebook = view.borrow().focused_notebook();
+        if let Some(nb) = notebook {
+            nb.run_all();
+            return;
+        }
+        let file = view.borrow().focused_file();
+        if file.is_some() && view.borrow().focused_dirty() {
+            view.borrow_mut().save_focused(self.window.upcast_ref());
+        }
+        let folder = {
+            let w = self.workspaces.borrow();
+            w.folder(w.active())
+        };
+        let out = glib::user_runtime_dir().join("tileide-run");
+        let _ = std::fs::create_dir_all(&out);
+        let plan = tileide_core::run::plan(file.as_deref(), folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path);
+        match plan {
+            Ok(plan) => self.run_card.run(plan),
+            Err(_) if file.is_none() && self.run_card.rerun() => {}
+            Err(e) => self.run_card.show_message("Run", &e),
+        }
+    }
+
+    /// `Alt+=` / `Alt+-`: the code font of every tile, one point at a time.
+    fn step_font_size(&self, by: i8) {
+        if self.config.borrow().explicit.contains("appearance.code_size") {
+            self.notice("tileide.lua sets appearance.code_size; change it there.".into());
+            return;
+        }
+        let (min, max) = tileide_config::settings::CODE_SIZE;
+        let size = (self.config.borrow().appearance.code_size + by as f64).clamp(min, max);
+        self.change_setting("appearance.code_size", tileide_config::settings::Value::Number(size));
+    }
+
+    /// Runs an extension command on the focused editor (its file, language and text).
+    fn run_extension_command(&self, command: &str) {
+        let view = self.workspaces.borrow().current();
+        let view = view.borrow();
+        let mut context = extensions::Context { file: view.focused_file(), ..Default::default() };
+        if let Some(editor) = view.focused_editor() {
+            let buffer = editor.buffer();
+            context.text = Some(buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string());
+            context.language = buffer.downcast_ref::<sourceview5::Buffer>().and_then(sourceview5::prelude::BufferExt::language).map(|l| l.id().to_string());
+        }
+        drop(view);
+        extensions::run_command(command, context);
+    }
+
+    /// Alt+Shift+T: Settings on Themes & background.
+    fn toggle_themes_section(&self) {
+        self.toggle_settings(settings_ui::Page::Themes);
     }
 
     fn refresh_themes_panel(&self) {
@@ -1075,7 +1330,7 @@ impl App {
     fn sync(&self) {
         let numbers = self.rail_dots();
         let clock = self.clock.borrow();
-        let scene = self.scene(&numbers, "", &clock);
+        let scene = self.scene(&numbers, &clock);
         self.workspaces.borrow_mut().set_area(draw::tile_area(&scene), draw::stage_rect(&scene));
 
         // The panel appears once the drawer is wide enough for its content (it fades
@@ -1085,7 +1340,10 @@ impl App {
         let shown = extension >= token::DRAWER_MIN_WIDTH * 0.9;
         self.panel.set_visible(shown);
         if shown {
-            self.panel.set_size_request(extension as i32, -1);
+            // The overlay places the panel (`connect_get_child_position`).
+            if let Some(overlay) = self.panel.parent() {
+                overlay.queue_allocate();
+            }
             self.panel.set_opacity(((extension / drawer.width - 0.6) / 0.4).clamp(0.0, 1.0));
         }
     }
@@ -1096,10 +1354,6 @@ impl App {
             return;
         }
         drop(config);
-        // Alt+B and the opener always open on Files; Alt+Shift+T opens Themes.
-        if self.drawer.borrow().target < 0.5 {
-            self.tabs.0.set_active(true);
-        }
         self.drawer.borrow_mut().toggle();
         self.area.queue_draw();
     }
@@ -1130,10 +1384,14 @@ impl App {
             Action::Themes => self.open_tray(),
             Action::Folder => self.open_folder_search(),
             Action::ThemesSection => self.toggle_themes_section(),
-            Action::WorkspaceClose => match self.workspaces.borrow().active() {
-                Active::Number(n) => self.close_workspace(n),
-                Active::Config => {}
-            },
+            Action::WorkspaceClose => {
+                // Read first: the removal borrows the workspaces mutably (a borrow held
+                // across this match panicked when nothing needed confirming).
+                let active = self.workspaces.borrow().active();
+                if let Active::Number(n) = active {
+                    self.close_workspace(n);
+                }
+            }
             Action::Hover => {
                 if let Some(editor) = view.borrow().focused_editor() {
                     lsp::hover_at_cursor(&editor);
@@ -1149,6 +1407,36 @@ impl App {
                     lsp::complete(&editor, true);
                 }
             }
+            Action::ExtensionsSection => self.toggle_extensions_section(),
+            Action::Extension(command) => self.run_extension_command(command),
+            Action::Settings => self.toggle_settings(settings_ui::Page::General),
+            Action::Keybinds => {
+                if self.keybinds_card.is_open() {
+                    self.keybinds_card.close();
+                } else {
+                    self.open_keybinds();
+                }
+            }
+            Action::FontSize(by) => self.step_font_size(*by),
+            Action::Run => self.run_focused(),
+            Action::Debug => {
+                let file = view.borrow().focused_file();
+                if !debug::is_paused() && file.is_some() && view.borrow().focused_dirty() {
+                    view.borrow_mut().save_focused(self.window.upcast_ref());
+                }
+                debug::start_or_continue(file);
+            }
+            Action::DebugStop => debug::stop(),
+            Action::Breakpoint => {
+                let (editor, file) = (view.borrow().focused_editor(), view.borrow().focused_file());
+                if let (Some(editor), Some(file)) = (editor, file) {
+                    debug::toggle_breakpoint(&editor, &file);
+                }
+            }
+            Action::StepOver => debug::step("next"),
+            Action::StepInto => debug::step("stepIn"),
+            Action::StepOut => debug::step("stepOut"),
+            Action::Toolchains => self.toggle_settings(settings_ui::Page::Toolchains),
             Action::Unavailable(_) => {}
         }
     }
@@ -1164,10 +1452,27 @@ impl App {
         peek.target.set(Some((n, dot_y)));
     }
 
+    /// Hovering a workspace dot (not the active one) opens its peek.
+    fn hover_rail(&self, x: f64, y: f64) {
+        if x > token::rail_width() || self.tray.is_open() || self.overview.is_open() || self.quick_open.is_open() || self.settings_card.is_open() || self.keybinds_card.is_open() || dialog::is_open() {
+            return;
+        }
+        let numbers = self.rail_dots();
+        let clock = self.clock.borrow().clone();
+        let scene = self.scene(&numbers, &clock);
+        let Some(draw::RailHit::Workspace(n)) = draw::rail_hit(&scene, x, y) else { return };
+        let active = matches!(self.workspaces.borrow().active(), Active::Number(a) if a == n);
+        if active || self.peek.target.get().is_some_and(|(t, _)| t == n) {
+            return;
+        }
+        let dot_y = draw::rail_items(&scene).iter().find(|i| i.0 == draw::RailHit::Workspace(n)).map_or(y, |i| i.1);
+        self.show_peek(n, dot_y);
+    }
+
     /// Closes the peek once the pointer is neither on its dot nor over the panel.
     fn track_peek(&self, x: f64, y: f64) {
         let Some((_, dot_y)) = self.peek.target.get() else { return };
-        let on_dot = x <= token::RAIL_WIDTH + PEEK_GAP && (y - dot_y).abs() <= 14.0;
+        let on_dot = x <= token::rail_width() + PEEK_GAP && (y - dot_y).abs() <= 14.0;
         let on_panel = self.peek.widget.compute_bounds(&self.window).is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
         if !on_dot && !on_panel {
             hide_peek(&self.peek.widget, &self.peek.target);
@@ -1190,11 +1495,109 @@ impl App {
 
     fn near_resize_edge(&self, x: f64) -> bool {
         let drawer = self.drawer.borrow();
-        drawer.is_open() && (x - (token::RAIL_WIDTH + drawer.width)).abs() <= RESIZE_GRAB
+        drawer.is_open() && (x - (token::rail_width() + drawer.width)).abs() <= RESIZE_GRAB
     }
 }
 
 /// Hot reload: watches the config dir, `rices/` and `themes/`. `state.lua` is ours.
+/// The generated CSS with Settings' interface font and text scale: every
+/// `font-size: Npx` is scaled (code sizes are in pt and stay), and the design font is
+/// swapped for the chosen one.
+fn interface_css(css: &str, font: &str, scale: f64) -> String {
+    let css = css.replace(&format!("\"{}\"", token::UI_FONT), &format!("\"{}\"", font.replace('"', "")));
+    if (scale - 1.0).abs() < 1e-3 {
+        return css;
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css.as_str();
+    while let Some(i) = rest.find("font-size:") {
+        let (head, tail) = rest.split_at(i + "font-size:".len());
+        out.push_str(head);
+        let value = tail.trim_start();
+        let digits = value.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(value.len());
+        match (value[..digits].parse::<f64>(), value[digits..].starts_with("px")) {
+            (Ok(px), true) => {
+                out.push_str(&format!(" {:.1}", px * scale));
+                rest = &value[digits..];
+            }
+            _ => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Development: renders `window` to a PNG (`--test-actions screenshot:<file>@<s>`).
+fn screenshot(window: &gtk::Window, path: &str) -> Result<(), String> {
+    let paintable = gtk::WidgetPaintable::new(Some(window));
+    let snapshot = gtk::Snapshot::new();
+    paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+    let node = snapshot.to_node().ok_or("nothing drawn")?;
+    let renderer = window.renderer().ok_or("no renderer")?;
+    renderer.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())
+}
+
+/// The visualizer strip under the file tree (drawer open).
+fn connect_wave(state: &Rc<App>) {
+    let me = Rc::downgrade(state);
+    state.wave.set_draw_func(move |_, cr, w, h| {
+        let Some(app) = me.upgrade() else { return };
+        if let Some((bars, k)) = app.visualizer.shown() {
+            let accent = app.theme.borrow().accent;
+            let _ = draw::waveform(cr, tileide_core::tiles::Rect { x: 0.0, y: 0.0, w: w as f64, h: h as f64 }, &bars, accent, k, false);
+        }
+    });
+}
+
+/// The debugger opens files and its tile in the active workspace.
+fn init_debug(state: &Rc<App>) {
+    let (m1, m2) = (Rc::downgrade(state), Rc::downgrade(state));
+    debug::init(debug::Hooks {
+        show_line: Rc::new(move |path, line| {
+            let app = m1.upgrade()?;
+            let view = app.workspaces.borrow().current();
+            view.borrow_mut().show_line(path, line)
+        }),
+        show_panel: Rc::new(move |widget| {
+            let Some(app) = m2.upgrade() else { return };
+            let view = app.workspaces.borrow().current();
+            if !view.borrow().shows(widget) {
+                view.borrow_mut().add(Kind::Panel(widget.clone()));
+            }
+        }),
+    });
+}
+
+/// Extensions: found now, started later by their activation events.
+fn init_extensions(state: &Rc<App>) -> Vec<String> {
+    let root = std::env::var_os("TILEIDE_EXTENSIONS_DIR").map_or_else(extensions::default_root, PathBuf::from);
+    let (m1, m2, m3) = (Rc::downgrade(state), Rc::downgrade(state), Rc::downgrade(state));
+    let hooks = extensions::Hooks {
+        notice: Rc::new(move |message| {
+            if let Some(app) = m1.upgrade() {
+                app.notice(message);
+            }
+        }),
+        insert: Rc::new(move |text| {
+            let Some(app) = m2.upgrade() else { return };
+            let editor = app.workspaces.borrow().current().borrow().focused_editor();
+            match editor {
+                Some(view) => view.buffer().insert_at_cursor(&text),
+                None => app.notice("an extension tried to insert text, but no editor is focused".into()),
+            }
+        }),
+        changed: Rc::new(move || {
+            if let Some(app) = m3.upgrade()
+                && app.settings_card.page() == Some(settings_ui::Page::Extensions)
+            {
+                app.extensions_panel.refresh();
+            }
+        }),
+    };
+    let picks = state.state.borrow().extensions.clone();
+    extensions::init(root, picks, hooks)
+}
+
 fn watch_config(state: &Rc<App>) {
     let dirs = [state.paths.dir.clone(), state.paths.dir.join("rices"), state.paths.dir.join("themes")];
     for dir in dirs.iter().filter(|d| d.is_dir()) {
@@ -1303,12 +1706,13 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
                 }
             });
         }
-        let label = s.label();
         let clock = s.clock.borrow();
-        let mut scene = s.scene(&numbers, &label, &clock);
+        let mut scene = s.scene(&numbers, &clock);
         scene.background = background.as_ref();
         scene.frosted = frosted.as_ref();
         scene.tile_rects = &tile_rects;
+        let wave = s.visualizer.shown().filter(|_| s.config.borrow().sidebar.show_visualizer);
+        scene.visualizer = wave.as_ref().map(|(bars, k)| (bars.as_slice(), *k));
         if let Err(e) = draw::draw(cr, &scene) {
             eprintln!("draw failed: {e}");
         }
@@ -1325,6 +1729,10 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
                 started.elapsed().as_secs_f64() * 1000.0,
                 bench::rss().unwrap_or_else(|| "?".into())
             );
+            // The first file opened used to stall 20–30 ms loading the editor's languages
+            // and colour scheme; load them now, while nothing animates.
+            let theme = s.theme.borrow().clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || tile_view::prewarm(&theme));
         }
     });
 
@@ -1361,26 +1769,23 @@ fn connect_mouse(state: &Rc<App>) {
     let s = state.clone();
     click.connect_pressed(move |_, _, x, y| {
         // The tray and the overview handle their own clicks.
-        if s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open() || dialog::is_open() {
+        if s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open() || s.settings_card.is_open() || s.keybinds_card.is_open() || s.run_card.is_open() || dialog::is_open() {
             return;
         }
         let numbers = s.rail_dots();
         let clock = s.clock.borrow().clone();
-        let hit = draw::rail_hit(&s.scene(&numbers, "", &clock), x, y);
+        let hit = draw::rail_hit(&s.scene(&numbers, &clock), x, y);
         match hit {
             Some(draw::RailHit::Launcher) => s.toggle_drawer(),
-            // A second click on the peeked dot switches, like a nav-bar entry.
-            Some(draw::RailHit::Workspace(n)) if s.peek.target.get().is_some_and(|(t, _)| t == n) => {
+            // Hovering a dot previews it; a click goes there.
+            Some(draw::RailHit::Workspace(n)) => {
                 hide_peek(&s.peek.widget, &s.peek.target);
                 s.workspaces.borrow_mut().go(n);
-            }
-            Some(draw::RailHit::Workspace(n)) => {
-                let dot_y = draw::rail_items(&s.scene(&numbers, "", &clock)).iter().find(|i| i.0 == draw::RailHit::Workspace(n)).map_or(y, |i| i.1);
-                s.show_peek(n, dot_y);
             }
             Some(draw::RailHit::NewWorkspace) => s.workspaces.borrow_mut().create_next(),
             Some(draw::RailHit::Themes) => s.open_tray(),
             Some(draw::RailHit::Config) => s.workspaces.borrow_mut().toggle_config(),
+            Some(draw::RailHit::Settings) => s.toggle_settings(settings_ui::Page::General),
             None => {}
         }
     });
@@ -1413,6 +1818,7 @@ fn connect_mouse(state: &Rc<App>) {
     motion.connect_motion(move |_, x, y| {
         let cursor = s.near_resize_edge(x).then_some("col-resize");
         s.window.set_cursor_from_name(cursor);
+        s.hover_rail(x, y);
         s.track_peek(x, y);
     });
     let s = state.clone();
@@ -1433,7 +1839,7 @@ fn build_peek(overlay: &gtk::Overlay, workspaces: &Rc<RefCell<Workspaces>>) -> P
     widget.add_css_class("peek");
     widget.set_halign(gtk::Align::Start);
     widget.set_valign(gtk::Align::Start);
-    widget.set_margin_start((token::RAIL_WIDTH + PEEK_GAP) as i32);
+    widget.set_margin_start((token::rail_width() + PEEK_GAP) as i32);
     widget.set_size_request(PEEK_WIDTH, PEEK_HEIGHT);
     widget.set_overflow(gtk::Overflow::Hidden);
     widget.set_visible(false);
@@ -1452,7 +1858,15 @@ fn build_peek(overlay: &gtk::Overlay, workspaces: &Rc<RefCell<Workspaces>>) -> P
             ws.borrow_mut().go(n);
         }
     });
-    widget.append(&go);
+    go.set_hexpand(true);
+    let close = gtk::Button::from_icon_name("window-close-symbolic");
+    close.add_css_class("close");
+    close.set_tooltip_text(Some("Remove this workspace"));
+    close.set_valign(gtk::Align::Center);
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    header.append(&go);
+    header.append(&close);
+    widget.append(&header);
 
     let (w, t, ws) = (widget.clone(), target.clone(), workspaces.clone());
     let open_there: Rc<dyn Fn(&Path)> = Rc::new(move |path: &Path| {
@@ -1467,7 +1881,7 @@ fn build_peek(overlay: &gtk::Overlay, workspaces: &Rc<RefCell<Workspaces>>) -> P
     tree_widget.set_vexpand(true);
     widget.append(&tree_widget);
     overlay.add_overlay(&widget);
-    Peek { widget, go, tree, target }
+    Peek { widget, go, close, tree, target }
 }
 
 fn connect_keys(state: &Rc<App>) {
@@ -1489,7 +1903,15 @@ fn connect_keys(state: &Rc<App>) {
             return glib::Propagation::Proceed;
         }
         // While the tray or overview is open, only their own toggles act.
-        if (s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open()) && !matches!(action, Action::Themes | Action::Overview | Action::Editor | Action::Search | Action::Quit) {
+        if (s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open() || s.keybinds_card.is_open()) && !matches!(action, Action::Themes | Action::Overview | Action::Editor | Action::Search | Action::Quit | Action::Keybinds) {
+            return glib::Propagation::Proceed;
+        }
+        // The run card: only Alt+R (run again) and quitting act.
+        if s.run_card.is_open() && !matches!(action, Action::Run | Action::Quit) {
+            return glib::Propagation::Proceed;
+        }
+        // Settings takes typing; only its own keys act.
+        if s.settings_card.is_open() && !matches!(action, Action::Settings | Action::ThemesSection | Action::ExtensionsSection | Action::Toolchains | Action::Quit) {
             return glib::Propagation::Proceed;
         }
         // Editor actions leave their keys to a focused terminal (Ctrl+Space, F12).
@@ -1511,6 +1933,9 @@ fn connect_close(state: &Rc<App>) {
         let dirty = s.workspaces.borrow().dirty_count();
         if dirty == 0 || confirmed.get() {
             lsp::shutdown_all();
+            extensions::stop_all();
+            s.visualizer.shutdown();
+            debug::shutdown();
             return glib::Propagation::Proceed;
         }
         let files = if dirty == 1 { "1 file has".to_string() } else { format!("{dirty} files have") };

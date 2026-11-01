@@ -2,9 +2,10 @@
 //! Typed config model. Every field has a default, so an empty config is valid.
 //! Only what v0.2 applies is modelled; keys for later versions are accepted and dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tileide_core::layout::LayoutKind;
+use tileide_core::motion::Curve;
 use tileide_core::tiles::{Axis, Direction};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +23,11 @@ pub struct Config {
     pub workspaces: BTreeMap<u8, Workspace>,
     /// `tileide.lsp(name, { … })`, by server name ("rust", "c", "python", "typescript", "java").
     pub lsp: BTreeMap<String, Lsp>,
+    /// Setting keys (`settings::KEYS`) that `tileide.lua` set: Settings shows them locked
+    /// and `state.lua` can't override them.
+    pub explicit: BTreeSet<String>,
+    /// `tileide.runner(".ext", "command {file}")`: Alt+R commands by extension.
+    pub runners: BTreeMap<String, String>,
 }
 
 /// Overrides for one built-in language server.
@@ -45,6 +51,17 @@ pub struct Appearance {
     pub window_radius: u32,
     /// Smooth motion for tiles, workspace switches and overlays (the drawer always moves).
     pub animations: bool,
+    pub motion: Curve,
+    /// Divides every animation's duration.
+    pub motion_speed: f64,
+    /// Font of TileIDE's own interface (drawer, cards, rail).
+    pub ui_font: String,
+    /// Interface text size, 1.0 = as designed.
+    pub ui_scale: f64,
+    /// Editors and terminals.
+    pub code_font: String,
+    /// Points.
+    pub code_size: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +74,14 @@ pub struct Sidebar {
     pub show_files: bool,
     pub show_themes: bool,
     pub show_config: bool,
+    /// The audio visualizer (only while something plays).
+    pub show_visualizer: bool,
+    /// Size of the whole rail (its width and everything on it), 1.0 = as designed.
+    pub scale: f64,
+    /// Size of the rail's icons and dots within it.
+    pub icon_scale: f64,
+    /// The discs and squares behind the rail's icons.
+    pub icon_backgrounds: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,6 +161,27 @@ pub enum Action {
     Definition,
     /// Language server: completion at the cursor.
     Complete,
+    /// The drawer's Extensions section (installed extensions, weight meter).
+    ExtensionsSection,
+    /// Runs an extension command by id (e.g. "word-count.count").
+    Extension(String),
+    /// The Settings card.
+    Settings,
+    /// The keybinds card.
+    Keybinds,
+    /// Code font size of every tile: +1 or -1 point.
+    FontSize(i8),
+    /// Runs the focused file (or the Cargo project) and shows its output.
+    Run,
+    /// Debugging: start (or continue), stop, breakpoint at the cursor, steps.
+    Debug,
+    DebugStop,
+    Breakpoint,
+    StepOver,
+    StepInto,
+    StepOut,
+    /// Settings on its Toolchains page.
+    Toolchains,
     /// Valid, but its feature arrives in a later version; pressing it does nothing.
     Unavailable(String),
 }
@@ -152,7 +198,17 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             modifier: "ALT".into(),
-            appearance: Appearance { theme: None, window_radius: 14, animations: true },
+            appearance: Appearance {
+                theme: None,
+                window_radius: 14,
+                animations: true,
+                motion: Curve::Fluid,
+                motion_speed: 1.0,
+                ui_font: tileide_core::token::UI_FONT.into(),
+                ui_scale: 1.0,
+                code_font: "monospace".into(),
+                code_size: 11.0,
+            },
             sidebar: Sidebar {
                 start_expanded: false,
                 show_launcher: true,
@@ -162,6 +218,10 @@ impl Default for Config {
                 show_files: true,
                 show_themes: true,
                 show_config: true,
+                show_visualizer: true,
+                scale: 1.0,
+                icon_scale: 1.0,
+                icon_backgrounds: true,
             },
             background: Background { mode: "see-through".into(), source: None, dim: 0, blur: 0, tile_opacity: 0.92, fit: "cover".into() },
             background_set: false,
@@ -169,6 +229,8 @@ impl Default for Config {
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),
+            explicit: BTreeSet::new(),
+            runners: BTreeMap::new(),
         }
     }
 }
@@ -203,7 +265,8 @@ pub fn default_binds(m: &str) -> Vec<Bind> {
     for n in 1..=MAX_WORKSPACE {
         binds.push(bind(&[m], &(n % 10).to_string(), Action::Workspace(n)));
     }
-    for (key, d) in [("H", Left), ("J", Down), ("K", Up), ("L", Right)] {
+    // Arrows, so Alt+K stays free for the keybinds card (user choice, 2026-11-01).
+    for (key, d) in [("Left", Left), ("Down", Down), ("Up", Up), ("Right", Right)] {
         binds.push(bind(&[m], key, Action::Focus(d)));
         binds.push(bind(&[m, "SHIFT"], key, Action::Resize(d)));
         binds.push(bind(&[m, "SHIFT", "CTRL"], key, Action::Move(d)));
@@ -223,6 +286,18 @@ pub fn default_binds(m: &str) -> Vec<Bind> {
         bind(&[m], "D", Action::Folder),
         bind(&[m, "SHIFT"], "T", Action::ThemesSection),
         bind(&[m, "SHIFT"], "W", Action::WorkspaceClose),
+        bind(&[m, "SHIFT"], "X", Action::ExtensionsSection),
+        bind(&[m], "K", Action::Keybinds),
+        bind(&[m], "comma", Action::Settings),
+        bind(&[m], "equal", Action::FontSize(1)),
+        bind(&[m], "minus", Action::FontSize(-1)),
+        bind(&[m], "R", Action::Run),
+        bind(&[], "F5", Action::Debug),
+        bind(&["SHIFT"], "F5", Action::DebugStop),
+        bind(&[], "F9", Action::Breakpoint),
+        bind(&[], "F10", Action::StepOver),
+        bind(&[], "F11", Action::StepInto),
+        bind(&["SHIFT"], "F11", Action::StepOut),
         bind(&[m], "I", Action::Hover),
         bind(&[], "F12", Action::Definition),
         bind(&["CTRL"], "space", Action::Complete),

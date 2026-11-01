@@ -239,6 +239,9 @@ pub fn detach(buffer: &sourceview5::Buffer) {
         }
     }
     doc.popup.hide();
+    if let Some(view) = doc.view.upgrade() {
+        release_popovers(view.upcast_ref());
+    }
     clear_marks(buffer);
 }
 
@@ -372,6 +375,20 @@ fn line_text(buffer: &gtk::TextBuffer, line: i32) -> String {
 
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Unparents the popovers TileIDE attached to a text view (completion, `Alt+I` info).
+/// Must run before the view is disposed: GtkTextView's dispose removes children with
+/// `gtk_text_view_remove`, which only knows its own, warns about any other and leaves
+/// it in place, so its `while (first_child)` loop never ends and the app freezes.
+pub fn release_popovers(view: &gtk::Widget) {
+    let mut child = view.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        if c.is::<gtk::Popover>() {
+            c.unparent();
+        }
+    }
 }
 
 /// The start of the word that ends at `iter` (or `iter` itself).

@@ -1,0 +1,12 @@
+{
+  "id": "word-count",
+  "name": "Word count",
+  "version": "0.1.0",
+  "description": "Counts the words, lines and characters of the focused file, or inserts a summary.",
+  "run": ["python3", "./main.py"],
+  "activation": ["onCommand:word-count.count", "onCommand:word-count.insert"],
+  "commands": [
+    { "id": "word-count.count", "title": "Count words" },
+    { "id": "word-count.insert", "title": "Insert summary" }
+  ]
+}

@@ -73,7 +73,7 @@ pub fn crossfade(cover: &gtk::Picture) {
     cover.set_opacity(1.0);
     cover.set_visible(true);
     let c = cover.clone();
-    run(cover.upcast_ref(), Fade::with_duration(1.0, 0.0, motion::FADE_IN_US), move || {
+    run(cover.upcast_ref(), Fade::with_duration(1.0, 0.0, motion::fade_in_us()), move || {
         c.set_visible(false);
         c.set_paintable(None::<&gtk::gdk::Paintable>);
     });

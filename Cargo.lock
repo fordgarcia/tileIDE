@@ -104,6 +104,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,6 +755,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -863,21 +871,26 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tileide"
-version = "0.3.0-alpha.9"
+version = "0.4.0-alpha.4"
 dependencies = [
  "cairo-rs",
  "gtk4",
+ "libc",
  "pangocairo",
+ "serde_json",
  "sourceview5",
  "tileide-config",
  "tileide-core",
+ "tileide-dap",
+ "tileide-extensions",
  "tileide-lsp",
+ "tileide-notebook",
  "vte4",
 ]
 
 [[package]]
 name = "tileide-config"
-version = "0.3.0-alpha.9"
+version = "0.4.0-alpha.4"
 dependencies = [
  "mlua",
  "serde_json",
@@ -886,13 +899,43 @@ dependencies = [
 
 [[package]]
 name = "tileide-core"
-version = "0.3.0-alpha.9"
+version = "0.4.0-alpha.4"
+
+[[package]]
+name = "tileide-dap"
+version = "0.4.0-alpha.4"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tileide-core",
+ "tileide-lsp",
+]
+
+[[package]]
+name = "tileide-extensions"
+version = "0.4.0-alpha.4"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tileide-core",
+ "tileide-lsp",
+]
 
 [[package]]
 name = "tileide-lsp"
-version = "0.3.0-alpha.9"
+version = "0.4.0-alpha.4"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "tileide-notebook"
+version = "0.4.0-alpha.4"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tileide-core",
 ]
 
 [[package]]

@@ -27,6 +27,8 @@ pub enum Kind<'a> {
     /// `None` opens an untitled buffer; saving asks for a path.
     Editor(Option<&'a Path>),
     Terminal,
+    /// Any other view in a tile (the debug panel).
+    Panel(gtk::Widget),
 }
 
 struct Tile {
@@ -36,6 +38,8 @@ struct Tile {
     /// Editors only.
     buffer: Option<sourceview5::Buffer>,
     path: Option<PathBuf>,
+    /// `.ipynb` files open as notebooks.
+    notebook: Option<Rc<crate::notebook_view::NotebookView>>,
 }
 
 /// Tiles glide from where they are shown to where the layout puts them: opening,
@@ -51,6 +55,12 @@ struct Glide {
     k: f64,
     /// The frame callback, only while something glides (idle costs no wakeups).
     ticking: Option<gtk::TickCallbackId>,
+    /// `TILEIDE_TRACE_GLIDE`: when the glide was asked for, and each frame's time.
+    trace: Option<(std::time::Instant, Vec<i64>)>,
+}
+
+fn tracing() -> bool {
+    std::env::var_os("TILEIDE_TRACE_GLIDE").is_some()
 }
 
 /// A layout manager that gives each child exactly the rect stored for its widget name
@@ -275,6 +285,10 @@ impl TileView {
             }
         });
         lsp::attach(buffer, view, path, self.folder.as_deref(), goto);
+        crate::debug::attach(buffer, view, path);
+        if let Some(language) = buffer.language() {
+            crate::extensions::event(tileide_extensions::Event::Language(&language.id()));
+        }
     }
 
     /// Go to definition: the file's tile (opened if needed), cursor on `at`.
@@ -301,14 +315,32 @@ impl TileView {
 
     /// Ends language support for every editor (the workspace is being removed).
     pub fn release(&self) {
-        for buffer in self.tiles.values().filter_map(|t| t.buffer.as_ref()) {
-            lsp::detach(buffer);
+        for tile in self.tiles.values() {
+            if let Some(buffer) = &tile.buffer {
+                lsp::detach(buffer);
+            }
+            lsp::release_popovers(&tile.input);
         }
     }
 
     /// The focused tile's editor, if it is one (hover, definition and completion act on it).
     pub fn focused_editor(&self) -> Option<sourceview5::View> {
         self.tiles.get(&self.layout.focused()?)?.input.downcast_ref::<sourceview5::View>().cloned()
+    }
+
+    /// The focused tile's notebook, if it is one.
+    pub fn focused_notebook(&self) -> Option<Rc<crate::notebook_view::NotebookView>> {
+        self.tiles.get(&self.layout.focused()?)?.notebook.clone()
+    }
+
+    /// The focused editor has unsaved changes.
+    pub fn focused_dirty(&self) -> bool {
+        self.layout.focused().and_then(|id| self.tiles.get(&id)).and_then(|t| t.buffer.as_ref()).is_some_and(|b| b.is_modified())
+    }
+
+    /// The focused editor's file, if it has one.
+    pub fn focused_file(&self) -> Option<PathBuf> {
+        self.tiles.get(&self.layout.focused()?)?.path.clone()
     }
 
     pub fn set_wrap(&mut self, wrap: bool) {
@@ -325,6 +357,8 @@ impl TileView {
         for tile in self.tiles.values() {
             if let Some(buffer) = &tile.buffer {
                 apply_scheme(buffer, &theme);
+            } else if let Some(nb) = &tile.notebook {
+                nb.set_theme(theme.clone());
             } else if let Some(term) = tile.input.downcast_ref::<vte4::Terminal>() {
                 apply_terminal_colours(term, &theme);
             }
@@ -335,6 +369,7 @@ impl TileView {
     /// Opens a tile next to the focused one: a new column in the columns layout, a
     /// split in dwindle (see `split_next` for the direction).
     pub fn add(&mut self, kind: Kind) {
+        let began = std::time::Instant::now();
         // A file that is already open gets focus instead of a second, diverging buffer.
         if let Kind::Editor(Some(path)) = &kind
             && let Some(id) = self.find(path)
@@ -347,10 +382,24 @@ impl TileView {
         // The new tile grows out of the one it splits from.
         let parent = self.layout.focused().and_then(|f| self.glide.shown.get(&f).copied());
         let id = self.layout.add(self.area, self.gap);
+        let mut notebook = None;
         let (content, input, buffer, path) = match kind {
+            Kind::Editor(Some(path)) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ipynb")) => {
+                let nb = crate::notebook_view::NotebookView::open(path, self.theme.clone(), self.folder.clone());
+                let root: gtk::Widget = nb.widget().clone().upcast();
+                notebook = Some(nb);
+                (root.clone(), root, None, Some(path.to_path_buf()))
+            }
             Kind::Editor(path) => {
                 let (scroll, view, buffer) = editor(path, self.wrap, &self.theme);
                 (scroll, view, Some(buffer), path.map(Path::to_path_buf))
+            }
+            Kind::Panel(widget) => {
+                // Moved here from another workspace's tile, if it was shown there.
+                if let Some(frame) = widget.parent().and_downcast::<gtk::Box>() {
+                    frame.remove(&widget);
+                }
+                (widget.clone(), widget, None, None)
             }
             Kind::Terminal => {
                 let home = crate::workspaces::expand_home("~");
@@ -398,8 +447,17 @@ impl TileView {
 
         self.container.append(&frame);
         motion::fade_in(&frame);
-        self.tiles.insert(id, Tile { frame, input, buffer, path });
-        self.attach_lsp(id);
+        self.tiles.insert(id, Tile { frame, input, buffer, path, notebook });
+        // The language server (a process start and the whole file sent) waits until the
+        // tile has settled, so it never costs a frame of the opening glide.
+        let me = self.me.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_micros(tileide_core::motion::move_us() as u64), move || {
+            if let Some(view) = me.upgrade()
+                && let Ok(view) = view.try_borrow()
+            {
+                view.attach_lsp(id);
+            }
+        });
         self.relayout();
         if let Some(parent) = parent.filter(|_| !self.glide.from.is_empty()) {
             self.glide.from.insert(id, parent);
@@ -407,6 +465,9 @@ impl TileView {
         }
         self.apply_focus(true);
         (self.on_change)();
+        if tracing() {
+            eprintln!("trace: add() took {:.1} ms", began.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     /// The axis the next new tile uses (`split vertical` / `horizontal`).
@@ -431,7 +492,21 @@ impl TileView {
     }
 
     fn is_terminal(&self, id: TileId) -> bool {
-        self.tiles.get(&id).is_some_and(|t| t.buffer.is_none())
+        self.tiles.get(&id).is_some_and(|t| t.input.is::<vte4::Terminal>())
+    }
+
+    /// Whether `widget` is shown in one of this view's tiles.
+    pub fn shows(&self, widget: &gtk::Widget) -> bool {
+        self.tiles.values().any(|t| &t.input == widget)
+    }
+
+    /// Opens `path` (or focuses its tile) with the cursor on 1-based `line`; returns
+    /// the editor for the caller to mark the line.
+    pub fn show_line(&mut self, path: &Path, line: u32) -> Option<(sourceview5::View, sourceview5::Buffer)> {
+        let at = Position { line: line.saturating_sub(1), column: 0 };
+        self.goto(path, at, Encoding::Utf16);
+        let tile = self.tiles.get(&self.find(path)?)?;
+        Some((tile.input.downcast_ref::<sourceview5::View>()?.clone(), tile.buffer.clone()?))
     }
 
     /// Alt+F: shows `path` in the focused tile. An editor loads it in place; a terminal
@@ -482,6 +557,7 @@ impl TileView {
         if let Some(old) = &tile.buffer {
             lsp::detach(old);
         }
+        lsp::release_popovers(&tile.input);
         let (content, input, buffer) = editor(Some(path), self.wrap, &self.theme);
         content.set_hexpand(true);
         content.set_vexpand(true);
@@ -509,7 +585,9 @@ impl TileView {
     /// The tile's display name if it is an editor with unsaved changes.
     fn dirty_name(&self, id: TileId) -> Option<String> {
         let tile = self.tiles.get(&id)?;
-        tile.buffer.as_ref().filter(|b| b.is_modified())?;
+        if !tile.notebook.as_ref().is_some_and(|n| n.is_dirty()) {
+            tile.buffer.as_ref().filter(|b| b.is_modified())?;
+        }
         Some(tile.path.as_deref().and_then(Path::file_name).map_or_else(|| "Untitled".into(), |n| n.to_string_lossy().into_owned()))
     }
 
@@ -552,6 +630,11 @@ impl TileView {
             if let Some(buffer) = &tile.buffer {
                 lsp::detach(buffer);
             }
+            if let Some(nb) = &tile.notebook {
+                nb.shutdown();
+            }
+            // Also for views language support never attached to (see `release_popovers`).
+            lsp::release_popovers(&tile.input);
             // It fades where it stands while the others glide into its space.
             let (container, placement, frame) = (self.container.clone(), self.placement.clone(), tile.frame.clone());
             motion::fade_out_then(&tile.frame, move || {
@@ -592,6 +675,14 @@ impl TileView {
     /// main loop, never inside this borrow) only after a successful write.
     fn save(&self, id: TileId, parent: &gtk::Window, then: Option<Box<dyn FnOnce()>>) {
         let Some(tile) = self.tiles.get(&id) else { return };
+        if let Some(nb) = &tile.notebook {
+            if nb.save()
+                && let Some(then) = then
+            {
+                glib::idle_add_local_once(then);
+            }
+            return;
+        }
         let Some(buffer) = tile.buffer.clone() else { return };
         if let Some(path) = &tile.path {
             if write(path, &buffer)
@@ -640,6 +731,9 @@ impl TileView {
             self.glide.from = self.glide.shown.clone();
             self.glide.start_us = None;
             self.glide.k = 0.0;
+            if tracing() {
+                self.glide.trace = Some((std::time::Instant::now(), Vec::new()));
+            }
             self.start_ticking();
         }
         self.place();
@@ -669,8 +763,22 @@ impl TileView {
         let start = *self.glide.start_us.get_or_insert(now_us);
         let (k, done) = tileide_core::motion::progress(start, now_us);
         self.glide.k = k;
+        if let Some((_, frames)) = self.glide.trace.as_mut() {
+            frames.push(now_us);
+        }
         if done {
             self.glide.from.clear();
+            if let Some((asked, frames)) = self.glide.trace.take() {
+                let mut gaps: Vec<f64> = frames.windows(2).map(|w| (w[1] - w[0]) as f64 / 1000.0).collect();
+                gaps.sort_by(f64::total_cmp);
+                let first = asked.elapsed().as_secs_f64() * 1000.0 - (now_us - frames[0]) as f64 / 1000.0;
+                eprintln!(
+                    "trace: glide {} frames, first frame {first:.1} ms after the request, frame gap median {:.1} ms, max {:.1} ms",
+                    frames.len(),
+                    gaps.get(gaps.len() / 2).copied().unwrap_or(0.0),
+                    gaps.last().copied().unwrap_or(0.0)
+                );
+            }
         }
         self.place();
     }
@@ -717,7 +825,12 @@ impl TileView {
             if Some(*id) == focused {
                 tile.frame.add_css_class("focused");
                 if grab {
-                    tile.input.grab_focus();
+                    match &tile.notebook {
+                        Some(nb) => nb.focus(),
+                        None => {
+                            tile.input.grab_focus();
+                        }
+                    }
                 }
             } else {
                 tile.frame.remove_css_class("focused");
@@ -753,7 +866,7 @@ fn wrap_mode(wrap: bool) -> gtk::WrapMode {
 /// terminal's, syntax from `Theme::syntax` (the terminal's hues), line numbers on no
 /// background and the current line as a faint white band. Adwaita (light or dark) is
 /// the parent, for the styles a theme has no colour for (search matches, diff marks).
-fn apply_scheme(buffer: &sourceview5::Buffer, theme: &Theme) {
+pub fn apply_scheme(buffer: &sourceview5::Buffer, theme: &Theme) {
     let manager = sourceview5::StyleSchemeManager::default();
     let scheme = tileide_scheme(&manager, theme).or_else(|| manager.scheme(if theme.dark { "Adwaita-dark" } else { "Adwaita" }));
     if let Some(scheme) = scheme {
@@ -823,6 +936,19 @@ fn tileide_scheme(manager: &sourceview5::StyleSchemeManager, theme: &Theme) -> O
         manager.force_rescan();
     }
     manager.scheme(&id)
+}
+
+/// Loads what the first editor needs (language definitions, the generated colour
+/// scheme, the text view's styles) with a throwaway editor, off any animation.
+pub fn prewarm(theme: &Theme) {
+    let started = std::time::Instant::now();
+    let (_, view, buffer) = editor(None, false, theme);
+    let manager = sourceview5::LanguageManager::default();
+    buffer.set_language(manager.guess_language(Some("a.rs"), None).as_ref());
+    let _ = view.measure(gtk::Orientation::Horizontal, -1);
+    if tracing() {
+        eprintln!("trace: editor prewarm {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+    }
 }
 
 fn editor(path: Option<&Path>, wrap: bool, theme: &Theme) -> (gtk::Widget, gtk::Widget, sourceview5::Buffer) {

@@ -199,6 +199,29 @@ fn state_round_trips_and_tolerates_odd_names() {
     assert_eq!(load_state(&path).unwrap(), state, "picker choices round-trip");
 
     let mut state = State::default();
+    let mut pick = tileide_config::ExtensionPick { enabled: false, ..Default::default() };
+    pick.workspaces.insert(3, tileide_core::extension::Mode::Off);
+    pick.workspaces.insert(4, tileide_core::extension::Mode::On);
+    state.extensions.insert("word-count".into(), pick);
+    let mut on_here = tileide_config::ExtensionPick::default();
+    on_here.workspaces.insert(1, tileide_core::extension::Mode::On);
+    state.extensions.insert("we\"ird".into(), on_here);
+    save_state(&path, &state).unwrap();
+    assert_eq!(load_state(&path).unwrap(), state, "extension choices round-trip");
+
+    let mut state = State::default();
+    use tileide_config::settings::Value;
+    state.settings.insert("appearance.code_font".into(), Value::Text("Iosevka \"Term\"".into()));
+    state.settings.insert("appearance.code_size".into(), Value::Number(13.5));
+    state.settings.insert("sidebar.show_clock".into(), Value::Bool(false));
+    state.settings.insert("appearance.motion".into(), Value::Text("snappy".into()));
+    save_state(&path, &state).unwrap();
+    assert_eq!(load_state(&path).unwrap(), state, "GUI settings round-trip");
+    fs::write(&path, "return { settings = { [\"tiling.gaps_in\"] = 30, [\"appearance.motion\"] = \"bouncy\", [\"x.y\"] = 1 } }").unwrap();
+    let loaded = load_state(&path).unwrap();
+    assert_eq!(loaded.settings.len(), 1, "unknown keys and bad choices are dropped: {:?}", loaded.settings);
+
+    let mut state = State::default();
     for i in 0..15 {
         state.remember_folder(&format!("/f{i}"));
     }
@@ -373,4 +396,16 @@ fn memory_bomb_hits_memory_limit() {
 #[test]
 fn pattern_backtracking_hits_time_limit() {
     fails("pattern", "local s = ('a'):rep(26) s:find(('a-'):rep(26) .. 'b')");
+}
+
+#[test]
+fn runners_and_settings_keys_load() {
+    let dir = config_dir("runner", &[("tileide.lua", "tileide.runner('.PY', 'uv run {file}')\ntileide.appearance { code_size = 14, motion = 'snappy' }\ntileide.bind('ALT', 'R', 'run')")]);
+    let loaded = load(&dir.join("tileide.lua"), Limits::default()).unwrap();
+    assert_eq!(loaded.config.runners.get(".py").map(String::as_str), Some("uv run {file}"));
+    assert!(loaded.config.explicit.contains("appearance.code_size") && loaded.config.explicit.contains("appearance.motion"));
+    assert!(!loaded.config.explicit.contains("tiling.gaps_in"));
+    assert!(loaded.config.binds.iter().any(|b| b.action == Action::Run));
+    let bad = config_dir("runner-bad", &[("tileide.lua", "tileide.runner('py', 'x')")]);
+    assert!(load(&bad.join("tileide.lua"), Limits::default()).unwrap_err().contains("must look like"));
 }

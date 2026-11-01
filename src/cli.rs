@@ -39,17 +39,20 @@ Full-screen background (ignored when windowed; overrides tileide.background):
 Keys (Alt is TileIDE's modifier; all can be rebound with tileide.bind):
   Alt+Return terminal   Alt+E new file      Alt+W close tile    Ctrl+S save
   Alt+B files drawer    Alt+C config        Alt+Z word wrap     Alt+1..9, 0 workspaces
-  Alt+H/J/K/L focus     Alt+Shift+H/J/K/L resize   Alt+Ctrl+Shift+H/J/K/L move
+  Alt+arrows focus      Alt+Shift+arrows resize    Alt+Ctrl+Shift+arrows move
   Alt+V dwindle/columns Alt+S next tile below      Alt+O overview  Alt+T themes
   Alt+D workspace folder  Alt+Shift+W remove workspace
   Ctrl+Space complete   F12 / Ctrl+click definition    Alt+I info at cursor
+  Alt+, settings       Alt+K keybinds      Alt+= / Alt+- code font size
+  Alt+R run the focused file (Ctrl+C stop, Esc close; a notebook runs all cells)
+  F9 breakpoint  F5 debug/continue  F10 over  F11 into  Shift+F11 out  Shift+F5 stop
   Alt+Escape quit
 
 Config lives in ~/.config/tileide/ (created from a sample on first run); saved
 changes apply at once.";
 
 /// Flags that take a value; anything else starting with `-` is a switch.
-const WITH_VALUE: &[&str] = &["--bg", "--dim", "--tint", "--blur", "--fit", "--tile-opacity", "--seconds", "--bench-drawer"];
+const WITH_VALUE: &[&str] = &["--bg", "--dim", "--tint", "--blur", "--fit", "--tile-opacity", "--seconds", "--bench-drawer", "--test-actions"];
 const SWITCHES: &[&str] = &["-w", "--windowed", "-f", "--fullscreen", "--wait", "--foreground", "--solid", "--overlay", "--no-auto-dim"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +75,9 @@ pub struct Options {
     pub solid: bool,
     pub seconds: Option<u32>,
     pub bench_toggles: Option<u32>,
+    /// Development: `action@seconds,…` run on a timer (headless tests; `--test-actions
+    /// "run@2,save@12,quit@14"`). Action names as in `tileide.bind`.
+    pub test_actions: Vec<(String, f64)>,
     /// Set only when background flags were given; they then win over `tileide.background`.
     pub background: Option<background::Settings>,
 }
@@ -150,6 +156,12 @@ pub fn parse(args: &[String], cwd: &Path) -> Result<Command, String> {
         solid: has("--solid"),
         seconds: number("--seconds")?,
         bench_toggles: number("--bench-drawer")?,
+        test_actions: args
+            .iter()
+            .position(|a| a == "--test-actions")
+            .and_then(|i| args.get(i + 1))
+            .map(|list| list.split(',').filter_map(|item| item.split_once('@').and_then(|(a, t)| Some((a.trim().to_string(), t.trim().parse().ok()?)))).collect())
+            .unwrap_or_default(),
         background: match args.iter().any(|a| BACKGROUND_FLAGS.contains(&a.as_str())) {
             true => Some(background::Settings::from_args(args)?),
             false => None,

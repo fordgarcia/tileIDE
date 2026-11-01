@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use mlua::{Lua, Result, Table, Value, Variadic};
 use tileide_core::layout::LayoutKind;
+use tileide_core::motion::{Curve, MAX_SPEED, MIN_SPEED};
 use tileide_core::tiles::{Axis, Direction};
 
 use crate::fields::{Fields, error};
@@ -68,11 +69,19 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
     api.set("appearance", lua.create_function(move |lua, value: Value| {
         let mut f = options(lua, "appearance", value)?;
         let mut b = b.borrow_mut();
+        let mut set = Vec::new();
         let a = &mut b.config.appearance;
         if let Some(v) = f.string("theme")? { a.theme = Some(v) }
-        if let Some(v) = f.uint("window_radius", 60)? { a.window_radius = v }
-        if let Some(v) = f.boolean("animations")? { a.animations = v }
+        if let Some(v) = f.uint("window_radius", 60)? { a.window_radius = v; set.push("window_radius") }
+        if let Some(v) = f.boolean("animations")? { a.animations = v; set.push("animations") }
+        if let Some(v) = f.choice("motion", &["fluid", "snappy"])? { a.motion = Curve::from_key(&v).unwrap_or_default(); set.push("motion") }
+        if let Some(v) = f.number("motion_speed", MIN_SPEED, MAX_SPEED)? { a.motion_speed = v; set.push("motion_speed") }
+        if let Some(v) = f.string("ui_font")? { a.ui_font = v; set.push("ui_font") }
+        if let Some(v) = f.number("ui_scale", crate::settings::UI_SCALE.0, crate::settings::UI_SCALE.1)? { a.ui_scale = v; set.push("ui_scale") }
+        if let Some(v) = f.string("code_font")? { a.code_font = v; set.push("code_font") }
+        if let Some(v) = f.number("code_size", crate::settings::CODE_SIZE.0, crate::settings::CODE_SIZE.1)? { a.code_size = v; set.push("code_size") }
         f.accept(&["opacity", "blur_hint"]);
+        b.config.explicit.extend(set.into_iter().map(|k| format!("appearance.{k}")));
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -81,8 +90,9 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
     api.set("sidebar", lua.create_function(move |lua, value: Value| {
         let mut f = options(lua, "sidebar", value)?;
         let mut b = b.borrow_mut();
+        let mut set = Vec::new();
         let s = &mut b.config.sidebar;
-        if let Some(v) = f.choice("start_state", &["collapsed", "expanded"])? { s.start_expanded = v == "expanded" }
+        if let Some(v) = f.choice("start_state", &["collapsed", "expanded"])? { s.start_expanded = v == "expanded"; set.push("start_expanded") }
         for (key, slot) in [
             ("show_launcher", &mut s.show_launcher),
             ("show_workspaces", &mut s.show_workspaces),
@@ -91,10 +101,15 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
             ("show_files", &mut s.show_files),
             ("show_themes", &mut s.show_themes),
             ("show_config", &mut s.show_config),
+            ("show_visualizer", &mut s.show_visualizer),
+            ("icon_backgrounds", &mut s.icon_backgrounds),
         ] {
-            if let Some(v) = f.boolean(key)? { *slot = v }
+            if let Some(v) = f.boolean(key)? { *slot = v; set.push(key) }
         }
+        if let Some(v) = f.number("scale", crate::settings::RAIL_SCALE.0, crate::settings::RAIL_SCALE.1)? { s.scale = v; set.push("scale") }
+        if let Some(v) = f.number("icon_scale", crate::settings::ICON_SCALE.0, crate::settings::ICON_SCALE.1)? { s.icon_scale = v; set.push("icon_scale") }
         f.accept(&["drawer_fillet", "show_system", "show_extensions"]);
+        b.config.explicit.extend(set.into_iter().map(|k| format!("sidebar.{k}")));
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -113,11 +128,13 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
     api.set("tiling", lua.create_function(move |lua, value: Value| {
         let mut f = options(lua, "tiling", value)?;
         let mut b = b.borrow_mut();
+        let mut set = Vec::new();
         let t = &mut b.config.tiling;
         if let Some(v) = layout_kind(&mut f, "layout")? { t.layout = v }
-        if let Some(v) = f.uint("gaps_in", 100)? { t.gaps_in = v }
-        if let Some(v) = f.uint("gaps_out", 100)? { t.gaps_out = v }
+        if let Some(v) = f.uint("gaps_in", 100)? { t.gaps_in = v; set.push("gaps_in") }
+        if let Some(v) = f.uint("gaps_out", 100)? { t.gaps_out = v; set.push("gaps_out") }
         if let Some(v) = f.number("column_width", 0.2, 1.0)? { t.column_width = v }
+        b.config.explicit.extend(set.into_iter().map(|k| format!("tiling.{k}")));
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -194,6 +211,20 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         Ok(())
     })?)?;
 
+    let b = shared.clone();
+    api.set("runner", lua.create_function(move |lua, (ext, cmd): (Value, Value)| {
+        let location = caller(lua);
+        let (Value::String(ext), Value::String(cmd)) = (ext, cmd) else {
+            return Err(error(&location, "runner: expects an extension and a command, e.g. runner(\".py\", \"python3 -u {file}\")"));
+        };
+        let (ext, cmd) = (ext.to_str()?.to_lowercase(), cmd.to_str()?.to_string());
+        if !ext.starts_with('.') || ext.len() < 2 {
+            return Err(error(&location, &format!("runner: the extension must look like \".py\", got \"{ext}\"")));
+        }
+        b.borrow_mut().config.runners.insert(ext, cmd);
+        Ok(())
+    })?)?;
+
     // Later versions (v0.3 extensions, v0.4 toolchains): accepted so configs written
     // for them load today, and ignored.
     for func in ["extension", "toolchain"] {
@@ -266,7 +297,27 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
         "hover" => Action::Hover,
         "definition" => Action::Definition,
         "complete" => Action::Complete,
-        "moveto" | "palette" | "run" => Action::Unavailable(action.into()),
+        "extensions_section" => Action::ExtensionsSection,
+        "settings" => Action::Settings,
+        "keybinds" => Action::Keybinds,
+        "font_size" => match arg {
+            Some("up") => Action::FontSize(1),
+            Some("down") => Action::FontSize(-1),
+            other => return Err(with(&format!("expected up or down, got {}", other.unwrap_or("nothing")))),
+        },
+        "extension" => match arg {
+            Some(id) if !id.is_empty() => Action::Extension(id.into()),
+            _ => return Err(with("needs a command id, e.g. \"word-count.count\"")),
+        },
+        "run" => Action::Run,
+        "debug" => Action::Debug,
+        "debug_stop" => Action::DebugStop,
+        "breakpoint" => Action::Breakpoint,
+        "step_over" => Action::StepOver,
+        "step_into" => Action::StepInto,
+        "step_out" => Action::StepOut,
+        "toolchains" => Action::Toolchains,
+        "moveto" | "palette" => Action::Unavailable(action.into()),
         other => return Err(format!("unknown action \"{other}\"")),
     })
 }

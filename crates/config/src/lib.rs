@@ -8,6 +8,7 @@ pub mod api;
 pub mod fields;
 pub mod model;
 pub mod sandbox;
+pub mod settings;
 pub mod vscode;
 
 use std::cell::RefCell;
@@ -17,6 +18,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use mlua::{Lua, Value};
+use tileide_core::extension::Mode;
 use tileide_core::theme::{ANSI_KEYS, Glass, SYNTAX_KEYS, Theme};
 
 use fields::Fields;
@@ -162,6 +164,29 @@ pub struct State {
     pub background: Option<model::Background>,
     /// Themes section picks for one workspace, by number.
     pub workspaces: BTreeMap<u8, WorkspacePick>,
+    /// Extensions section choices, by extension id.
+    pub extensions: BTreeMap<String, ExtensionPick>,
+    /// Settings changed in the GUI (`settings::KEYS`).
+    pub settings: BTreeMap<String, settings::Value>,
+}
+
+/// An extension's switch and its per-workspace modes (absent = on demand).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionPick {
+    pub enabled: bool,
+    pub workspaces: BTreeMap<u8, Mode>,
+}
+
+impl Default for ExtensionPick {
+    fn default() -> Self {
+        ExtensionPick { enabled: true, workspaces: BTreeMap::new() }
+    }
+}
+
+impl ExtensionPick {
+    pub fn mode(&self, workspace: Option<u8>) -> Mode {
+        workspace.and_then(|n| self.workspaces.get(&n).copied()).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -195,6 +220,32 @@ pub fn load_state(path: &Path) -> Result<State, String> {
                 let Some(mut w) = list.table(&key)? else { continue };
                 let pick = WorkspacePick { theme: w.string("theme")?, background: w.table("background")?.map(|mut b| state_background(&mut b)).transpose()? };
                 state.workspaces.insert(n, pick);
+            }
+        }
+        if let Some(mut list) = f.table("settings")? {
+            for key in list.keys() {
+                let value = match settings::kind(&key) {
+                    Some(settings::Kind::Bool) => list.boolean(&key)?.map(settings::Value::Bool),
+                    Some(settings::Kind::Number(min, max)) => list.number(&key, min, max)?.map(settings::Value::Number),
+                    Some(settings::Kind::Text | settings::Kind::Choice(_)) => list.string(&key)?.map(settings::Value::Text),
+                    None => None,
+                };
+                if let Some(v) = value.and_then(|v| settings::checked(&key, v)) {
+                    state.settings.insert(key, v);
+                }
+            }
+        }
+        if let Some(mut list) = f.table("extensions")? {
+            for id in list.keys() {
+                let Some(mut e) = list.table(&id)? else { continue };
+                let mut pick = ExtensionPick { enabled: e.boolean("enabled")?.unwrap_or(true), ..ExtensionPick::default() };
+                if let Some(mut modes) = e.table("workspaces")? {
+                    for key in modes.keys() {
+                        let (Ok(n), Some(mode)) = (key.parse::<u8>(), modes.string(&key)?.as_deref().and_then(Mode::from_key)) else { continue };
+                        pick.workspaces.insert(n, mode);
+                    }
+                }
+                state.extensions.insert(id, pick);
             }
         }
         Ok(state)
@@ -233,6 +284,33 @@ pub fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
         .collect();
     if !picks.is_empty() {
         text += &format!("  workspaces = {{\n{}  }},\n", picks.concat());
+    }
+    let extensions: Vec<String> = state
+        .extensions
+        .iter()
+        .filter(|(_, e)| **e != ExtensionPick::default())
+        .map(|(id, e)| {
+            let modes: Vec<String> = e.workspaces.iter().filter(|(_, m)| **m != Mode::OnDemand).map(|(n, m)| format!("[\"{n}\"] = {}", lua_string(m.key()))).collect();
+            format!("    [{}] = {{ enabled = {}, workspaces = {{ {} }} }},\n", lua_string(id), e.enabled, modes.join(", "))
+        })
+        .collect();
+    if !extensions.is_empty() {
+        text += &format!("  extensions = {{\n{}  }},\n", extensions.concat());
+    }
+    let settings: Vec<String> = state
+        .settings
+        .iter()
+        .map(|(key, v)| {
+            let value = match v {
+                settings::Value::Bool(b) => b.to_string(),
+                settings::Value::Number(n) => format!("{n}"),
+                settings::Value::Text(t) => lua_string(t),
+            };
+            format!("    [{}] = {value},\n", lua_string(key))
+        })
+        .collect();
+    if !settings.is_empty() {
+        text += &format!("  settings = {{\n{}  }},\n", settings.concat());
     }
     if !state.recent_folders.is_empty() {
         let list: Vec<String> = state.recent_folders.iter().map(|f| lua_string(f)).collect();

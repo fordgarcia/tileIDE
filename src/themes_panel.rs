@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The drawer's Themes section (design.md S1d + S1f, v0.3 phase 7): the local themes
+//! The Themes & background page of Settings (design.md S1d + S1f, v0.3 phase 7; in the drawer until v0.4): the local themes
 //! (hover or select one to preview it on the real window, click or Enter to apply),
 //! applied to every workspace or only this one, the VS Code theme import, and the
 //! background picker (modes, sliders, legibility, live). The app owns what applies;
@@ -78,7 +78,8 @@ pub fn css(t: &Theme) -> String {
 .themes scale highlight {{ background-color: {accent}; border-radius: 2px; }}
 .themes scale slider {{ background-color: {accent}; min-width: 14px; min-height: 14px; margin: -5px; border-radius: 7px; border: none; box-shadow: none; }}
 .themes .value {{ color: {muted}; font-size: 12px; }}
-.drawer .switcher {{ padding: 8px 8px 0 10px; }}",
+.drawer .switcher {{ padding: 8px 8px 0 10px; }}
+.drawer flowbox.flow, .drawer flowbox.flow flowboxchild {{ background: transparent; padding: 0; min-width: 0; }}",
         text = c(t.text, 1.0),
         muted = c(t.muted, 1.0),
         error = c(t.error, 1.0),
@@ -96,10 +97,10 @@ struct Controls {
     note: gtk::Label,
     list: gtk::ListBox,
     modes: Vec<gtk::ToggleButton>,
-    image_row: gtk::Box,
+    image_row: gtk::FlowBox,
     image_button: gtk::Button,
     fit: gtk::DropDown,
-    gradient_row: gtk::Box,
+    gradient_row: gtk::FlowBox,
     gradient_top: gtk::ColorDialogButton,
     gradient_bottom: gtk::ColorDialogButton,
     solid_row: gtk::Box,
@@ -137,7 +138,7 @@ impl ThemesPanel {
         let scope_workspace = pill("This workspace");
         scope_workspace.set_group(Some(&scope_all));
         scope_all.set_active(true);
-        let scope = row_of(&[scope_all.upcast_ref(), scope_workspace.upcast_ref()]);
+        let scope = flow_row(&[scope_all.upcast_ref(), scope_workspace.upcast_ref()]);
         scope.set_margin_top(6);
         content.append(&scope);
         let note = gtk::Label::new(None);
@@ -168,20 +169,13 @@ impl ThemesPanel {
         for m in &modes[1..] {
             m.set_group(Some(&modes[0]));
         }
-        let mode_row = gtk::FlowBox::new();
-        mode_row.set_selection_mode(gtk::SelectionMode::None);
-        mode_row.set_max_children_per_line(4);
-        mode_row.set_column_spacing(4);
-        mode_row.set_row_spacing(4);
-        for m in &modes {
-            mode_row.append(m);
-        }
-        picker.append(&mode_row);
+        let mode_widgets: Vec<&gtk::Widget> = modes.iter().map(|m| m.upcast_ref()).collect();
+        picker.append(&flow_row(&mode_widgets));
 
         let image_button = gtk::Button::with_label("Choose image…");
         image_button.add_css_class("pill");
         let fit = gtk::DropDown::from_strings(&FITS);
-        let image_row = row_of(&[image_button.upcast_ref(), fit.upcast_ref()]);
+        let image_row = flow_row(&[image_button.upcast_ref(), fit.upcast_ref()]);
         picker.append(&image_row);
         let colour = || {
             let b = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::builder().with_alpha(false).build()));
@@ -189,7 +183,9 @@ impl ThemesPanel {
             b
         };
         let (gradient_top, gradient_bottom) = (colour(), colour());
-        let gradient_row = row_of(&[label("Top").upcast_ref(), gradient_top.upcast_ref(), label("Bottom").upcast_ref(), gradient_bottom.upcast_ref()]);
+        let top = row_of(&[label("Top").upcast_ref(), gradient_top.upcast_ref()]);
+        let bottom = row_of(&[label("Bottom").upcast_ref(), gradient_bottom.upcast_ref()]);
+        let gradient_row = flow_row(&[top.upcast_ref(), bottom.upcast_ref()]);
         picker.append(&gradient_row);
         let solid = colour();
         let solid_row = row_of(&[label("Colour").upcast_ref(), solid.upcast_ref()]);
@@ -536,6 +532,27 @@ fn row_of(children: &[&gtk::Widget]) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     for c in children {
         row.append(*c);
+    }
+    row
+}
+
+/// A row that wraps onto more lines instead of widening the drawer (its minimum width
+/// is its widest child's).
+pub fn flow_row(children: &[&gtk::Widget]) -> gtk::FlowBox {
+    let row = gtk::FlowBox::new();
+    row.add_css_class("flow");
+    // Packed to the left; a FlowBox spreads extra width between its children otherwise.
+    row.set_halign(gtk::Align::Start);
+    row.set_selection_mode(gtk::SelectionMode::None);
+    row.set_max_children_per_line(children.len().max(1) as u32);
+    row.set_column_spacing(4);
+    row.set_row_spacing(4);
+    for c in children {
+        row.append(*c);
+        if let Some(child) = c.parent() {
+            child.set_focusable(false);
+            child.set_halign(gtk::Align::Start);
+        }
     }
     row
 }

@@ -3,9 +3,12 @@
 
 pub mod columns;
 pub mod drawer;
+pub mod extension;
 pub mod layout;
 pub mod motion;
+pub mod run;
 pub mod search;
 pub mod theme;
 pub mod tiles;
+pub mod visualizer;
 pub mod token;

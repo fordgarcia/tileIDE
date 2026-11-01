@@ -17,6 +17,9 @@ pub struct FrameStats {
     pub draw_times: Vec<Duration>,
 }
 
+/// Bar heights for the offscreen `--visualizer` preview (mirrored like the real one).
+const SAMPLE_WAVE: [f64; 24] = [0.15, 0.22, 0.3, 0.26, 0.38, 0.5, 0.44, 0.62, 0.7, 0.85, 0.78, 0.95, 0.95, 0.78, 0.85, 0.7, 0.62, 0.44, 0.5, 0.38, 0.26, 0.3, 0.22, 0.15];
+
 pub fn print_stats(window: &gtk::ApplicationWindow, s: &FrameStats) {
     let refresh_mhz = window
         .surface()
@@ -65,6 +68,9 @@ pub fn render(args: &[String]) -> Result<(), String> {
     let out = args.first().ok_or(usage)?;
     let open: f64 = args.get(1).and_then(|p| p.parse().ok()).ok_or(usage)?;
     let (w, h, scale) = (1280.0, 720.0, 2.0);
+    // `--rail-scale N` / `--icon-scale N`: Settings' sidebar and icon sizes.
+    let number = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
+    tileide_core::token::set_rail(number("--rail-scale").unwrap_or(1.0), number("--icon-scale").unwrap_or(1.0));
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, (w * scale) as i32, (h * scale) as i32).map_err(|e| e.to_string())?;
     let cr = cairo::Context::new(&surface).map_err(|e| e.to_string())?;
     cr.scale(scale, scale);
@@ -87,17 +93,21 @@ pub fn render(args: &[String]) -> Result<(), String> {
         height: h,
         theme: std::rc::Rc::new(theme),
         geometry: tileide_core::token::Geometry::default(),
-        modules: draw::Modules::default(),
+        // `--plain-icons`: no backgrounds behind the rail icons.
+        modules: draw::Modules { icon_backgrounds: !args.iter().any(|a| a == "--plain-icons"), ..draw::Modules::default() },
         themes_open: false,
+        settings_open: false,
+        // `--visualizer`: a sample waveform where the rail label goes.
+        visualizer: args.iter().any(|a| a == "--visualizer").then_some((SAMPLE_WAVE.as_slice(), 1.0)),
         solid: false,
         drawer: tileide_core::token::DRAWER_WIDTH * open.clamp(0.0, 1.0),
         push: !args.iter().any(|a| a == "--overlay"),
         workspaces: &[(1, 1.0), (2, 1.0), (3, 1.0)],
         active: Some(2),
-        label: "tileIDE · 2",
         clock: ("21", "45"),
-        empty: false,
-        placeholder_tiles: true,
+        // `--empty`: an empty workspace instead of the three placeholder tiles.
+        empty: args.iter().any(|a| a == "--empty"),
+        placeholder_tiles: !args.iter().any(|a| a == "--empty"),
         background: background.as_ref(),
         frosted: frosted.as_ref(),
         tile_rects: &[],

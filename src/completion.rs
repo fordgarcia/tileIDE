@@ -72,9 +72,9 @@ impl Popup {
         popover.set_position(gtk::PositionType::Bottom);
         popover.set_halign(gtk::Align::Start);
         popover.set_child(Some(&scroll));
+        // Unparented by `lsp::release_popovers` before the view goes away: GtkTextView's
+        // dispose loops forever on a child it didn't add itself (GTK 4.24).
         popover.set_parent(view);
-        let p = popover.clone();
-        view.connect_destroy(move |_| p.unparent());
 
         let popup = Rc::new(Popup { view: view.downgrade(), popover, list, scroll, state: RefCell::new(State::default()) });
 

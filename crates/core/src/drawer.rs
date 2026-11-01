@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Drawer state: open/close animation (frame-clock driven) and its user-set width.
 
-use crate::token;
-
-/// design.md §8: drawer expand/collapse 180–220 ms, ease-out, interruptible.
-pub const DURATION_US: f64 = 200_000.0;
+use crate::{motion, token};
 
 pub struct Drawer {
     /// Linear animation time 0..1; drawing eases it.
@@ -46,13 +43,13 @@ impl Drawer {
         let start = *self.start_us.get_or_insert(now_us);
         // A partial reverse takes proportionally less time.
         let span = (self.target - self.from).abs().max(f64::EPSILON);
-        let t = ((now_us - start) as f64 / (DURATION_US * span)).min(1.0);
+        let t = ((now_us - start) as f64 / (motion::drawer_us() * span)).min(1.0);
         self.progress = self.from + (self.target - self.from) * t;
     }
 
-    /// Current extension in px (ease-out cubic).
+    /// Current extension in px (the motion curve, `motion::ease`).
     pub fn extension(&self) -> f64 {
-        self.width * (1.0 - (1.0 - self.progress).powi(3))
+        self.width * motion::ease(self.progress)
     }
 
     pub fn set_width(&mut self, width: f64) {
@@ -69,7 +66,7 @@ mod tests {
         let mut d = Drawer::default();
         d.toggle();
         d.tick(0);
-        d.tick(DURATION_US as i64);
+        d.tick(motion::drawer_us() as i64);
         assert_eq!(d.progress, 1.0);
         assert!(d.is_open());
         assert_eq!(d.extension(), token::DRAWER_WIDTH);
@@ -79,14 +76,15 @@ mod tests {
     fn reversing_mid_animation_is_continuous_and_shorter() {
         let mut d = Drawer::default();
         d.toggle();
+        let half = (motion::drawer_us() / 2.0) as i64;
         d.tick(0);
-        d.tick(100_000);
+        d.tick(half);
         let at_reverse = d.progress;
-        assert!((at_reverse - 0.5).abs() < 1e-9);
+        assert!((at_reverse - 0.5).abs() < 1e-6);
         d.toggle();
-        d.tick(100_000);
+        d.tick(half);
         assert_eq!(d.progress, at_reverse, "no jump when reversing");
-        d.tick(200_000);
+        d.tick(2 * half);
         assert_eq!(d.progress, 0.0, "half the distance takes half the time");
     }
 

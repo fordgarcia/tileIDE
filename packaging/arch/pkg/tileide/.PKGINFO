@@ -3,12 +3,12 @@
 pkgname = tileide
 pkgbase = tileide
 xdata = pkgtype=pkg
-pkgver = 0.3.0alpha9-1
+pkgver = 0.4.0alpha4-1
 pkgdesc = A tiling, riceable code editor for Hyprland
 url = https://github.com/fordgarcia/tileIDE
-builddate = 1793506619
+builddate = 1793522731
 packager = Unknown Packager
-size = 3858354
+size = 4924117
 arch = x86_64
 license = GPL-3.0-or-later
 depend = gtk4
@@ -23,4 +23,11 @@ depend = glibc
 depend = libarchive
 optdepend = otf-space-grotesk: the intended UI font (AUR; falls back to the default sans)
 optdepend = hyprland: the compositor TileIDE is designed and tested on
+optdepend = git: install extensions from a git URL
+optdepend = python: the example extension
+optdepend = libpulse: pactl and parec, for the audio visualizer (PipeWire users: pipewire-pulse)
+optdepend = gdb: debugging C, C++ and Rust (F5)
+optdepend = python-debugpy: debugging Python (F5)
+optdepend = python-ipykernel: Jupyter notebooks (.ipynb)
+optdepend = python-jupyter-client: Jupyter notebooks (.ipynb)
 makedepend = cargo

@@ -5,7 +5,7 @@
 # An AUR package would instead fetch a tagged release from the repository.
 
 pkgname=tileide
-pkgver=0.3.0alpha9
+pkgver=0.4.0alpha4
 pkgrel=1
 pkgdesc="A tiling, riceable code editor for Hyprland"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,14 @@ license=('GPL-3.0-or-later')
 depends=('gtk4' 'gtksourceview5' 'vte4' 'gdk-pixbuf2' 'cairo' 'pango' 'glib2' 'gcc-libs' 'glibc' 'libarchive')
 makedepends=('cargo')
 optdepends=('otf-space-grotesk: the intended UI font (AUR; falls back to the default sans)'
-            'hyprland: the compositor TileIDE is designed and tested on')
+            'hyprland: the compositor TileIDE is designed and tested on'
+            'git: install extensions from a git URL'
+            'python: the example extension'
+            'libpulse: pactl and parec, for the audio visualizer (PipeWire users: pipewire-pulse)'
+            'gdb: debugging C, C++ and Rust (F5)'
+            'python-debugpy: debugging Python (F5)'
+            'python-ipykernel: Jupyter notebooks (.ipynb)'
+            'python-jupyter-client: Jupyter notebooks (.ipynb)')
 # !lto: makepkg's -flto turns the vendored Luau (C++) into GCC LTO bitcode, which
 # Rust's linker cannot read (undefined lua_* symbols).
 options=('!debug' '!lto')
@@ -50,7 +57,11 @@ package() {
   install -d "$pkgdir/usr/share/tileide"
   cp -r --no-preserve=ownership config "$pkgdir/usr/share/tileide/config"
   find "$pkgdir/usr/share/tileide" -type f -exec chmod 644 {} +
+  cp -r --no-preserve=ownership examples "$pkgdir/usr/share/tileide/examples"
+  chmod 755 "$pkgdir/usr/share/tileide/examples/extensions/word-count/main.py"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/extensions.md "$pkgdir/usr/share/doc/$pkgname/extensions.md"
+  install -Dm644 docs/compatibility.md "$pkgdir/usr/share/doc/$pkgname/compatibility.md"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
