@@ -29,8 +29,10 @@ pub struct Scene<'a> {
     pub drawer: f64,
     /// Push: the tiles move right with the drawer. Overlay: the drawer covers their edge.
     pub push: bool,
-    /// Workspace numbers that exist (1..=10, where 10 is `Alt+0`), in rail order.
-    pub workspaces: &'a [u8],
+    /// Workspace numbers on the rail (1..=10, where 10 is `Alt+0`), in rail order, each
+    /// with its presence 0..1: a dot grows and fades in when its workspace is created and
+    /// shrinks out when it is removed.
+    pub workspaces: &'a [(u8, f64)],
     /// `None` while the Config workspace is shown.
     pub active: Option<u8>,
     pub label: &'a str,
@@ -107,11 +109,11 @@ pub fn rail_items(s: &Scene) -> Vec<(RailHit, f64, f64)> {
     }
     if s.modules.workspaces {
         let mut top = WORKSPACES_TOP;
-        for &n in s.workspaces {
-            let height = if Some(n) == s.active { ACTIVE_PILL.1 } else { DOT };
+        for &(n, k) in s.workspaces {
+            let height = if Some(n) == s.active { ACTIVE_PILL.1 } else { DOT } * k;
             // At least the pill's half height, so small dots stay easy to hit.
             items.push((RailHit::Workspace(n), top + height / 2.0, (height / 2.0).max(10.0)));
-            top += height + ITEM_GAP;
+            top += height + ITEM_GAP * k;
         }
         items.push((RailHit::NewWorkspace, top + PLUS_RING / 2.0, PLUS_RING / 2.0));
     }
@@ -223,6 +225,7 @@ fn draw_hint(cr: &Context, t: &Theme, g: Geometry, area: Rect) -> Result<(), Err
         ("Alt+Return   terminal", 13.0, t.muted),
         ("Alt+E   open a file (new tile)", 13.0, t.muted),
         ("Alt+F   open a file here", 13.0, t.muted),
+        ("Alt+D   open a folder", 13.0, t.muted),
         ("Alt+B   files", 13.0, t.muted),
         ("Alt+Z   word wrap", 13.0, t.muted),
         ("Alt+V   columns layout", 13.0, t.muted),
@@ -250,6 +253,10 @@ fn draw_hint(cr: &Context, t: &Theme, g: Geometry, area: Rect) -> Result<(), Err
     Ok(())
 }
 
+fn presence(s: &Scene, n: u8) -> f64 {
+    s.workspaces.iter().find(|w| w.0 == n).map_or(1.0, |w| w.1)
+}
+
 fn draw_rail_modules(cr: &Context, s: &Scene) -> Result<(), Error> {
     let t = &*s.theme;
     let cx = RAIL_WIDTH / 2.0;
@@ -266,14 +273,16 @@ fn draw_rail_modules(cr: &Context, s: &Scene) -> Result<(), Error> {
             RailHit::Launcher => draw_launcher(cr, t, cx, y, s.drawer > 0.0)?,
             // Current workspace: a plain accent pill.
             RailHit::Workspace(n) if Some(n) == s.active => {
-                let (w, h) = ACTIVE_PILL;
+                let k = presence(s, n);
+                let (w, h) = (ACTIVE_PILL.0 * k, ACTIVE_PILL.1 * k);
                 rounded_rect(cr, Rect { x: cx - w / 2.0, y: y - h / 2.0, w, h }, w / 2.0);
-                set(cr, t.accent, 1.0);
+                set(cr, t.accent, k);
                 cr.fill()?;
             }
-            RailHit::Workspace(_) => {
-                cr.arc(cx, y, DOT / 2.0, 0.0, 2.0 * PI);
-                set(cr, t.muted, 0.7);
+            RailHit::Workspace(n) => {
+                let k = presence(s, n);
+                cr.arc(cx, y, DOT / 2.0 * k, 0.0, 2.0 * PI);
+                set(cr, t.muted, 0.7 * k);
                 cr.fill()?;
             }
             // Dashed ring with a plus: create the next free workspace.
@@ -515,7 +524,8 @@ fn set(cr: &Context, (r, g, b): Rgb, alpha: f64) {
 mod tests {
     use super::*;
 
-    fn scene<'a>(workspaces: &'a [u8], active: Option<u8>) -> Scene<'a> {
+    fn scene(workspaces: &[u8], active: Option<u8>) -> Scene<'static> {
+        let workspaces = Box::leak(workspaces.iter().map(|&n| (n, 1.0)).collect::<Box<[_]>>());
         Scene {
             width: 1280.0,
             height: 720.0,

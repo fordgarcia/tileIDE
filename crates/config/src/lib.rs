@@ -8,6 +8,7 @@ pub mod api;
 pub mod fields;
 pub mod model;
 pub mod sandbox;
+pub mod vscode;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -16,7 +17,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use mlua::{Lua, Value};
-use tileide_core::theme::{Glass, Theme};
+use tileide_core::theme::{ANSI_KEYS, Glass, SYNTAX_KEYS, Theme};
 
 use fields::Fields;
 pub use model::{Action, Bind, Config};
@@ -95,7 +96,21 @@ pub fn load_theme(path: &Path) -> Result<(Theme, Vec<String>), String> {
         let error = f.colour("error")?.unwrap_or(Theme::builtin().error);
         let mid = f.colour("strip_mid")?.unwrap_or(muted);
         let glass = f.table("glass")?.map(|g| read_glass(g, &mut glass_warnings)).transpose()?;
-        Ok(Theme { name: f.string("name")?.unwrap_or(stem), dark: mode == "dark", surface, tile, text, muted, accent, on_accent, error, strip: [surface, mid, accent], glass })
+        let mut code = [None; 8];
+        if let Some(mut s) = f.table("syntax")? {
+            for (slot, key) in code.iter_mut().zip(SYNTAX_KEYS) {
+                *slot = s.colour(key)?;
+            }
+            s.finish(&mut glass_warnings);
+        }
+        let mut ansi = [None; 16];
+        if let Some(mut t) = f.table("terminal")? {
+            for (slot, key) in ansi.iter_mut().zip(ANSI_KEYS) {
+                *slot = t.colour(key)?;
+            }
+            t.finish(&mut glass_warnings);
+        }
+        Ok(Theme { name: f.string("name")?.unwrap_or(stem), dark: mode == "dark", surface, tile, text, muted, accent, on_accent, error, strip: [surface, mid, accent], glass, ansi, code })
     })?;
     warnings.append(&mut glass_warnings);
     Ok((theme, warnings))
@@ -141,6 +156,29 @@ pub fn find_themes(dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub theme: Option<String>,
+    /// Folders picked with the folder search, newest first (at most `RECENT_FOLDERS`).
+    pub recent_folders: Vec<String>,
+    /// The background picker's choice for every workspace.
+    pub background: Option<model::Background>,
+    /// Themes section picks for one workspace, by number.
+    pub workspaces: BTreeMap<u8, WorkspacePick>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkspacePick {
+    pub theme: Option<String>,
+    pub background: Option<model::Background>,
+}
+
+pub const RECENT_FOLDERS: usize = 10;
+
+impl State {
+    /// Moves `folder` to the front of the recent list.
+    pub fn remember_folder(&mut self, folder: &str) {
+        self.recent_folders.retain(|f| f != folder);
+        self.recent_folders.insert(0, folder.to_string());
+        self.recent_folders.truncate(RECENT_FOLDERS);
+    }
 }
 
 /// A missing file is an empty state; a broken one is an error the caller shows and ignores.
@@ -148,13 +186,57 @@ pub fn load_state(path: &Path) -> Result<State, String> {
     if !path.exists() {
         return Ok(State::default());
     }
-    data_table(path, "state", |f| Ok(State { theme: f.string("theme")? })).map(|(s, _)| s)
+    data_table(path, "state", |f| {
+        let mut state = State { theme: f.string("theme")?, recent_folders: f.strings("recent_folders")?.unwrap_or_default(), ..State::default() };
+        state.background = f.table("background")?.map(|mut b| state_background(&mut b)).transpose()?;
+        if let Some(mut list) = f.table("workspaces")? {
+            for key in list.keys() {
+                let Ok(n) = key.parse::<u8>() else { continue };
+                let Some(mut w) = list.table(&key)? else { continue };
+                let pick = WorkspacePick { theme: w.string("theme")?, background: w.table("background")?.map(|mut b| state_background(&mut b)).transpose()? };
+                state.workspaces.insert(n, pick);
+            }
+        }
+        Ok(state)
+    })
+    .map(|(s, _)| s)
+}
+
+fn state_background(f: &mut Fields) -> mlua::Result<model::Background> {
+    let mut bg = Config::default().background;
+    api::read_background(f, &mut bg)?;
+    Ok(bg)
+}
+
+fn background_lua(bg: &model::Background) -> String {
+    let source = bg.source.as_deref().map_or_else(String::new, |s| format!(" source = {},", lua_string(s)));
+    format!("{{ mode = {},{source} dim = {}, blur = {}, tile_opacity = {}, fit = {} }}", lua_string(&bg.mode), bg.dim, bg.blur, bg.tile_opacity, lua_string(&bg.fit))
 }
 
 pub fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
     let mut text = String::from("-- Written by TileIDE (GUI choices). Settings in tileide.lua win over these.\nreturn {\n");
     if let Some(theme) = &state.theme {
         text += &format!("  theme = {},\n", lua_string(theme));
+    }
+    if let Some(bg) = &state.background {
+        text += &format!("  background = {},\n", background_lua(bg));
+    }
+    let picks: Vec<String> = state
+        .workspaces
+        .iter()
+        .filter(|(_, w)| w.theme.is_some() || w.background.is_some())
+        .map(|(n, w)| {
+            let theme = w.theme.as_deref().map_or_else(String::new, |t| format!(" theme = {},", lua_string(t)));
+            let bg = w.background.as_ref().map_or_else(String::new, |b| format!(" background = {},", background_lua(b)));
+            format!("    [\"{n}\"] = {{{theme}{bg} }},\n")
+        })
+        .collect();
+    if !picks.is_empty() {
+        text += &format!("  workspaces = {{\n{}  }},\n", picks.concat());
+    }
+    if !state.recent_folders.is_empty() {
+        let list: Vec<String> = state.recent_folders.iter().map(|f| lua_string(f)).collect();
+        text += &format!("  recent_folders = {{ {} }},\n", list.join(", "));
     }
     text += "}\n";
     // Written next to the target and renamed, so a crash never leaves half a file.

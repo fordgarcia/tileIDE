@@ -63,6 +63,51 @@ impl Fade {
     }
 }
 
+/// Things that come and go from a list (the rail's workspace dots): each fades and
+/// grows in when it appears, and shrinks out when it leaves.
+#[derive(Debug, Default)]
+pub struct Presence {
+    /// Item, running fade and when it started (`None` = settled at `to`).
+    items: Vec<(u8, Fade, Option<i64>)>,
+    started: bool,
+}
+
+impl Presence {
+    /// Follows `now_present` (sorted). The first call settles at once: nothing animates in at startup.
+    pub fn sync(&mut self, now_present: &[u8], now_us: i64, animate: bool) {
+        if !self.started || !animate {
+            self.started = true;
+            self.items = now_present.iter().map(|&n| (n, Fade::new(1.0, 1.0), None)).collect();
+            return;
+        }
+        for &n in now_present {
+            match self.items.iter_mut().find(|i| i.0 == n) {
+                Some(item) if item.1.to < 1.0 => *item = (n, Fade::new(item.1.at(elapsed(item.2, now_us)).0, 1.0), Some(now_us)),
+                Some(_) => {}
+                None => self.items.push((n, Fade::new(0.0, 1.0), Some(now_us))),
+            }
+        }
+        for item in self.items.iter_mut().filter(|i| !now_present.contains(&i.0) && i.1.to > 0.0) {
+            *item = (item.0, Fade::new(item.1.at(elapsed(item.2, now_us)).0, 0.0), Some(now_us));
+        }
+        self.items.sort_by_key(|i| i.0);
+    }
+
+    /// Each item with its presence 0..1 at `now_us`; items that finished leaving are dropped.
+    pub fn at(&mut self, now_us: i64) -> Vec<(u8, f64)> {
+        self.items.retain(|i| !(i.1.to == 0.0 && i.1.at(elapsed(i.2, now_us)).1));
+        self.items.iter().map(|i| (i.0, i.1.at(elapsed(i.2, now_us)).0)).collect()
+    }
+
+    pub fn animating(&self, now_us: i64) -> bool {
+        self.items.iter().any(|i| !i.1.at(elapsed(i.2, now_us)).1)
+    }
+}
+
+fn elapsed(start: Option<i64>, now_us: i64) -> i64 {
+    start.map_or(i64::MAX, |s| now_us - s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +141,32 @@ mod tests {
         assert_eq!(fade.at(0), (0.4, false));
         assert!(fade.at((FADE_IN_US * 0.6) as i64).1, "only the remaining 60% is played");
         assert_eq!(Fade::new(1.0, 1.0).at(0), (1.0, true), "nothing to do");
+    }
+
+    #[test]
+    fn presence_settles_at_start_then_fades_items_in_and_out() {
+        let mut p = Presence::default();
+        p.sync(&[1, 2], 0, true);
+        assert_eq!(p.at(0), [(1, 1.0), (2, 1.0)], "no fade-in at startup");
+        p.sync(&[1, 3], 1_000, true);
+        let mid = p.at(1_000 + (FADE_OUT_US / 2.0) as i64);
+        assert_eq!(mid.iter().map(|i| i.0).collect::<Vec<_>>(), [1, 2, 3], "2 is still leaving");
+        assert!(mid[1].1 > 0.0 && mid[1].1 < 1.0 && mid[2].1 > 0.0 && mid[2].1 < 1.0);
+        assert!(p.animating(1_000));
+        let end = 1_000 + FADE_IN_US as i64;
+        assert_eq!(p.at(end), [(1, 1.0), (3, 1.0)], "2 is gone once faded");
+        assert!(!p.animating(end));
+    }
+
+    #[test]
+    fn presence_reverses_a_leaving_item_smoothly() {
+        let mut p = Presence::default();
+        p.sync(&[1, 2], 0, true);
+        p.sync(&[1], 0, true);
+        let t = (FADE_OUT_US / 2.0) as i64;
+        let leaving = p.at(t)[1].1;
+        p.sync(&[1, 2], t, true);
+        assert_eq!(p.at(t)[1].1, leaving, "comes back from where it was");
     }
 
     #[test]

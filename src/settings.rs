@@ -132,10 +132,53 @@ pub fn key_binds(binds: &[Bind]) -> (Vec<KeyBind>, Vec<String>) {
     (out, problems)
 }
 
-/// Theme names in priority order: the active workspace's, the session's tray pick,
-/// the config's, `state.lua`'s, the default.
-pub fn theme_name(workspace: Option<&str>, session: Option<&str>, config: Option<&str>, state: Option<&str>) -> String {
-    workspace.or(session).or(config).or(state).unwrap_or(DEFAULT_THEME).to_string()
+/// Where the theme comes from, highest priority first.
+#[derive(Clone, Copy)]
+pub struct ThemeSources<'a> {
+    /// A Themes section row being previewed (hover or selection).
+    pub preview: Option<&'a str>,
+    /// `tileide.workspace(n, { theme = … })`: the config wins over GUI picks (Q15).
+    pub config_workspace: Option<&'a str>,
+    /// A Themes section pick for this workspace only (`state.lua`).
+    pub picked_workspace: Option<&'a str>,
+    /// A tray pick while the config pins the theme: lasts the session.
+    pub session: Option<&'a str>,
+    pub config: Option<&'a str>,
+    pub state: Option<&'a str>,
+}
+
+pub fn theme_name(s: &ThemeSources) -> String {
+    s.preview.or(s.config_workspace).or(s.picked_workspace).or(s.session).or(s.config).or(s.state).unwrap_or(DEFAULT_THEME).to_string()
+}
+
+/// Which background applies (full-screen only).
+#[derive(Debug, PartialEq)]
+pub enum BackgroundFrom<'a> {
+    /// `tileide.background`, or the config's defaults; with the workspace's image if it has one.
+    Config(Option<&'a str>),
+    /// The picker's choice: for this workspace, this session, or saved for all.
+    Picked(&'a model::Background),
+    /// `--bg` and friends on the command line.
+    CommandLine,
+}
+
+/// The config's workspace image wins (Q15), then the picker's live or per-workspace
+/// choice, then the command line, then `tileide.background` if set, else the picker's
+/// saved choice.
+pub fn background_from<'a>(workspace_image: Option<&'a str>, picked_workspace: Option<&'a model::Background>, session: Option<&'a model::Background>, command_line: bool, config_set: bool, saved: Option<&'a model::Background>) -> BackgroundFrom<'a> {
+    if workspace_image.is_some() {
+        return BackgroundFrom::Config(workspace_image);
+    }
+    if let Some(b) = picked_workspace.or(session) {
+        return BackgroundFrom::Picked(b);
+    }
+    if command_line {
+        return BackgroundFrom::CommandLine;
+    }
+    match saved.filter(|_| !config_set) {
+        Some(b) => BackgroundFrom::Picked(b),
+        None => BackgroundFrom::Config(None),
+    }
 }
 
 #[cfg(test)]
@@ -144,11 +187,26 @@ mod tests {
 
     #[test]
     fn theme_priority() {
-        assert_eq!(theme_name(None, None, None, None), "dusk");
-        assert_eq!(theme_name(None, None, None, Some("s")), "s");
-        assert_eq!(theme_name(None, None, Some("c"), Some("s")), "c", "the config wins over state.lua");
-        assert_eq!(theme_name(None, Some("t"), Some("c"), Some("s")), "t", "a tray pick lasts the session");
-        assert_eq!(theme_name(Some("w"), Some("t"), Some("c"), None), "w", "a workspace override wins while active");
+        let none = ThemeSources { preview: None, config_workspace: None, picked_workspace: None, session: None, config: None, state: None };
+        assert_eq!(theme_name(&none), "dusk");
+        assert_eq!(theme_name(&ThemeSources { state: Some("s"), ..none }), "s");
+        assert_eq!(theme_name(&ThemeSources { config: Some("c"), state: Some("s"), ..none }), "c", "the config wins over state.lua");
+        assert_eq!(theme_name(&ThemeSources { session: Some("t"), config: Some("c"), ..none }), "t", "a tray pick lasts the session");
+        assert_eq!(theme_name(&ThemeSources { picked_workspace: Some("p"), session: Some("t"), config: Some("c"), ..none }), "p", "a workspace pick beats global ones");
+        assert_eq!(theme_name(&ThemeSources { config_workspace: Some("w"), picked_workspace: Some("p"), ..none }), "w", "the config's workspace theme wins over a pick");
+        assert_eq!(theme_name(&ThemeSources { preview: Some("v"), config_workspace: Some("w"), ..none }), "v", "a preview shows over everything");
+    }
+
+    #[test]
+    fn background_priority() {
+        let a = tileide_config::Config::default().background;
+        let b = model::Background { mode: "solid".into(), source: Some("112233".into()), ..a.clone() };
+        assert_eq!(background_from(Some("/w.png"), Some(&a), Some(&a), true, true, Some(&a)), BackgroundFrom::Config(Some("/w.png")));
+        assert_eq!(background_from(None, Some(&b), Some(&a), true, false, None), BackgroundFrom::Picked(&b), "a workspace pick beats the session's");
+        assert_eq!(background_from(None, None, Some(&b), true, false, None), BackgroundFrom::Picked(&b), "a live pick beats --bg");
+        assert_eq!(background_from(None, None, None, true, false, Some(&b)), BackgroundFrom::CommandLine, "--bg beats a saved pick");
+        assert_eq!(background_from(None, None, None, false, false, Some(&b)), BackgroundFrom::Picked(&b));
+        assert_eq!(background_from(None, None, None, false, true, Some(&b)), BackgroundFrom::Config(None), "tileide.background wins over a saved pick");
     }
 
     #[test]

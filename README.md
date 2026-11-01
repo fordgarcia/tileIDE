@@ -31,7 +31,7 @@ Tired of switching tiling window managers and customizing configs of IDE per swi
 
 > **Status: v0.2.0.** Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes, and a Lua config that applies as you save it. Language features (completion, debugger) aren't in the UI yet. Install details: [docs/install-arch.md](docs/install-arch.md).
 
-![TileIDE with three tiles](docs/screenshot.png)
+![TileIDE with three tiles]()
 
 # Quick Start
 Arch

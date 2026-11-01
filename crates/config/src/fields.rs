@@ -39,6 +39,42 @@ impl Fields {
         }
     }
 
+    /// The keys not read yet (for tables keyed by data, like workspace numbers).
+    pub fn keys(&self) -> Vec<String> {
+        self.values.keys().cloned().collect()
+    }
+
+    /// A command: `"prog --flag"` (split on spaces) or `{ "prog", "--flag" }`.
+    pub fn command(&mut self, key: &str) -> Result<Option<Vec<String>>> {
+        if let Some(Value::String(s)) = self.values.get(key) {
+            let parts: Vec<String> = s.to_str()?.split_whitespace().map(String::from).collect();
+            self.values.remove(key);
+            return if parts.is_empty() { Err(self.fail(key, "is empty")) } else { Ok(Some(parts)) };
+        }
+        match self.strings(key)? {
+            Some(parts) if parts.is_empty() => Err(self.fail(key, "is empty")),
+            other => Ok(other),
+        }
+    }
+
+    /// A list of strings (`{ "a", "b" }`).
+    pub fn strings(&mut self, key: &str) -> Result<Option<Vec<String>>> {
+        match self.values.remove(key) {
+            None => Ok(None),
+            Some(Value::Table(t)) => {
+                let mut out = Vec::new();
+                for value in t.sequence_values::<Value>() {
+                    match value? {
+                        Value::String(s) => out.push(s.to_str()?.to_string()),
+                        other => return Err(self.fail(key, &format!("expected a list of strings, got a {} in it", other.type_name()))),
+                    }
+                }
+                Ok(Some(out))
+            }
+            Some(other) => Err(self.fail(key, &format!("expected a list of strings, got {}", other.type_name()))),
+        }
+    }
+
     pub fn choice(&mut self, key: &str, allowed: &[&str]) -> Result<Option<String>> {
         let Some(value) = self.string(key)? else { return Ok(None) };
         if allowed.contains(&value.as_str()) {

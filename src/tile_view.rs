@@ -14,11 +14,13 @@ use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use sourceview5::prelude::*;
 use crate::dialog::{self, Role};
-use crate::motion;
+use crate::{lsp, motion};
 use tileide_core::layout::{Layout, LayoutKind};
 use tileide_core::theme::{self, Theme};
 use tileide_core::tiles::{Axis, Direction, Rect, TileId};
 use tileide_core::token::Geometry;
+use tileide_lsp::protocol::Position;
+use tileide_lsp::text::Encoding;
 use vte4::prelude::*;
 
 pub enum Kind<'a> {
@@ -134,8 +136,9 @@ pub struct TileView {
     /// Word wrap for this view's editors (Alt+Z).
     wrap: bool,
     theme: Rc<Theme>,
-    /// Where new terminals start (the workspace's folder).
-    folder: PathBuf,
+    /// The workspace's folder: language servers start for it, terminals in it (home
+    /// when `None`).
+    folder: Option<PathBuf>,
     /// Called when tiles appear or disappear, so the canvas can redraw its empty hint.
     on_change: Rc<dyn Fn()>,
 }
@@ -167,7 +170,7 @@ pub fn css(t: &Theme, g: Geometry, tile_opacity: f64, see_behind: bool) -> Strin
         ".tiles {{ border-radius: {stage_radius}px; }}
 .tile {{ {fill} color: {text}; border-radius: {radius}px; border: 2px solid {edge}; }}
 .tile.focused {{ border-color: {focus}; }}
-.tile textview, .tile textview text, .tile scrolledwindow, .tile vte-terminal, .tile textview gutter {{ background-color: transparent; }}
+.tile textview, .tile textview text, .tile scrolledwindow, .tile vte-terminal, .tile textview border, .tile textview gutter, .tile textview gutterrenderer {{ background-color: transparent; background-image: none; }}
 .tile textview text {{ color: {text}; }}
 .tile vte-terminal {{ padding: 18px 24px; }}",
         text = theme::css(t.text, 1.0),
@@ -177,7 +180,7 @@ pub fn css(t: &Theme, g: Geometry, tile_opacity: f64, see_behind: bool) -> Strin
 }
 
 impl TileView {
-    pub fn new(kind: LayoutKind, column_width: f64, gap: f64, theme: Rc<Theme>, folder: PathBuf, on_change: Rc<dyn Fn()>) -> Rc<RefCell<TileView>> {
+    pub fn new(kind: LayoutKind, column_width: f64, gap: f64, theme: Rc<Theme>, folder: Option<PathBuf>, on_change: Rc<dyn Fn()>) -> Rc<RefCell<TileView>> {
         let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         // Placed over the frame's hole (the stage) by `set_area` and clipped to its rounded
         // corners, so a column scrolled past an edge disappears under the frame.
@@ -249,8 +252,63 @@ impl TileView {
         self.layout.set_column_width(width);
     }
 
-    pub fn set_folder(&mut self, folder: PathBuf) {
+    /// A new folder also moves open editors to its language servers.
+    pub fn set_folder(&mut self, folder: Option<PathBuf>) {
+        if self.folder == folder {
+            return;
+        }
         self.folder = folder;
+        let ids: Vec<TileId> = self.tiles.keys().copied().collect();
+        for id in ids {
+            self.attach_lsp(id);
+        }
+    }
+
+    /// Language support for editor `id`, if it has a file.
+    fn attach_lsp(&self, id: TileId) {
+        let Some(tile) = self.tiles.get(&id) else { return };
+        let (Some(buffer), Some(path), Some(view)) = (&tile.buffer, &tile.path, tile.input.downcast_ref::<sourceview5::View>()) else { return };
+        let me = self.me.clone();
+        let goto: lsp::Goto = Rc::new(move |path, at, encoding| {
+            if let Some(view) = me.upgrade() {
+                view.borrow_mut().goto(&path, at, encoding);
+            }
+        });
+        lsp::attach(buffer, view, path, self.folder.as_deref(), goto);
+    }
+
+    /// Go to definition: the file's tile (opened if needed), cursor on `at`.
+    fn goto(&mut self, path: &Path, at: Position, encoding: Encoding) {
+        let id = match self.find(path) {
+            Some(id) => {
+                self.layout.focus(id, self.area, self.gap);
+                self.relayout();
+                self.apply_focus(true);
+                id
+            }
+            None => {
+                self.add(Kind::Editor(Some(path)));
+                let Some(id) = self.find(path) else { return };
+                id
+            }
+        };
+        let Some(tile) = self.tiles.get(&id) else { return };
+        let (Some(buffer), Some(view)) = (tile.buffer.clone(), tile.input.downcast_ref::<sourceview5::View>().cloned()) else { return };
+        buffer.place_cursor(&lsp::iter_at(buffer.upcast_ref(), at, encoding));
+        // After a new tile's first layout, or the scroll has nothing to measure.
+        glib::idle_add_local_once(move || view.scroll_to_mark(&buffer.get_insert(), 0.1, false, 0.0, 0.0));
+    }
+
+    /// Ends language support for every editor (the workspace is being removed).
+    pub fn release(&self) {
+        for buffer in self.tiles.values().filter_map(|t| t.buffer.as_ref()) {
+            lsp::detach(buffer);
+        }
+    }
+
+    /// The focused tile's editor, if it is one (hover, definition and completion act on it).
+    pub fn focused_editor(&self) -> Option<sourceview5::View> {
+        self.tiles.get(&self.layout.focused()?)?.input.downcast_ref::<sourceview5::View>().cloned()
     }
 
     pub fn set_wrap(&mut self, wrap: bool) {
@@ -295,7 +353,8 @@ impl TileView {
                 (scroll, view, Some(buffer), path.map(Path::to_path_buf))
             }
             Kind::Terminal => {
-                let term = terminal(&self.theme, &self.folder);
+                let home = crate::workspaces::expand_home("~");
+                let term = terminal(&self.theme, self.folder.as_deref().unwrap_or(&home));
                 // Closing the shell (`exit`, Ctrl+D) closes its tile.
                 let me = self.me.clone();
                 term.connect_child_exited(move |_, _| {
@@ -340,6 +399,7 @@ impl TileView {
         self.container.append(&frame);
         motion::fade_in(&frame);
         self.tiles.insert(id, Tile { frame, input, buffer, path });
+        self.attach_lsp(id);
         self.relayout();
         if let Some(parent) = parent.filter(|_| !self.glide.from.is_empty()) {
             self.glide.from.insert(id, parent);
@@ -419,6 +479,9 @@ impl TileView {
     /// replaced terminal's shell ends when its widget is dropped.
     fn replace_with_file(&mut self, id: TileId, path: &Path) {
         let Some(tile) = self.tiles.get_mut(&id) else { return };
+        if let Some(old) = &tile.buffer {
+            lsp::detach(old);
+        }
         let (content, input, buffer) = editor(Some(path), self.wrap, &self.theme);
         content.set_hexpand(true);
         content.set_vexpand(true);
@@ -429,6 +492,7 @@ impl TileView {
         tile.input = input;
         tile.buffer = Some(buffer);
         tile.path = Some(path.to_path_buf());
+        self.attach_lsp(id);
         self.apply_focus(true);
         (self.on_change)();
     }
@@ -436,6 +500,10 @@ impl TileView {
     /// Editors with unsaved changes in this view.
     pub fn dirty_count(&self) -> usize {
         self.tiles.keys().filter(|id| self.dirty_name(**id).is_some()).count()
+    }
+
+    pub fn terminal_count(&self) -> usize {
+        self.tiles.keys().filter(|id| self.is_terminal(**id)).count()
     }
 
     /// The tile's display name if it is an editor with unsaved changes.
@@ -481,6 +549,9 @@ impl TileView {
         if self.layout.close(id, self.area, self.gap)
             && let Some(tile) = self.tiles.remove(&id)
         {
+            if let Some(buffer) = &tile.buffer {
+                lsp::detach(buffer);
+            }
             // It fades where it stands while the others glide into its space.
             let (container, placement, frame) = (self.container.clone(), self.placement.clone(), tile.frame.clone());
             motion::fade_out_then(&tile.frame, move || {
@@ -537,10 +608,13 @@ impl TileView {
             if !write(&path, &buffer) {
                 return;
             }
-            if let Some(view) = me.upgrade()
-                && let Some(tile) = view.borrow_mut().tiles.get_mut(&id)
-            {
-                tile.path = Some(path);
+            if let Some(view) = me.upgrade() {
+                let mut view = view.borrow_mut();
+                if let Some(tile) = view.tiles.get_mut(&id) {
+                    tile.path = Some(path);
+                    // Saved under a name: now it has a language (and a server).
+                    view.attach_lsp(id);
+                }
             }
             if let Some(then) = then {
                 then();
@@ -658,6 +732,7 @@ fn write(path: &Path, buffer: &sourceview5::Buffer) -> bool {
     match std::fs::write(path, text.as_str()) {
         Ok(()) => {
             buffer.set_modified(false);
+            lsp::saved(buffer);
             println!("saved {}", path.display());
             true
         }
@@ -674,9 +749,10 @@ fn wrap_mode(wrap: bool) -> gtk::WrapMode {
 }
 
 /// Syntax colours follow the theme's mode until themes carry their own syntax palette.
-/// The editor's syntax colours: Adwaita (light or dark) with TileIDE's own gutter and
-/// current line (a theme's colours, so it is generated per theme): line numbers on no
-/// background, and the current line as a faint white band.
+/// The editor's colours, all from the theme: text, cursor and selection like the
+/// terminal's, syntax from `Theme::syntax` (the terminal's hues), line numbers on no
+/// background and the current line as a faint white band. Adwaita (light or dark) is
+/// the parent, for the styles a theme has no colour for (search matches, diff marks).
 fn apply_scheme(buffer: &sourceview5::Buffer, theme: &Theme) {
     let manager = sourceview5::StyleSchemeManager::default();
     let scheme = tileide_scheme(&manager, theme).or_else(|| manager.scheme(if theme.dark { "Adwaita-dark" } else { "Adwaita" }));
@@ -686,21 +762,57 @@ fn apply_scheme(buffer: &sourceview5::Buffer, theme: &Theme) {
 }
 
 fn tileide_scheme(manager: &sourceview5::StyleSchemeManager, theme: &Theme) -> Option<sourceview5::StyleScheme> {
-    let hex = |c: tileide_core::theme::Rgb| format!("#{:02X}{:02X}{:02X}", (c.0 * 255.0).round() as u8, (c.1 * 255.0).round() as u8, (c.2 * 255.0).round() as u8);
-    let (text, muted) = (hex(theme.text), hex(theme.muted));
+    let hex = |c: theme::Rgb| format!("#{:02X}{:02X}{:02X}", (c.0 * 255.0).round() as u8, (c.1 * 255.0).round() as u8, (c.2 * 255.0).round() as u8);
+    let (text, muted, accent, on_accent, error) = (hex(theme.text), hex(theme.muted), hex(theme.accent), hex(theme.on_accent), hex(theme.error));
+    let selection = hex(theme::over(theme.accent, 0.3, theme.tile));
+    let s = theme.syntax();
+    let (keyword, type_, string, constant, function, preprocessor, builtin, comment) =
+        (hex(s.keyword), hex(s.type_), hex(s.string), hex(s.constant), hex(s.function), hex(s.preprocessor), hex(s.builtin), hex(s.comment));
     // White reads as a lift on dark tiles; light tiles need more of it to show.
     let band = if theme.dark { "#FFFFFF12" } else { "#FFFFFF99" };
-    let id = format!("tileide-{}{}{}", if theme.dark { "dark" } else { "light" }, &text[1..], &muted[1..]);
-    if manager.scheme(&id).is_none() {
-        let dir = glib::user_runtime_dir().join("tileide-schemes");
-        let parent = if theme.dark { "Adwaita-dark" } else { "Adwaita" };
-        let xml = format!(
-            r##"<?xml version="1.0" encoding="UTF-8"?>
-<style-scheme id="{id}" name="TileIDE" version="1.0" parent-scheme="{parent}">
+    let parent = if theme.dark { "Adwaita-dark" } else { "Adwaita" };
+    let styles = format!(
+        r##"  <style name="text" foreground="{text}"/>
+  <style name="selection" foreground="{text}" background="{selection}"/>
+  <style name="cursor" foreground="{accent}"/>
+  <style name="bracket-match" foreground="{on_accent}" background="{accent}" bold="true"/>
   <style name="current-line" background="{band}"/>
   <style name="current-line-number" foreground="{text}" background="{band}" bold="true"/>
   <style name="line-numbers" foreground="{muted}" background="#00000000"/>
-</style-scheme>
+  <style name="def:comment" foreground="{comment}" italic="true"/>
+  <style name="def:doc-comment-element" foreground="{comment}" bold="true"/>
+  <style name="def:keyword" foreground="{keyword}"/>
+  <style name="def:statement" foreground="{keyword}"/>
+  <style name="def:type" foreground="{type_}"/>
+  <style name="def:string" foreground="{string}"/>
+  <style name="def:special-char" foreground="{constant}"/>
+  <style name="def:constant" foreground="{constant}"/>
+  <style name="def:number" foreground="{constant}"/>
+  <style name="def:boolean" foreground="{constant}"/>
+  <style name="def:special-constant" foreground="{constant}"/>
+  <style name="def:function" foreground="{function}"/>
+  <style name="def:preprocessor" foreground="{preprocessor}"/>
+  <style name="def:builtin" foreground="{builtin}"/>
+  <style name="def:identifier" foreground="{text}"/>
+  <style name="def:operator" foreground="{text}"/>
+  <style name="def:net-address" foreground="{function}" underline="single"/>
+  <style name="def:heading" foreground="{accent}" bold="true"/>
+  <style name="def:emphasis" italic="true"/>
+  <style name="def:strong-emphasis" bold="true"/>
+  <style name="def:error" underline="error" underline-color="{error}"/>
+  <style name="def:warning" underline="error" underline-color="{type_}"/>
+"##
+    );
+    // One file per distinct set of colours; the id changes whenever any colour does.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(parent, &styles), &mut hasher);
+    let id = format!("tileide-{:016x}", std::hash::Hasher::finish(&hasher));
+    if manager.scheme(&id).is_none() {
+        let dir = glib::user_runtime_dir().join("tileide-schemes");
+        let xml = format!(
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<style-scheme id="{id}" name="TileIDE" version="1.0" parent-scheme="{parent}">
+{styles}</style-scheme>
 "##
         );
         std::fs::create_dir_all(&dir).ok()?;

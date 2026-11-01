@@ -3,6 +3,8 @@
 //! new-tab bar. `Alt+E` opens the pick in a new tile (an empty query offers a blank
 //! file); `Alt+F` opens it in the focused tile. Type to filter the workspace's files,
 //! ↑/↓ (or Ctrl+N/P) to select, Enter to open, Esc or a click on the dim to close.
+//! `Alt+D` uses the same card to pick the workspace's folder: recent folders first,
+//! then folders under `~`.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -19,11 +21,15 @@ use tileide_core::theme::{self, Theme};
 pub enum Target {
     NewTile,
     Focused,
+    /// Picks a folder for the active workspace.
+    Folder,
 }
 
 /// Files listed per search; enough for any project, and `~` can't stall it.
 const INDEX_LIMIT: usize = 50_000;
 const SHOWN: usize = 50;
+/// How deep the folder search looks under `~`.
+const FOLDER_DEPTH: usize = 6;
 
 pub fn css(t: &Theme) -> String {
     let c = theme::css;
@@ -51,7 +57,10 @@ pub fn css(t: &Theme) -> String {
 struct State {
     target: Target,
     root: PathBuf,
+    /// Files (or folders, for `Target::Folder`) under `root`, relative to it.
     files: Vec<PathBuf>,
+    /// Folder search only: recent folders (absolute), listed first.
+    recent: Vec<PathBuf>,
     /// What each list row opens; `None` = a blank file.
     rows: Vec<Option<PathBuf>>,
     /// Bumped on every open, so a slow index from an earlier open is dropped.
@@ -106,7 +115,7 @@ impl QuickOpen {
             list,
             scroll,
             hint,
-            state: RefCell::new(State { target: Target::NewTile, root: PathBuf::new(), files: Vec::new(), rows: Vec::new(), generation: 0 }),
+            state: RefCell::new(State { target: Target::NewTile, root: PathBuf::new(), files: Vec::new(), recent: Vec::new(), rows: Vec::new(), generation: 0 }),
         });
 
         let v = Rc::downgrade(&view);
@@ -171,29 +180,43 @@ impl QuickOpen {
 
     /// Opens over the window and lists `folder`'s files (indexed off the main thread).
     pub fn open(self: &Rc<Self>, target: Target, folder: &Path) {
+        self.show(target, folder, Vec::new());
+    }
+
+    /// The folder search: `recent` first, then folders under `home`.
+    pub fn open_folders(self: &Rc<Self>, home: &Path, recent: Vec<PathBuf>) {
+        self.show(Target::Folder, home, recent);
+    }
+
+    fn show(self: &Rc<Self>, target: Target, folder: &Path, recent: Vec<PathBuf>) {
         let generation = {
             let mut st = self.state.borrow_mut();
-            st.target = target;
-            st.generation += 1;
-            // Same folder: show the last index at once while the new one runs.
-            if st.root != folder {
+            // Same folder and kind: show the last index at once while the new one runs.
+            if st.root != folder || (st.target == Target::Folder) != (target == Target::Folder) {
                 st.root = folder.to_path_buf();
                 st.files.clear();
             }
+            st.target = target;
+            st.recent = recent;
+            st.generation += 1;
             st.generation
         };
-        let place = match target {
-            Target::NewTile => "in a new tile",
-            Target::Focused => "in this tile",
+        let placeholder = match target {
+            Target::NewTile => "Open a file in a new tile…",
+            Target::Focused => "Open a file in this tile…",
+            Target::Folder => "Open a folder in this workspace…",
         };
-        self.entry.set_placeholder_text(Some(&format!("Open a file {place}…")));
+        self.entry.set_placeholder_text(Some(placeholder));
         self.entry.set_text("");
         self.refilter();
         crate::motion::fade_in(&self.root);
         self.entry.grab_focus();
 
         let (me, root) = (Rc::downgrade(self), folder.to_path_buf());
-        let job = gio::spawn_blocking(move || search::list_files(&root, INDEX_LIMIT));
+        let job = gio::spawn_blocking(move || match target {
+            Target::Folder => search::list_dirs(&root, FOLDER_DEPTH, INDEX_LIMIT),
+            _ => search::list_files(&root, INDEX_LIMIT),
+        });
         glib::spawn_future_local(async move {
             let Ok(files) = job.await else { return };
             let Some(me) = me.upgrade() else { return };
@@ -216,19 +239,47 @@ impl QuickOpen {
         if st.target == Target::NewTile && query.trim().is_empty() {
             rows.push(None);
         }
-        rows.extend(search::rank(&query, &st.files, SHOWN).into_iter().map(|p| Some(p.to_path_buf())));
+        let folders = st.target == Target::Folder;
+        if folders {
+            // A typed path that exists comes first (`~/notes`, `/etc`).
+            let typed = crate::workspaces::expand_home(query.trim());
+            if typed.is_absolute() && typed.is_dir() {
+                rows.push(Some(typed));
+            }
+            // Recent ones next; a folder listed both ways appears once.
+            rows.extend(search::rank(&query, &st.recent, SHOWN).into_iter().map(|p| Some(p.to_path_buf())));
+        }
+        for p in search::rank(&query, &st.files, SHOWN) {
+            let full = st.root.join(p);
+            if rows.len() >= SHOWN {
+                break;
+            }
+            if !(folders && st.recent.contains(&full)) {
+                rows.push(Some(p.to_path_buf()));
+            }
+        }
+        if folders {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| r.as_ref().is_none_or(|p| seen.insert(st.root.join(p))));
+        }
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         for row in &rows {
-            self.list.append(&row_widget(row.as_deref()));
+            let shown = match row {
+                Some(p) if folders => Some(tilde(&st.root.join(p))),
+                other => other.clone(),
+            };
+            self.list.append(&row_widget(shown.as_deref()));
         }
         self.list.select_row(self.list.row_at_index(0).as_ref());
         let found = st.files.len();
+        let (kind, verb) = if folders { ("folders", "open here") } else { ("files", "open") };
         self.hint.set_text(&match (found, rows.iter().flatten().count()) {
-            (0, _) => "Indexing… · Esc closes".to_string(),
-            (_, 0) => "No matching files · Esc closes".to_string(),
-            _ => format!("↑↓ select · Enter open · Esc close · {found} files in {}", folder_name(&st.root)),
+            (0, 0) => "Indexing… · Esc closes".to_string(),
+            (_, 0) => format!("No matching {kind} · Esc closes"),
+            (0, _) => format!("↑↓ select · Enter {verb} · Esc close · indexing…"),
+            _ => format!("↑↓ select · Enter {verb} · Esc close · {found} {kind} in {}", folder_name(&st.root)),
         });
         st.rows = rows;
     }
@@ -285,4 +336,12 @@ fn row_widget(path: Option<&Path>) -> gtk::Box {
 
 fn folder_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// `$HOME/x` → `~/x`, for display.
+fn tilde(path: &Path) -> PathBuf {
+    match std::env::var_os("HOME").and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => Path::new("~").join(rest),
+        None => path.to_path_buf(),
+    }
 }

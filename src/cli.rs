@@ -41,6 +41,8 @@ Keys (Alt is TileIDE's modifier; all can be rebound with tileide.bind):
   Alt+B files drawer    Alt+C config        Alt+Z word wrap     Alt+1..9, 0 workspaces
   Alt+H/J/K/L focus     Alt+Shift+H/J/K/L resize   Alt+Ctrl+Shift+H/J/K/L move
   Alt+V dwindle/columns Alt+S next tile below      Alt+O overview  Alt+T themes
+  Alt+D workspace folder  Alt+Shift+W remove workspace
+  Ctrl+Space complete   F12 / Ctrl+click definition    Alt+I info at cursor
   Alt+Escape quit
 
 Config lives in ~/.config/tileide/ (created from a sample on first run); saved

@@ -13,14 +13,17 @@
 mod background;
 mod bench;
 mod cli;
+mod completion;
 mod dialog;
 mod draw;
 mod file_tree;
 mod logo;
+mod lsp;
 mod motion;
 mod overview;
 mod quick_open;
 mod settings;
+mod themes_panel;
 mod tile_view;
 mod tray;
 mod workspaces;
@@ -43,6 +46,7 @@ use settings::{KeyBind, Paths};
 use tile_view::Kind;
 use tileide_config::{Action, Config, State};
 use tileide_core::drawer::Drawer;
+use tileide_core::motion::Presence;
 use tileide_core::theme::{self, Theme};
 use tileide_core::token::{self, Geometry};
 use tray::Tray;
@@ -69,6 +73,8 @@ struct Peek {
 }
 
 struct App {
+    /// For callbacks that must run after the current borrow ends (idle).
+    me: Weak<App>,
     options: Options,
     window: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
@@ -104,6 +110,18 @@ struct App {
     quick_open: Rc<QuickOpen>,
     /// A still of the old frame that fades away when the theme changes (`motion::crossfade`).
     cover: gtk::Picture,
+    /// The drawer's sections ("files", "themes") and their switcher tabs.
+    sections: gtk::Stack,
+    tabs: (gtk::ToggleButton, gtk::ToggleButton),
+    themes_panel: Rc<themes_panel::ThemesPanel>,
+    /// The workspace the Themes section was last filled for.
+    panel_for: Cell<Option<Option<u8>>>,
+    /// A Themes section row shown over the applied theme while hovered or selected.
+    preview_theme: RefCell<Option<String>>,
+    /// A background picked while the config pins one: lasts until restart.
+    session_background: RefCell<Option<tileide_config::model::Background>>,
+    /// The rail's workspace dots, fading in and out as workspaces come and go.
+    dots: RefCell<Presence>,
     reload_timer: RefCell<Option<glib::SourceId>>,
     _monitors: RefCell<Vec<gio::FileMonitor>>,
 }
@@ -266,9 +284,34 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     panel.set_margin_bottom(token::FRAME_BORDER as i32);
     panel.set_overflow(gtk::Overflow::Hidden);
     panel.set_visible(false);
+    panel.add_css_class("drawer");
     let tree_widget = files.borrow().widget().clone();
     tree_widget.set_vexpand(true);
-    panel.append(&tree_widget);
+    // Files and Themes share the drawer; the switcher picks one (Alt+B / Alt+Shift+T too).
+    let sections = gtk::Stack::new();
+    sections.set_transition_type(gtk::StackTransitionType::Crossfade);
+    sections.set_transition_duration((tileide_core::motion::FADE_IN_US / 1000.0) as u32);
+    sections.set_vexpand(true);
+    sections.add_named(&tree_widget, Some("files"));
+    let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    switcher.add_css_class("switcher");
+    switcher.add_css_class("themes");
+    let files_tab = gtk::ToggleButton::with_label("Files");
+    let themes_tab = gtk::ToggleButton::with_label("Themes");
+    themes_tab.set_group(Some(&files_tab));
+    files_tab.set_active(true);
+    for (tab, page) in [(&files_tab, "files"), (&themes_tab, "themes")] {
+        tab.add_css_class("pill");
+        let s = sections.clone();
+        tab.connect_toggled(move |t| {
+            if t.is_active() {
+                s.set_visible_child_name(page);
+            }
+        });
+        switcher.append(tab);
+    }
+    panel.append(&switcher);
+    panel.append(&sections);
     overlay.add_overlay(&panel);
     let peek = build_peek(&overlay, &workspaces);
 
@@ -321,6 +364,30 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
         let quick_open = QuickOpen::new(&overlay, on_file, on_close);
         // Last, so confirmations sit above every other layer.
         dialog::install(&overlay);
+        let (m5, m6, m7, m8) = (me.clone(), me.clone(), me.clone(), me.clone());
+        let themes_panel = themes_panel::ThemesPanel::new(themes_panel::Callbacks {
+            preview: Rc::new(move |key| {
+                if let Some(app) = m5.upgrade() {
+                    app.preview(key);
+                }
+            }),
+            apply: Rc::new(move |key, scope| {
+                if let Some(app) = m6.upgrade() {
+                    app.apply_theme(key, scope);
+                }
+            }),
+            background: Rc::new(move |bg, scope| {
+                if let Some(app) = m7.upgrade() {
+                    app.apply_background(bg, scope);
+                }
+            }),
+            import: Rc::new(move || {
+                if let Some(app) = m8.upgrade() {
+                    app.import_theme();
+                }
+            }),
+        });
+        sections.add_named(themes_panel.widget(), Some("themes"));
         let cover = gtk::Picture::new();
         cover.set_can_target(false);
         cover.set_can_shrink(true);
@@ -328,6 +395,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
         cover.set_visible(false);
         overlay.add_overlay(&cover);
         App {
+            me: me.clone(),
             options: options.clone(),
             window: window.clone(),
             area: area.clone(),
@@ -354,6 +422,13 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             overview,
             quick_open,
             cover,
+            sections,
+            tabs: (files_tab, themes_tab),
+            themes_panel,
+            panel_for: Cell::new(None),
+            preview_theme: RefCell::new(None),
+            session_background: RefCell::new(None),
+            dots: RefCell::new(Presence::default()),
             reload_timer: RefCell::new(None),
             _monitors: RefCell::new(Vec::new()),
         }
@@ -413,7 +488,7 @@ fn folder_name(path: &Path) -> String {
 }
 
 impl App {
-    fn scene<'a>(&self, numbers: &'a [u8], label: &'a str, clock: &'a (String, String)) -> draw::Scene<'a> {
+    fn scene<'a>(&self, numbers: &'a [(u8, f64)], label: &'a str, clock: &'a (String, String)) -> draw::Scene<'a> {
         let workspaces = self.workspaces.borrow();
         let config = self.config.borrow();
         let s = &config.sidebar;
@@ -459,11 +534,20 @@ impl App {
         }
     }
 
+    /// The rail's dots with their presence now; follows the workspaces that exist.
+    fn rail_dots(&self) -> Vec<(u8, f64)> {
+        let numbers = self.workspaces.borrow().numbers();
+        let now = self.area.frame_clock().map_or(0, |c| c.frame_time());
+        let mut dots = self.dots.borrow_mut();
+        dots.sync(&numbers, now, motion::enabled());
+        dots.at(now)
+    }
+
     fn label(&self) -> String {
         let workspaces = self.workspaces.borrow();
         match workspaces.active() {
             Active::Number(n) => {
-                let name = workspaces.name(n).unwrap_or_else(|| folder_name(&workspaces.root(Active::Number(n))));
+                let name = workspaces.name(n).unwrap_or_else(|| workspaces.folder(Active::Number(n)).map_or_else(|| "no folder".into(), |f| folder_name(&f)));
                 format!("{name} · {}", workspaces::display(n))
             }
             Active::Config => "config".into(),
@@ -486,6 +570,18 @@ impl App {
             *self.session_theme.borrow_mut() = None;
         }
         *self.binds.borrow_mut() = binds;
+        let me = self.me.clone();
+        let notice: Rc<dyn Fn(String)> = Rc::new(move |message| {
+            if let Some(app) = me.upgrade() {
+                let mut problems = app.problems.borrow_mut();
+                if !problems.contains(&message) {
+                    problems.push(message);
+                }
+                drop(problems);
+                app.show_problems();
+            }
+        });
+        problems.extend(lsp::configure(&config.lsp, notice));
         motion::set_enabled(config.appearance.animations);
         let (tiling, per_workspace) = (config.tiling.clone(), config.workspaces.clone());
         *self.config.borrow_mut() = config;
@@ -514,9 +610,29 @@ impl App {
     /// the background follow the active workspace. Runs inside a `Workspaces` borrow, so
     /// it must not touch `self.workspaces`; a changed theme is returned for it to apply.
     fn on_switch(&self, info: &workspaces::Switch) -> Option<Rc<Theme>> {
-        self.files.borrow_mut().set_root(&info.root);
-        let theme = self.refresh_theme(info.theme.as_deref());
-        self.refresh_background(info.background.as_deref());
+        self.files.borrow_mut().set_root(info.root.as_deref().unwrap_or(Path::new("")));
+        if info.ask_folder {
+            // After the switch's borrow ends; the new workspace's fade-in runs under it.
+            let me = self.me.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(app) = me.upgrade() {
+                    app.open_folder_search();
+                }
+            });
+        }
+        let theme = self.refresh_theme(info.theme.as_deref(), info.number);
+        self.refresh_background(info.background.as_deref(), info.number);
+        // A workspace change shows that workspace's picks; a preview must not rebuild the
+        // list it is browsing.
+        if self.themes_shown() && self.panel_for.get() != Some(info.number) {
+            // After the switch's borrow ends: the snapshot reads the workspaces.
+            let me = self.me.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(app) = me.upgrade() {
+                    app.refresh_themes_panel();
+                }
+            });
+        }
         self.reload_css();
         self.show_problems();
         self.area.queue_draw();
@@ -532,13 +648,9 @@ impl App {
     }
 
     /// The theme for the active workspace; `Some` when it changed.
-    fn refresh_theme(&self, workspace: Option<&str>) -> Option<Rc<Theme>> {
-        let name = settings::theme_name(
-            workspace,
-            self.session_theme.borrow().as_deref(),
-            self.config.borrow().appearance.theme.as_deref(),
-            self.state.borrow().theme.as_deref(),
-        );
+    fn refresh_theme(&self, workspace: Option<&str>, number: Option<u8>) -> Option<Rc<Theme>> {
+        let preview = self.preview_theme.borrow().clone();
+        let name = self.theme_for(preview.as_deref(), workspace, number);
         if *self.theme_name.borrow() == name {
             return None;
         }
@@ -559,16 +671,40 @@ impl App {
         Some(theme)
     }
 
-    /// Full-screen only. Command-line flags win over `tileide.background`; a workspace's
-    /// image wins over both.
-    fn refresh_background(&self, image: Option<&str>) {
+    /// The theme name for workspace `number` (its config theme is `workspace`).
+    fn theme_for(&self, preview: Option<&str>, workspace: Option<&str>, number: Option<u8>) -> String {
+        let state = self.state.borrow();
+        let config = self.config.borrow();
+        let session = self.session_theme.borrow();
+        settings::theme_name(&settings::ThemeSources {
+            preview,
+            config_workspace: workspace,
+            picked_workspace: number.and_then(|n| state.workspaces.get(&n)?.theme.as_deref()),
+            session: session.as_deref(),
+            config: config.appearance.theme.as_deref(),
+            state: state.theme.as_deref(),
+        })
+    }
+
+    /// The background model in effect for workspace `number` (`settings::background_from`).
+    fn background_choice(&self, image: Option<&str>, number: Option<u8>) -> Result<background::Settings, String> {
+        let state = self.state.borrow();
+        let config = self.config.borrow();
+        let session = self.session_background.borrow();
+        let picked = number.and_then(|n| state.workspaces.get(&n)?.background.as_ref());
+        match settings::background_from(image, picked, session.as_ref(), self.options.background.is_some(), config.background_set, state.background.as_ref()) {
+            settings::BackgroundFrom::Config(image) => settings::background(&config.background, image),
+            settings::BackgroundFrom::Picked(b) => settings::background(b, None),
+            settings::BackgroundFrom::CommandLine => Ok(self.options.background.clone().expect("checked")),
+        }
+    }
+
+    /// Full-screen only (`background_choice` decides which one).
+    fn refresh_background(&self, image: Option<&str>, number: Option<u8>) {
         if self.options.mode != Mode::Fullscreen {
             return;
         }
-        let settings = match (&self.options.background, image) {
-            (Some(cli), None) => Ok(cli.clone()),
-            (_, image) => settings::background(&self.config.borrow().background, image),
-        };
+        let settings = self.background_choice(image, number);
         let settings = settings.unwrap_or_else(|e| {
             self.problems.borrow_mut().push(e);
             background::Settings::default()
@@ -592,7 +728,7 @@ impl App {
         self.css.load_from_string(&format!(
             "window, window.background {{ background: transparent; font-family: \"{font}\"; }}
 .banner {{ background-color: {bg}; color: {text}; border: 1px solid {edge}; border-radius: 10px; padding: 8px 14px; font-size: 13px; }}
-{tiles}\n{files}\n{overview}\n{quick_open}\n{dialog}",
+{tiles}\n{files}\n{overview}\n{quick_open}\n{dialog}\n{lsp}\n{completion}\n{themes}",
             font = token::UI_FONT,
             bg = theme::css(t.surface, 0.96),
             text = theme::css(t.text, 1.0),
@@ -602,6 +738,9 @@ impl App {
             overview = overview::css(t),
             quick_open = quick_open::css(t),
             dialog = dialog::css(t),
+            lsp = lsp::css(t),
+            completion = completion::css(t),
+            themes = themes_panel::css(t),
         ));
     }
 
@@ -647,6 +786,166 @@ impl App {
         self.refresh();
     }
 
+    fn themes_shown(&self) -> bool {
+        self.drawer.borrow().target > 0.5 && self.sections.visible_child_name().as_deref() == Some("themes")
+    }
+
+    /// Alt+Shift+T: the drawer on its Themes section (closes it if that is showing).
+    fn toggle_themes_section(&self) {
+        if self.themes_shown() {
+            self.toggle_drawer();
+            return;
+        }
+        self.tabs.1.set_active(true);
+        self.refresh_themes_panel();
+        if self.drawer.borrow().target < 0.5 {
+            self.drawer.borrow_mut().toggle();
+            self.area.queue_draw();
+        }
+        // Once the panel is shown (it appears as the drawer opens).
+        let me = self.me.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis((tileide_core::motion::MOVE_US / 1000.0) as u64), move || {
+            if let Some(app) = me.upgrade() {
+                app.themes_panel.focus();
+            }
+        });
+    }
+
+    fn refresh_themes_panel(&self) {
+        let (number, workspace_theme, image) = {
+            let w = self.workspaces.borrow();
+            let number = match w.active() {
+                Active::Number(n) => Some(n),
+                Active::Config => None,
+            };
+            let (theme, image) = w.overrides();
+            (number, theme, image)
+        };
+        self.panel_for.set(Some(number));
+        let state = self.state.borrow().clone();
+        let config = self.config.borrow().clone();
+        let picks = number.and_then(|n| state.workspaces.get(&n)).filter(|p| p.theme.is_some() || p.background.is_some());
+        let scope = match (number, picks) {
+            (Some(n), Some(_)) => themes_panel::Scope::Workspace(n),
+            _ => themes_panel::Scope::All,
+        };
+        let session = self.session_background.borrow().clone();
+        let background = match settings::background_from(image.as_deref(), picks.and_then(|p| p.background.as_ref()), session.as_ref(), self.options.background.is_some(), config.background_set, state.background.as_ref()) {
+            settings::BackgroundFrom::Picked(b) => b.clone(),
+            _ => config.background.clone(),
+        };
+        let mut notes = Vec::new();
+        if let Some(own) = &workspace_theme {
+            notes.push(format!("tileide.lua gives this workspace the theme \"{own}\"; picks show in other workspaces."));
+        } else if let Some(pinned) = &config.appearance.theme {
+            notes.push(format!("tileide.lua sets theme = \"{pinned}\": a pick for all workspaces lasts until restart."));
+        }
+        if image.is_some() {
+            notes.push("tileide.lua gives this workspace a background image.".into());
+        } else if config.background_set {
+            notes.push("tileide.lua sets a background: a pick for all workspaces lasts until restart.".into());
+        }
+        self.themes_panel.refresh(themes_panel::Snapshot {
+            themes: self.paths.all_themes(),
+            current: self.theme_for(None, workspace_theme.as_deref(), number),
+            workspace: number,
+            scope,
+            background,
+            fullscreen: self.options.mode == Mode::Fullscreen,
+            note: (!notes.is_empty()).then(|| notes.join(" ")),
+        });
+    }
+
+    fn preview(&self, key: Option<&str>) {
+        if self.preview_theme.borrow().as_deref() == key {
+            return;
+        }
+        *self.preview_theme.borrow_mut() = key.map(String::from);
+        self.refresh();
+    }
+
+    /// A Themes section pick. For all workspaces it behaves like the tray's.
+    fn apply_theme(&self, key: &str, scope: themes_panel::Scope) {
+        *self.preview_theme.borrow_mut() = None;
+        match scope {
+            themes_panel::Scope::All => {
+                if let Active::Number(n) = self.workspaces.borrow().active()
+                    && let Some(pick) = self.state.borrow_mut().workspaces.get_mut(&n)
+                {
+                    pick.theme = None;
+                }
+                self.pick_theme(key);
+            }
+            themes_panel::Scope::Workspace(n) => {
+                self.state.borrow_mut().workspaces.entry(n).or_default().theme = Some(key.into());
+                self.save_state();
+                self.refresh();
+            }
+        }
+        self.refresh_themes_panel();
+    }
+
+    fn apply_background(&self, bg: tileide_config::model::Background, scope: themes_panel::Scope) {
+        match scope {
+            themes_panel::Scope::All => {
+                if let Active::Number(n) = self.workspaces.borrow().active()
+                    && let Some(pick) = self.state.borrow_mut().workspaces.get_mut(&n)
+                {
+                    pick.background = None;
+                }
+                if self.config.borrow().background_set {
+                    *self.session_background.borrow_mut() = Some(bg);
+                } else {
+                    *self.session_background.borrow_mut() = None;
+                    self.state.borrow_mut().background = Some(bg);
+                }
+            }
+            themes_panel::Scope::Workspace(n) => self.state.borrow_mut().workspaces.entry(n).or_default().background = Some(bg),
+        }
+        self.save_state();
+        self.refresh();
+        self.reload_css();
+    }
+
+    /// "Import VS Code theme…": a theme `.json` or an extension `.vsix` becomes a theme
+    /// file in the user's `themes/`, then shows in the list (hot reload).
+    fn import_theme(&self) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("VS Code themes (.json, .vsix)"));
+        for pattern in ["*.json", "*.vsix", "*.jsonc"] {
+            filter.add_pattern(pattern);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let me = self.me.clone();
+        gtk::FileDialog::builder().title("Import a VS Code theme").filters(&filters).build().open(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+            let (Some(app), Some(path)) = (me.upgrade(), result.ok().and_then(|f| f.path())) else { return };
+            let notes = match tileide_config::vscode::import(&path, &app.paths.dir.join("themes")) {
+                Ok(written) => written
+                    .into_iter()
+                    .map(|(file, name, warnings)| {
+                        let file = file.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+                        match warnings.is_empty() {
+                            true => format!("Imported \"{name}\" as themes/{file}; pick it in Themes."),
+                            false => format!("Imported \"{name}\" as themes/{file}, but its {}.", warnings.join(" and ")),
+                        }
+                    })
+                    .collect(),
+                Err(e) => vec![format!("Cannot import {}: {e}", path.display())],
+            };
+            *app.problems.borrow_mut() = notes;
+            app.show_problems();
+            app.refresh_themes_panel();
+        });
+    }
+
+    fn save_state(&self) {
+        if let Err(e) = tileide_config::save_state(&self.paths.state, &self.state.borrow()) {
+            self.problems.borrow_mut().push(format!("cannot save {}: {e}", self.paths.state.display()));
+            self.show_problems();
+        }
+    }
+
     fn open_tray(&self) {
         if self.tray.is_open() {
             self.tray.close();
@@ -674,7 +973,68 @@ impl App {
         self.area.queue_draw();
     }
 
+    /// Alt+D, and by itself on a new workspace without a folder.
+    fn open_folder_search(&self) {
+        if self.quick_open.is_open() || dialog::is_open() {
+            return;
+        }
+        self.tray.close();
+        self.overview.close();
+        let recent = self.state.borrow().recent_folders.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect();
+        self.quick_open.open_folders(&workspaces::expand_home("~"), recent);
+        self.area.queue_draw();
+    }
+
+    /// The folder search's pick: the workspace follows it, and it goes to the top of
+    /// the recent folders in `state.lua`.
+    fn set_workspace_folder(&self, folder: PathBuf) {
+        let mut state = self.state.borrow_mut();
+        state.remember_folder(&folder.to_string_lossy());
+        if let Err(e) = tileide_config::save_state(&self.paths.state, &state) {
+            eprintln!("state: cannot save: {e}");
+        }
+        drop(state);
+        self.workspaces.borrow_mut().set_folder(folder);
+        self.workspaces.borrow().current().borrow().grab_focused();
+    }
+
+    /// Alt+Shift+W or an overview card's ×. Asks first if it would end unsaved edits or shells.
+    fn close_workspace(&self, n: u8) {
+        let (dirty, terminals) = self.workspaces.borrow().work(n);
+        let me = self.me.clone();
+        let remove = move || {
+            let Some(app) = me.upgrade() else { return };
+            app.workspaces.borrow_mut().remove(n);
+            if app.overview.is_open() {
+                app.show_overview();
+            } else {
+                app.workspaces.borrow().current().borrow().grab_focused();
+            }
+        };
+        if dirty == 0 && terminals == 0 {
+            remove();
+            return;
+        }
+        let plural = |count: usize, one: &str| if count == 1 { format!("1 {one}") } else { format!("{count} {one}s") };
+        let lost = match (dirty, terminals) {
+            (0, t) => format!("Its {} will end.", plural(t, "terminal")),
+            (d, 0) => format!("{} will be lost.", plural(d, "unsaved file")),
+            (d, t) => format!("{} will be lost and {} will end.", plural(d, "unsaved file"), plural(t, "terminal")),
+        };
+        dialog::ask(&format!("Remove workspace {}?", workspaces::display(n)), &lost, &[("Cancel", dialog::Role::Cancel), ("Remove", dialog::Role::Destructive)], 0, move |choice| {
+            if choice == 1 {
+                remove();
+            }
+        });
+    }
+
     fn open_picked(&self, target: quick_open::Target, path: Option<PathBuf>) {
+        if target == quick_open::Target::Folder {
+            if let Some(folder) = path {
+                self.set_workspace_folder(folder);
+            }
+            return;
+        }
         let view = self.workspaces.borrow().current();
         match (target, path) {
             (quick_open::Target::Focused, Some(path)) => view.borrow_mut().open_in_focused(&path, self.window.upcast_ref()),
@@ -683,25 +1043,37 @@ impl App {
         self.area.queue_draw();
     }
 
-    fn open_overview(&self, me: &Rc<App>) {
+    fn open_overview(&self) {
         if self.overview.is_open() {
             self.overview.close();
             self.workspaces.borrow().current().borrow().grab_focused();
             return;
         }
         self.tray.close();
-        let me = Rc::downgrade(me);
+        self.show_overview();
+    }
+
+    /// Opens (or refreshes) the overview with the current workspaces.
+    fn show_overview(&self) {
+        let me = self.me.clone();
         let on_pick: Rc<dyn Fn(u8)> = Rc::new(move |n| {
             if let Some(app) = me.upgrade() {
                 app.workspaces.borrow_mut().go(n);
             }
         });
-        self.overview.open(&self.workspaces.borrow().summaries(), on_pick);
+        let me = self.me.clone();
+        let on_remove: Rc<dyn Fn(u8)> = Rc::new(move |n| {
+            if let Some(app) = me.upgrade() {
+                app.close_workspace(n);
+            }
+        });
+        let summaries = self.workspaces.borrow().summaries();
+        self.overview.open(&summaries, on_pick, on_remove);
     }
 
     /// Places tiles and the Files panel for the current drawer extension and window size.
     fn sync(&self) {
-        let numbers = self.workspaces.borrow().numbers();
+        let numbers = self.rail_dots();
         let clock = self.clock.borrow();
         let scene = self.scene(&numbers, "", &clock);
         self.workspaces.borrow_mut().set_area(draw::tile_area(&scene), draw::stage_rect(&scene));
@@ -724,11 +1096,15 @@ impl App {
             return;
         }
         drop(config);
+        // Alt+B and the opener always open on Files; Alt+Shift+T opens Themes.
+        if self.drawer.borrow().target < 0.5 {
+            self.tabs.0.set_active(true);
+        }
         self.drawer.borrow_mut().toggle();
         self.area.queue_draw();
     }
 
-    fn run(&self, me: &Rc<App>, action: &Action) {
+    fn run(&self, action: &Action) {
         let view = self.workspaces.borrow().current();
         match action {
             Action::Workspace(n) => {
@@ -750,8 +1126,29 @@ impl App {
             Action::Wrap => self.workspaces.borrow_mut().toggle_wrap(),
             Action::Save => view.borrow_mut().save_focused(self.window.upcast_ref()),
             Action::Quit => self.window.close(),
-            Action::Overview => self.open_overview(me),
+            Action::Overview => self.open_overview(),
             Action::Themes => self.open_tray(),
+            Action::Folder => self.open_folder_search(),
+            Action::ThemesSection => self.toggle_themes_section(),
+            Action::WorkspaceClose => match self.workspaces.borrow().active() {
+                Active::Number(n) => self.close_workspace(n),
+                Active::Config => {}
+            },
+            Action::Hover => {
+                if let Some(editor) = view.borrow().focused_editor() {
+                    lsp::hover_at_cursor(&editor);
+                }
+            }
+            Action::Definition => {
+                if let Some(editor) = view.borrow().focused_editor() {
+                    lsp::definition_at_cursor(&editor);
+                }
+            }
+            Action::Complete => {
+                if let Some(editor) = view.borrow().focused_editor() {
+                    lsp::complete(&editor, true);
+                }
+            }
             Action::Unavailable(_) => {}
         }
     }
@@ -759,7 +1156,7 @@ impl App {
     /// Shows workspace `n`'s files next to its dot (a click on the dot).
     fn show_peek(&self, n: u8, dot_y: f64) {
         let peek = &self.peek;
-        peek.tree.borrow_mut().set_root(&self.workspaces.borrow().root(Active::Number(n)));
+        peek.tree.borrow_mut().set_root(&self.workspaces.borrow().folder(Active::Number(n)).unwrap_or_default());
         peek.go.set_label(&format!("Workspace {}  →", workspaces::display(n)));
         let max_top = (self.area.height() - PEEK_HEIGHT - token::FRAME_BORDER as i32).max(0);
         peek.widget.set_margin_top(((dot_y - 20.0) as i32).clamp(0, max_top));
@@ -896,7 +1293,16 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
         let background = s.background.borrow_mut().as_mut().and_then(|b| b.surface(width, height, scale).cloned());
         let frosted = s.background.borrow().as_ref().and_then(|b| b.frosted().cloned());
         let tile_rects = if frosted.is_some() { s.workspaces.borrow().current().borrow().tile_rects() } else { Vec::new() };
-        let numbers = s.workspaces.borrow().numbers();
+        let numbers = s.rail_dots();
+        let now = area.frame_clock().map_or(0, |c| c.frame_time());
+        if s.dots.borrow().animating(now) {
+            let area = area.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(area) = area.upgrade() {
+                    area.queue_draw();
+                }
+            });
+        }
         let label = s.label();
         let clock = s.clock.borrow();
         let mut scene = s.scene(&numbers, &label, &clock);
@@ -908,6 +1314,10 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
         }
         if s.drawer.borrow().animating() {
             s.stats.borrow_mut().draw_times.push(begin.elapsed());
+        }
+        if s.themes_shown() {
+            let report = s.background.borrow().as_ref().and_then(|b| b.report().map(|r| r.describe()));
+            s.themes_panel.set_legibility(report.as_ref().map(|(text, _)| text.as_str()), report.as_ref().is_some_and(|(_, warn)| *warn));
         }
         if first_frame.replace(false) {
             println!(
@@ -954,7 +1364,7 @@ fn connect_mouse(state: &Rc<App>) {
         if s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open() || dialog::is_open() {
             return;
         }
-        let numbers = s.workspaces.borrow().numbers();
+        let numbers = s.rail_dots();
         let clock = s.clock.borrow().clone();
         let hit = draw::rail_hit(&s.scene(&numbers, "", &clock), x, y);
         match hit {
@@ -1082,7 +1492,11 @@ fn connect_keys(state: &Rc<App>) {
         if (s.tray.is_open() || s.overview.is_open() || s.quick_open.is_open()) && !matches!(action, Action::Themes | Action::Overview | Action::Editor | Action::Search | Action::Quit) {
             return glib::Propagation::Proceed;
         }
-        s.run(&s, &action);
+        // Editor actions leave their keys to a focused terminal (Ctrl+Space, F12).
+        if matches!(action, Action::Hover | Action::Definition | Action::Complete) && s.workspaces.borrow().current().borrow().focused_editor().is_none() {
+            return glib::Propagation::Proceed;
+        }
+        s.run(&action);
         glib::Propagation::Stop
     });
     state.window.add_controller(keys);
@@ -1096,6 +1510,7 @@ fn connect_close(state: &Rc<App>) {
     state.window.connect_close_request(move |window| {
         let dirty = s.workspaces.borrow().dirty_count();
         if dirty == 0 || confirmed.get() {
+            lsp::shutdown_all();
             return glib::Propagation::Proceed;
         }
         let files = if dirty == 1 { "1 file has".to_string() } else { format!("{dirty} files have") };

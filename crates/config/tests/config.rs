@@ -63,9 +63,24 @@ fn rice_overrides_earlier_values() {
 }
 
 #[test]
+fn background_set_is_tracked() {
+    assert!(!run("bg-unset", "").unwrap().config.background_set);
+    assert!(run("bg-set", "tileide.background { mode = 'solid', source = '112233' }").unwrap().config.background_set);
+}
+
+#[test]
 fn later_version_calls_are_accepted() {
     let loaded = run("later", "tileide.lsp('rust', { cmd = 'rust-analyzer' })\ntileide.appearance { opacity = 0.8, blur_hint = true }").unwrap();
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn lsp_overrides_parse() {
+    let c = run("lsp", "tileide.lsp('rust', { cmd = 'ra --flag' })\ntileide.lsp('python', { cmd = { 'pylsp', '-v' } })\ntileide.lsp('java', { enabled = false })").unwrap().config;
+    assert_eq!(c.lsp["rust"].cmd.as_deref(), Some(&["ra".to_string(), "--flag".to_string()][..]));
+    assert_eq!(c.lsp["python"].cmd.as_deref(), Some(&["pylsp".to_string(), "-v".to_string()][..]));
+    assert!(!c.lsp["java"].enabled && c.lsp["java"].cmd.is_none());
+    assert!(run("lsp-bad", "tileide.lsp('rust', { cmd = '' })").is_err());
 }
 
 #[test]
@@ -169,9 +184,27 @@ fn state_round_trips_and_tolerates_odd_names() {
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("state.lua");
     assert_eq!(load_state(&path).unwrap(), State::default(), "missing file = empty state");
-    let state = State { theme: Some("we\"ird\\name\n".into()) };
+    let state = State { theme: Some("we\"ird\\name\n".into()), recent_folders: vec!["/home/a b".into(), "/tmp/\"q\"".into()], ..State::default() };
     save_state(&path, &state).unwrap();
     assert_eq!(load_state(&path).unwrap(), state);
+
+    let mut bg = tileide_config::Config::default().background;
+    bg.mode = "image".into();
+    bg.source = Some("~/Pictures/a \"b\".png".into());
+    bg.dim = 20;
+    let mut state = State { theme: Some("dusk".into()), background: Some(bg.clone()), ..State::default() };
+    state.workspaces.insert(2, tileide_config::WorkspacePick { theme: Some("miasma".into()), background: None });
+    state.workspaces.insert(10, tileide_config::WorkspacePick { theme: None, background: Some(bg) });
+    save_state(&path, &state).unwrap();
+    assert_eq!(load_state(&path).unwrap(), state, "picker choices round-trip");
+
+    let mut state = State::default();
+    for i in 0..15 {
+        state.remember_folder(&format!("/f{i}"));
+    }
+    state.remember_folder("/f3");
+    assert_eq!(state.recent_folders.len(), tileide_config::RECENT_FOLDERS);
+    assert_eq!(&state.recent_folders[..2], ["/f3", "/f14"], "a repick moves to the front, once");
     fs::write(&path, "return {{{").unwrap();
     assert!(load_state(&path).is_err(), "a broken state file is an error the app shows and ignores");
 }

@@ -23,12 +23,16 @@ pub fn css(t: &Theme) -> String {
 .overview button.card.active {{ border-color: {accent}; }}
 .overview .number {{ font-size: 22px; font-weight: 600; color: {accent}; }}
 .overview .name {{ font-size: 15px; font-weight: 500; }}
-.overview .detail {{ font-size: 12px; color: {muted}; }}",
+.overview .detail {{ font-size: 12px; color: {muted}; }}
+.overview button.remove {{ min-width: 24px; min-height: 24px; padding: 0; margin: 8px; border-radius: 12px; border: none; box-shadow: none; background: transparent; color: {muted}; }}
+.overview button.remove:hover {{ background-color: {remove_hover}; color: {error}; }}",
         surface = c(t.surface, 0.96),
         text = c(t.text, 1.0),
         muted = c(t.muted, 1.0),
         edge = c(t.text, 0.1),
         accent = c(t.accent, 1.0),
+        error = c(t.error, 1.0),
+        remove_hover = c(t.error, 0.14),
     )
 }
 
@@ -95,7 +99,8 @@ impl Overview {
         crate::motion::shown(&self.root)
     }
 
-    pub fn open(&self, summaries: &[Summary], on_pick: Rc<dyn Fn(u8)>) {
+    /// `on_remove` runs from a card's × button (the app asks, removes, then reopens this).
+    pub fn open(&self, summaries: &[Summary], on_pick: Rc<dyn Fn(u8)>, on_remove: Rc<dyn Fn(u8)>) {
         while let Some(child) = self.cards.first_child() {
             self.cards.remove(&child);
         }
@@ -110,7 +115,11 @@ impl Overview {
             let number = gtk::Label::new(Some(&workspaces::display(s.number).to_string()));
             number.add_css_class("number");
             number.set_xalign(0.0);
-            let name = gtk::Label::new(Some(s.name.as_deref().unwrap_or(&s.folder.file_name().map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned()))));
+            let folder_name = match &s.folder {
+                Some(f) => f.file_name().map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned()),
+                None => "No folder".into(),
+            };
+            let name = gtk::Label::new(Some(s.name.as_deref().unwrap_or(&folder_name)));
             name.add_css_class("name");
             name.set_xalign(0.0);
             let tiles = match s.tiles {
@@ -122,7 +131,8 @@ impl Overview {
                 LayoutKind::Dwindle => "dwindle",
                 LayoutKind::Columns => "columns",
             };
-            let detail = gtk::Label::new(Some(&format!("{tiles} · {layout}\n{}", s.folder.display())));
+            let folder = s.folder.as_ref().map_or_else(|| "Alt+D picks one".into(), |f| f.display().to_string());
+            let detail = gtk::Label::new(Some(&format!("{tiles} · {layout}\n{folder}")));
             detail.add_css_class("detail");
             detail.set_xalign(0.0);
             detail.set_ellipsize(gtk::pango::EllipsizeMode::Start);
@@ -136,7 +146,18 @@ impl Overview {
                 crate::motion::fade_out(&root);
                 pick(n);
             });
-            self.cards.append(&card);
+            // A sibling over the card's corner: a button can't hold another button.
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("remove");
+            remove.set_tooltip_text(Some("Remove workspace (Alt+Shift+W)"));
+            remove.set_halign(gtk::Align::End);
+            remove.set_valign(gtk::Align::Start);
+            let (on_remove, n) = (on_remove.clone(), s.number);
+            remove.connect_clicked(move |_| on_remove(n));
+            let corner = gtk::Overlay::new();
+            corner.set_child(Some(&card));
+            corner.add_overlay(&remove);
+            self.cards.append(&corner);
             if s.active {
                 focus = Some(card);
             }

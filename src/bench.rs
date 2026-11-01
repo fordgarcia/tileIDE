@@ -92,7 +92,7 @@ pub fn render(args: &[String]) -> Result<(), String> {
         solid: false,
         drawer: tileide_core::token::DRAWER_WIDTH * open.clamp(0.0, 1.0),
         push: !args.iter().any(|a| a == "--overlay"),
-        workspaces: &[1, 2, 3],
+        workspaces: &[(1, 1.0), (2, 1.0), (3, 1.0)],
         active: Some(2),
         label: "tileIDE · 2",
         clock: ("21", "45"),

@@ -143,13 +143,41 @@ pub struct Background {
     image: Option<ImageSurface>,
     /// (width, height, background, glass backdrop) in device pixels.
     baked: Option<(i32, i32, ImageSurface, Option<ImageSurface>)>,
+    /// What the last bake found, for the background picker.
+    report: Option<Report>,
+}
+
+/// The legibility check's outcome, in words for the picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    /// Worst text contrast on tiles, after any automatic dimming.
+    pub contrast: f64,
+    /// The dim asked for and the dim used (higher when auto-dim stepped in).
+    pub dim: (f64, f64),
+}
+
+impl Report {
+    /// (text, whether it is a warning).
+    pub fn describe(&self) -> (String, bool) {
+        if self.dim.1 > self.dim.0 + 0.001 {
+            return (format!("Dimmed to {:.0}% so text stays readable ({:.1}:1).", self.dim.1 * 100.0, self.contrast), true);
+        }
+        if self.contrast < MIN_CONTRAST {
+            return (format!("Text contrast is {:.1}:1, below {MIN_CONTRAST}:1. Raise Dim or Tiles.", self.contrast), true);
+        }
+        (format!("Text contrast {:.1}:1.", self.contrast), false)
+    }
 }
 
 impl Background {
     /// `None` for see-through. An image source is decoded separately (`decode`), off the
     /// main thread in the app, so it never delays the first frame.
     pub fn new(settings: Settings, theme: Theme) -> Option<Background> {
-        (settings.source != Source::SeeThrough).then_some(Background { settings, theme, image: None, baked: None })
+        (settings.source != Source::SeeThrough).then_some(Background { settings, theme, image: None, baked: None, report: None })
+    }
+
+    pub fn report(&self) -> Option<&Report> {
+        self.report.as_ref()
     }
 
     pub fn image_path(&self) -> Option<PathBuf> {
@@ -224,6 +252,7 @@ impl Background {
         drop(cr);
         let report = legibility(&luminances(&surface), &self.theme, self.settings.tile_opacity);
         println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the empty-workspace hint (minimum {MIN_CONTRAST}:1)", report.tile, report.hint);
+        self.report = Some(Report { contrast: report.tile.min(report.hint), dim: (self.settings.dim, dim) });
         let frosted = match self.theme.glass {
             Some(g) => {
                 let f = blur_with(copy(&surface)?, g.blur * scale, |small| saturate(small, g.saturate))?;

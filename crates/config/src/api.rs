@@ -103,13 +103,8 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
     api.set("background", lua.create_function(move |lua, value: Value| {
         let mut f = options(lua, "background", value)?;
         let mut b = b.borrow_mut();
-        let bg = &mut b.config.background;
-        if let Some(v) = f.choice("mode", BACKGROUND_MODES)? { bg.mode = v }
-        if let Some(v) = f.string("source")? { bg.source = Some(v) }
-        if let Some(v) = f.uint("dim", 100)? { bg.dim = v }
-        if let Some(v) = f.uint("blur", 200)? { bg.blur = v }
-        if let Some(v) = f.number("tile_opacity", MIN_TILE_OPACITY, 1.0)? { bg.tile_opacity = v }
-        if let Some(v) = f.choice("fit", FITS)? { bg.fit = v }
+        b.config.background_set = true;
+        read_background(&mut f, &mut b.config.background)?;
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -184,13 +179,39 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         Ok(())
     })?)?;
 
+    let b = shared.clone();
+    api.set("lsp", lua.create_function(move |lua, (name, value): (Value, Value)| {
+        let Value::String(name) = name else {
+            return Err(error(&caller(lua), "lsp: argument 1 must be a server name, e.g. \"rust\""));
+        };
+        let name = name.to_str()?.to_string();
+        let mut f = options(lua, &format!("lsp(\"{name}\")"), value)?;
+        let mut b = b.borrow_mut();
+        let entry = b.config.lsp.entry(name).or_default();
+        if let Some(v) = f.command("cmd")? { entry.cmd = Some(v) }
+        if let Some(v) = f.boolean("enabled")? { entry.enabled = v }
+        f.finish(&mut b.warnings);
+        Ok(())
+    })?)?;
+
     // Later versions (v0.3 extensions, v0.4 toolchains): accepted so configs written
     // for them load today, and ignored.
-    for func in ["extension", "lsp", "toolchain"] {
+    for func in ["extension", "toolchain"] {
         api.set(func, lua.create_function(|_, _: Variadic<Value>| Ok(()))?)?;
     }
 
     read_only(lua, api)
+}
+
+/// `tileide.background { … }` keys; also the picker's choice in `state.lua`.
+pub fn read_background(f: &mut Fields, bg: &mut Background) -> Result<()> {
+    if let Some(v) = f.choice("mode", BACKGROUND_MODES)? { bg.mode = v }
+    if let Some(v) = f.string("source")? { bg.source = Some(v) }
+    if let Some(v) = f.uint("dim", 100)? { bg.dim = v }
+    if let Some(v) = f.uint("blur", 200)? { bg.blur = v }
+    if let Some(v) = f.number("tile_opacity", MIN_TILE_OPACITY, 1.0)? { bg.tile_opacity = v }
+    if let Some(v) = f.choice("fit", FITS)? { bg.fit = v }
+    Ok(())
 }
 
 fn direction(arg: Option<&str>) -> std::result::Result<Direction, String> {
@@ -239,6 +260,12 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
         "quit" => Action::Quit,
         "overview" => Action::Overview,
         "themes" => Action::Themes,
+        "folder" => Action::Folder,
+        "themes_section" => Action::ThemesSection,
+        "workspace_close" => Action::WorkspaceClose,
+        "hover" => Action::Hover,
+        "definition" => Action::Definition,
+        "complete" => Action::Complete,
         "moveto" | "palette" | "run" => Action::Unavailable(action.into()),
         other => return Err(format!("unknown action \"{other}\"")),
     })

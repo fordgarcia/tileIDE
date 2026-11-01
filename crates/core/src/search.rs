@@ -40,6 +40,38 @@ pub fn list_files(root: &Path, limit: usize) -> Vec<PathBuf> {
     out
 }
 
+/// Folders under `root` (relative to it), at most `depth` levels down, breadth first so
+/// near folders come before deep ones when `limit` cuts the list. Same skips as
+/// `list_files`; a folder's contents are not listed below a skipped one.
+pub fn list_dirs(root: &Path, depth: usize, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut level = vec![root.to_path_buf()];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for dir in level {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut entries: Vec<_> = entries.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) || !entry.file_type().is_ok_and(|k| k.is_dir()) {
+                    continue;
+                }
+                if let Ok(relative) = entry.path().strip_prefix(root) {
+                    out.push(relative.to_path_buf());
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+                next.push(entry.path());
+            }
+        }
+        level = next;
+    }
+    out
+}
+
 /// Scores `candidate` (a relative path) against `query`; `None` if the query's
 /// characters don't all appear in order. Case-insensitive. Higher is better: runs of
 /// consecutive characters, starts of words, and matches in the file name count most;
@@ -116,6 +148,20 @@ mod tests {
         }
         assert_eq!(list_files(&root, 100), vec![PathBuf::from("a.rs"), PathBuf::from("src/b.rs")]);
         assert_eq!(list_files(&root, 1).len(), 1, "stops at the limit");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lists_dirs_breadth_first_to_a_depth() {
+        let root = std::env::temp_dir().join(format!("tileide-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["b/deep/deeper", "a", ".git/x", "target/y"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("file"), "").unwrap();
+        let dirs = |depth, limit| list_dirs(&root, depth, limit);
+        assert_eq!(dirs(2, 100), ["a", "b", "b/deep"].map(PathBuf::from));
+        assert_eq!(dirs(2, 2), ["a", "b"].map(PathBuf::from), "near folders first");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

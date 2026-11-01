@@ -29,7 +29,16 @@ pub struct Theme {
     pub strip: [Rgb; 3],
     /// Translucent "glass" tiles (Black Glass); `None` = solid tiles at `tile_opacity`.
     pub glass: Option<Glass>,
+    /// Terminal colours the theme sets itself (ANSI order); the rest are derived.
+    pub ansi: [Option<Rgb>; 16],
+    /// Syntax colours the theme sets itself (`SYNTAX_KEYS` order); the rest are derived.
+    pub code: [Option<Rgb>; 8],
 }
+
+/// Theme file keys of `syntax = { … }`, in `Theme::code` order.
+pub const SYNTAX_KEYS: [&str; 8] = ["keyword", "type", "string", "constant", "function", "preprocessor", "builtin", "comment"];
+/// Theme file keys of `terminal = { … }`, in ANSI order.
+pub const ANSI_KEYS: [&str; 16] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_black", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan", "bright_white"];
 
 /// Smoked-glass tiles (`themes/theme-design.md` §4): a diagonal fill from `tile` at
 /// `opacity` to `bottom` at `bottom_opacity`, over a blurred, saturated copy of the
@@ -73,6 +82,8 @@ impl Theme {
             error: rgb(0xE8735F),
             strip: [rgb(0x14110F), rgb(0x6B5244), rgb(0xF0A37A)],
             glass: None,
+            ansi: [None; 16],
+            code: [None; 8],
         }
     }
 
@@ -110,7 +121,35 @@ impl Theme {
         p[7] = over(ink, 0.2, paper);
         p[8] = legible(self.muted, bg, dark);
         p[15] = paper;
+        for (slot, set) in p.iter_mut().zip(self.ansi) {
+            if let Some(c) = set {
+                *slot = c;
+            }
+        }
         p
+    }
+}
+
+/// The editor's syntax colours. They reuse the terminal's hues, so code reads the same
+/// in an editor tile and in `bat` or `git diff` in a terminal tile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Syntax {
+    pub keyword: Rgb,
+    pub type_: Rgb,
+    pub string: Rgb,
+    /// Numbers, booleans and other constants.
+    pub constant: Rgb,
+    pub function: Rgb,
+    pub preprocessor: Rgb,
+    pub builtin: Rgb,
+    pub comment: Rgb,
+}
+
+impl Theme {
+    pub fn syntax(&self) -> Syntax {
+        let p = self.terminal_palette();
+        let pick = |i: usize, derived: Rgb| self.code[i].unwrap_or(derived);
+        Syntax { keyword: pick(0, p[5]), type_: pick(1, p[3]), string: pick(2, p[2]), constant: pick(3, p[6]), function: pick(4, p[4]), preprocessor: pick(5, p[13]), builtin: pick(6, p[14]), comment: pick(7, p[8]) }
     }
 }
 
@@ -207,6 +246,28 @@ mod tests {
             assert!(to_hsl(p[2]).0 > 60.0 && to_hsl(p[2]).0 < 160.0, "{}: green stays green", t.name);
             assert!(luminance(p[0]) < luminance(p[15]), "{}: black is darker than white", t.name);
         }
+    }
+
+    #[test]
+    fn syntax_colours_read_and_differ() {
+        let t = Theme::builtin();
+        let s = t.syntax();
+        let all = [s.keyword, s.type_, s.string, s.constant, s.function, s.preprocessor, s.builtin, s.comment];
+        for (i, c) in all.iter().enumerate() {
+            assert!(contrast(*c, t.tile) >= 4.5, "syntax colour {i}");
+            assert!(all[..i].iter().all(|o| o != c), "syntax colour {i} repeats");
+        }
+    }
+
+    #[test]
+    fn theme_colours_override_derived_ones() {
+        let mut t = Theme::builtin();
+        t.ansi[1] = Some(rgb(0x123456));
+        t.code[2] = Some(rgb(0xABCDEF));
+        assert_eq!(t.terminal_palette()[1], rgb(0x123456));
+        assert_eq!(t.terminal_palette()[2], Theme::builtin().terminal_palette()[2], "unset ones stay derived");
+        assert_eq!(t.syntax().string, rgb(0xABCDEF));
+        assert_eq!(t.syntax().keyword, Theme::builtin().syntax().keyword);
     }
 
     #[test]

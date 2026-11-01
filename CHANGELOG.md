@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0-alpha.9 (2026-11-01): Themes section, background picker, VS Code themes
+
+### Added
+- **Themes section in the drawer** (`Alt+Shift+T`, action `themes_section`, or the drawer's Files | Themes switch). Hover a theme (or move to it with ↑/↓) to preview it on the real window; click or Enter applies it to **all workspaces** or **this workspace** only. Picks are saved in `state.lua`; `tileide.lua` still wins, and the section says when it does.
+- **Background picker** in the same section (full-screen mode): None, Image, Gradient or Solid; an image file chooser and fit; colour pickers; Dim, Blur and Tiles sliders; all live. It shows the text contrast the legibility check measured and says when it dimmed the background to keep text readable. Per-workspace like themes.
+- **Import VS Code theme…**: a theme `.json` or an extension `.vsix` (e.g. from Open VSX) becomes a theme file in `~/.config/tileide/themes/` (every colour theme in a `.vsix`). Workbench colours, syntax colours and terminal colours are mapped; nothing from the extension is run. Low-contrast imports are reported.
+- Theme files may set their own syntax and terminal colours: `syntax = { keyword = "#…", … }` and `terminal = { red = "#…", … }`. Anything left out is still derived from the theme.
+
+### Changed
+- The editor's line-number column is transparent like the rest of the tile (the GTK theme still painted its border area).
+- The Arch package depends on `libarchive` (for `bsdtar`, to read `.vsix` files).
+
+## 0.3.0-alpha.8 (2026-11-01): language servers
+
+### Added
+- **Language servers** for Rust (rust-analyzer), C/C++ (clangd), Python (basedpyright, pyright or pylsp), JavaScript/TypeScript (typescript-language-server) and Java (jdtls). TileIDE starts the one you have installed when a matching file opens, one per workspace folder; a workspace without a folder starts none. A missing or failing server shows a notice with how to get it.
+  - **Diagnostics:** a squiggle under the code plus an icon in the gutter (shape, not just colour); hover either for the message.
+  - **Hover:** the mouse shows types and docs; `Alt+I` (action `hover`) shows them at the cursor.
+  - **Completion:** opens on `.`, `::` and other trigger characters, after two letters of a word, or with `Ctrl+Space` (action `complete`). Typing filters it; ↑/↓ select, Enter or Tab insert, Esc closes.
+  - **Go to definition:** `F12` (action `definition`) or Ctrl+click; another file opens in a tile.
+  - `tileide.lsp(name, { cmd = "…", enabled = false })` changes a server's command or turns it off.
+- Servers stop when no workspace uses their folder any more, and when TileIDE quits.
+
+### Fixed
+- A workspace whose folder was picked with `Alt+D` is no longer removed when you leave it before opening a tile. Only workspaces with neither tiles nor a folder are removed.
+
+## 0.3.0-alpha.7 (2026-11-01): workspace folders, themed editors
+
+### Added
+- **Editors match the theme.** Code text, syntax colours, cursor, selection and bracket matches come from the theme, using the same hues as the terminal (keywords, types, strings, numbers, functions, comments), so code reads alike in an editor and in `bat` or `git diff`.
+- **Folder search** (`Alt+D`, new action `folder`): the quick-open card lists folders, recent ones first (kept in `state.lua`), then folders under `~` (6 levels, hidden and build folders skipped). A typed path (`~/notes`, `/etc`) works too. Enter sets the workspace's folder: the Files drawer, new terminals and quick open follow it.
+- **Remove a workspace:** `Alt+Shift+W` (new action `workspace_close`) or the × on its overview card. Unsaved files or open terminals are named in a confirmation first.
+- Rail dots grow and fade in when a workspace is created and shrink out when it is removed.
+
+### Changed
+- **New workspaces start empty, without a folder**; the folder search opens by itself. Only the launch workspace gets the folder TileIDE was opened on; workspaces defined in `tileide.lua` keep their `folder`. The Files drawer says "No folder · Alt+D" until one is picked.
+- **Leaving a workspace with no tiles removes it**, except the last one and workspaces defined in `tileide.lua`. Numbers never shift (removing 3 leaves 1, 2, 4); `+` takes the lowest free number.
+
 ## 0.3.0-alpha.6 (2026-11-01): calmer motion, themed terminals
 
 ### Changed

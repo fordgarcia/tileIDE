@@ -29,6 +29,7 @@ pub fn css(t: &Theme) -> String {
 .drawer row image {{ color: {muted}; }}
 .drawer row:hover {{ background-color: {row_hover}; }}
 .drawer row:selected {{ background-color: {selected}; color: {text}; }}
+.drawer .placeholder {{ color: {muted}; padding: 12px 14px; }}
 .drawer entry {{ min-height: 24px; font-family: \"{font}\"; }}
 .drawer entry.error {{ border-color: {error}; }}
 .peek {{ background-color: {peek}; border-radius: 12px; border: 1px solid {peek_edge}; }}
@@ -62,6 +63,8 @@ pub struct FileTree {
     /// One path per list row, in order (the inline name entry has no path).
     rows: Vec<PathBuf>,
     list: gtk::ListBox,
+    /// Shown instead of the list while it has no rows.
+    placeholder: gtk::Label,
     container: gtk::Box,
     title: gtk::Label,
     on_open: Rc<dyn Fn(&Path)>,
@@ -80,7 +83,10 @@ impl FileTree {
         scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
         scroll.set_child(Some(&list));
 
-        let title = gtk::Label::new(Some(&folder_name(&root)));
+        let title = gtk::Label::new(Some(&title(&root)));
+        let placeholder = gtk::Label::new(None);
+        placeholder.add_css_class("placeholder");
+        placeholder.set_xalign(0.0);
         let tree = Rc::new(RefCell::new(FileTree {
             root,
             expanded: HashSet::new(),
@@ -88,6 +94,7 @@ impl FileTree {
             selected: None,
             rows: Vec::new(),
             list: list.clone(),
+            placeholder,
             container: container.clone(),
             title,
             on_open,
@@ -96,6 +103,7 @@ impl FileTree {
         tree.borrow_mut().me = Rc::downgrade(&tree);
 
         container.append(&header(&tree));
+        container.append(&tree.borrow().placeholder);
         container.append(&scroll);
 
         let weak = Rc::downgrade(&tree);
@@ -114,6 +122,7 @@ impl FileTree {
 
     /// Shows another folder (workspace switch). Each root keeps the folders that were
     /// open the last time it was shown.
+    /// An empty path: a workspace without a folder (the list says how to pick one).
     pub fn set_root(&mut self, root: &Path) {
         if root == self.root {
             return;
@@ -122,7 +131,7 @@ impl FileTree {
         let previous = std::mem::replace(&mut self.expanded, expanded);
         self.remembered.insert(std::mem::replace(&mut self.root, root.to_path_buf()), previous);
         self.selected = None;
-        self.title.set_text(&folder_name(root));
+        self.title.set_text(&title(root));
         self.rebuild();
     }
 
@@ -158,6 +167,8 @@ impl FileTree {
         self.rows.clear();
         let root = self.root.clone();
         self.add_children(&root, 0);
+        self.placeholder.set_text(if root.as_os_str().is_empty() { "No folder · Alt+D" } else { "Empty folder" });
+        self.placeholder.set_visible(self.rows.is_empty());
         if let Some(i) = self.selected.as_ref().and_then(|s| self.rows.iter().position(|p| p == s)) {
             self.list.select_row(self.list.row_at_index(i as i32).as_ref());
         }
@@ -186,6 +197,9 @@ impl FileTree {
 
     /// Shows an inline name entry under the target folder, like VS Code.
     fn start_new(&mut self, kind: NewKind) {
+        if self.root.as_os_str().is_empty() {
+            return;
+        }
         let dir = self.target_dir();
         if dir != self.root {
             self.expanded.insert(dir.clone());
@@ -322,6 +336,10 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = read.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.file_name().is_some_and(|n| n != ".git")).collect();
     entries.sort_by_key(|p| (!p.is_dir(), p.file_name().map(|n| n.to_string_lossy().to_lowercase())));
     entries
+}
+
+fn title(root: &Path) -> String {
+    if root.as_os_str().is_empty() { "No folder".into() } else { folder_name(root) }
 }
 
 #[cfg(test)]

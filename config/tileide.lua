@@ -48,5 +48,10 @@ tileide.bind(mod, "S", "split",  "vertical")   -- the next tile opens below (sta
 tileide.workspace(1, { name = "code" })
 -- tileide.workspace(2, { name = "notes", folder = "~/notes", layout = "columns", theme = "dune-teal" })
 
+-- language servers (rust, c, python, typescript, java) start by themselves when one is
+-- installed and the workspace has a folder; change the command or turn one off here
+-- tileide.lsp("python", { cmd = "pylsp" })
+-- tileide.lsp("java", { enabled = false })
+
 -- a rice is just another Lua file; require() is limited to ~/.config/tileide
 -- require("rices.nord")
