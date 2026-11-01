@@ -40,6 +40,9 @@ pub struct Settings {
     pub tile_opacity: f64,
     /// App-side blur radius in px (app-drawn modes only).
     pub blur: f64,
+    /// Backdrop blur under the tiles and under the sidebar (frame), px; 0 = none.
+    pub tile_blur: f64,
+    pub frame_blur: f64,
     pub fit: Fit,
     /// Raise `dim` until text passes the contrast check (spec §4.4 legibility guard).
     pub auto_dim: bool,
@@ -58,6 +61,8 @@ impl Default for Settings {
             tint: None,
             tile_opacity: token::TILE_OPACITY,
             blur: 0.0,
+            tile_blur: 0.0,
+            frame_blur: 0.0,
             fit: Fit::Cover,
             auto_dim: true,
         }
@@ -137,12 +142,19 @@ fn parse_hex(text: &str) -> Result<Rgb, String> {
 }
 
 /// The baked background for one window size, plus what the legibility check found.
+/// The background blurred for what sits on it: under the tiles, under the sidebar.
+#[derive(Default)]
+struct Backdrops {
+    tiles: Option<ImageSurface>,
+    frame: Option<ImageSurface>,
+}
+
 pub struct Background {
     pub settings: Settings,
     theme: Theme,
     image: Option<ImageSurface>,
-    /// (width, height, background, glass backdrop) in device pixels.
-    baked: Option<(i32, i32, ImageSurface, Option<ImageSurface>)>,
+    /// (width, height, background, backdrops) in device pixels.
+    baked: Option<(i32, i32, ImageSurface, Backdrops)>,
     /// What the last bake found, for the background picker.
     report: Option<Report>,
 }
@@ -217,13 +229,18 @@ impl Background {
         self.baked.as_ref().map(|(_, _, s, _)| s)
     }
 
-    /// The glass themes' backdrop: the baked background, blurred and saturated. Valid
+    /// The background blurred for under the tiles (glass themes also saturate it). Valid
     /// after `surface()` at the same size.
     pub fn frosted(&self) -> Option<&ImageSurface> {
-        self.baked.as_ref().and_then(|(_, _, _, f)| f.as_ref())
+        self.baked.as_ref().and_then(|(_, _, _, b)| b.tiles.as_ref())
     }
 
-    fn bake(&mut self, width: i32, height: i32, scale: f64) -> Result<(ImageSurface, Option<ImageSurface>), cairo::Error> {
+    /// The background blurred for under the sidebar.
+    pub fn frosted_frame(&self) -> Option<&ImageSurface> {
+        self.baked.as_ref().and_then(|(_, _, _, b)| b.frame.as_ref())
+    }
+
+    fn bake(&mut self, width: i32, height: i32, scale: f64) -> Result<(ImageSurface, Backdrops), cairo::Error> {
         let surface = ImageSurface::create(Format::Rgb24, width, height)?;
         {
             let cr = Context::new(&surface)?;
@@ -253,14 +270,16 @@ impl Background {
         let report = legibility(&luminances(&surface), &self.theme, self.settings.tile_opacity);
         println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the empty-workspace hint (minimum {MIN_CONTRAST}:1)", report.tile, report.hint);
         self.report = Some(Report { contrast: report.tile.min(report.hint), dim: (self.settings.dim, dim) });
-        let frosted = match self.theme.glass {
-            Some(g) => {
-                let f = blur_with(copy(&surface)?, g.blur * scale, |small| saturate(small, g.saturate))?;
-                f.set_device_scale(scale, scale);
-                Some(f)
+        let saturation = self.theme.glass.map_or(1.0, |g| g.saturate);
+        let backdrop = |radius: f64, saturation: f64| -> Result<Option<ImageSurface>, cairo::Error> {
+            if radius < 1.0 {
+                return Ok(None);
             }
-            None => None,
+            let f = blur_with(copy(&surface)?, radius * scale, |small| if saturation == 1.0 { Ok(small) } else { saturate(small, saturation) })?;
+            f.set_device_scale(scale, scale);
+            Ok(Some(f))
         };
+        let frosted = Backdrops { tiles: backdrop(self.settings.tile_blur, saturation)?, frame: backdrop(self.settings.frame_blur, 1.0)? };
         // Drawn in logical units from here on.
         surface.set_device_scale(scale, scale);
         Ok((surface, frosted))
@@ -445,7 +464,7 @@ pub fn legibility(pixels: &[Rgb], theme: &Theme, tile_opacity: f64) -> Legibilit
         c.sort_by(f64::total_cmp);
         c.get(c.len() / 50).copied().unwrap_or(f64::INFINITY)
     };
-    let (fill, alpha) = theme.tile_fill(tile_opacity, true);
+    let (fill, alpha) = (theme.tile, tile_opacity);
     Legibility { tile: worst(fill, alpha), hint: worst(theme.surface, token::HINT_OPACITY) }
 }
 
@@ -520,8 +539,9 @@ mod tests {
     fn glass_tiles_dim_a_bright_background() {
         let glass = Theme { glass: Some(tileide_core::theme::Glass::default()), text: rgb(0xF2F2F4), tile: rgb(0x2C2C30), ..Theme::builtin() };
         let white = vec![(1.0, 1.0, 1.0); 100];
-        assert!(legibility(&white, &glass, MIN_TILE_OPACITY).tile < MIN_CONTRAST, "tile_opacity does not apply to glass");
-        let dim = required_dim(&white, &glass, MIN_TILE_OPACITY, None, 0.0);
+        // The glass look: 56% opaque tiles over white need the background dimmed.
+        assert!(legibility(&white, &glass, 0.56).tile < MIN_CONTRAST);
+        let dim = required_dim(&white, &glass, 0.56, None, 0.0);
         assert!(dim > 0.0 && dim < 1.0, "{dim}");
     }
 

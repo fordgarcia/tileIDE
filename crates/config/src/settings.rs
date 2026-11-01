@@ -15,6 +15,9 @@ pub const CODE_SIZE: (f64, f64) = (7.0, 32.0);
 /// (min, max) of the rail's size and of its icons within it.
 pub const RAIL_SCALE: (f64, f64) = (0.8, 1.5);
 pub const ICON_SCALE: (f64, f64) = (0.8, 1.25);
+/// Sidebar and tile see-through (percent) and backdrop blur (px) upper bounds.
+pub const TRANSPARENCY_MAX: f64 = 90.0;
+pub const BLUR_MAX: f64 = 60.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -54,6 +57,11 @@ pub const KEYS: &[(&str, Kind)] = &[
     ("sidebar.scale", Kind::Number(RAIL_SCALE.0, RAIL_SCALE.1)),
     ("sidebar.icon_scale", Kind::Number(ICON_SCALE.0, ICON_SCALE.1)),
     ("sidebar.icon_backgrounds", Kind::Bool),
+    ("alerts.missing_tools", Kind::Bool),
+    ("sidebar.transparency", Kind::Number(0.0, TRANSPARENCY_MAX)),
+    ("sidebar.blur", Kind::Number(0.0, BLUR_MAX)),
+    ("appearance.tile_transparency", Kind::Number(0.0, TRANSPARENCY_MAX)),
+    ("appearance.tile_blur", Kind::Number(0.0, BLUR_MAX)),
 ];
 
 pub fn kind(key: &str) -> Option<Kind> {
@@ -95,6 +103,12 @@ pub fn get(config: &Config, key: &str) -> Option<Value> {
         "sidebar.scale" => Value::Number(s.scale),
         "sidebar.icon_scale" => Value::Number(s.icon_scale),
         "sidebar.icon_backgrounds" => Value::Bool(s.icon_backgrounds),
+        "alerts.missing_tools" => Value::Bool(config.alerts.missing_tools),
+        // Unset = the theme's look, which only the app knows.
+        "sidebar.transparency" => Value::Number(s.transparency?),
+        "sidebar.blur" => Value::Number(s.blur?),
+        "appearance.tile_transparency" => Value::Number(a.tile_transparency?),
+        "appearance.tile_blur" => Value::Number(a.tile_blur?),
         _ => return None,
     })
 }
@@ -124,6 +138,11 @@ fn set(config: &mut Config, key: &str, value: Value) {
         ("sidebar.scale", Value::Number(v)) => s.scale = v,
         ("sidebar.icon_scale", Value::Number(v)) => s.icon_scale = v,
         ("sidebar.icon_backgrounds", Value::Bool(v)) => s.icon_backgrounds = v,
+        ("alerts.missing_tools", Value::Bool(v)) => config.alerts.missing_tools = v,
+        ("sidebar.transparency", Value::Number(v)) => s.transparency = Some(v),
+        ("sidebar.blur", Value::Number(v)) => s.blur = Some(v),
+        ("appearance.tile_transparency", Value::Number(v)) => a.tile_transparency = Some(v),
+        ("appearance.tile_blur", Value::Number(v)) => a.tile_blur = Some(v),
         _ => {}
     }
 }
@@ -138,6 +157,80 @@ pub fn apply(mut config: Config, settings: &BTreeMap<String, Value>) -> Config {
     config
 }
 
+/// The Lua table and field that set `key` (`sidebar.start_expanded` is `start_state`).
+fn lua_field(key: &str) -> Option<(&str, &str)> {
+    match key {
+        "sidebar.start_expanded" => Some(("sidebar", "start_state")),
+        _ => key.split_once('.'),
+    }
+}
+
+/// The code part of a Lua line (before a `--` comment outside strings).
+fn code_of(line: &str) -> &str {
+    let mut quote = None;
+    let bytes = line.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        match (quote, c) {
+            (None, b'"' | b'\'') => quote = Some(c),
+            (Some(q), _) if c == q && (i == 0 || bytes[i - 1] != b'\\') => quote = None,
+            (None, b'-') if bytes.get(i + 1) == Some(&b'-') => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// `source` (a `tileide.lua`) with the line that sets `key` commented out, so Settings
+/// can change it (the "Unlock" button). Only a line holding that one field, inside a
+/// `tileide.<table> { … }` call, is touched; anything else returns `None` (then the
+/// user edits the file).
+pub fn release(source: &str, key: &str) -> Option<String> {
+    let (table, field) = lua_field(key)?;
+    let call = format!("tileide.{table}");
+    let mut inside = false;
+    let mut depth = 0i32;
+    let mut lines: Vec<String> = source.lines().map(str::to_string).collect();
+    let mut target = None;
+    for (n, line) in lines.iter().enumerate() {
+        let code = code_of(line);
+        let mut rest = code;
+        if !inside && let Some(at) = code.find(&call) {
+            inside = true;
+            depth = 0;
+            rest = &code[at + call.len()..];
+        }
+        if !inside {
+            continue;
+        }
+        let assignment = rest.trim().trim_end_matches(',').trim();
+        let opens = rest.matches('{').count() as i32;
+        let closes = rest.matches('}').count() as i32;
+        if let Some((name, value)) = assignment.split_once('=')
+            && name.trim() == field
+            && !value.contains('=')
+            && depth == 1
+            && opens == 0
+            && closes == 0
+        {
+            target = Some(n);
+            break;
+        }
+        depth += opens - closes;
+        if depth <= 0 && (opens > 0 || closes > 0) {
+            inside = false;
+        }
+    }
+    let n = target?;
+    let line = &lines[n];
+    let indent = &line[..line.len() - line.trim_start().len()];
+    lines[n] = format!("{indent}-- {}  -- now set in Settings", line.trim_start());
+    let mut out = lines.join("\n");
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,11 +239,35 @@ mod tests {
     fn every_key_reads_back() {
         let config = Config::default();
         for (key, _) in KEYS {
-            let v = get(&config, key).unwrap_or_else(|| panic!("{key} has no getter"));
+            // Keys unset by default (the theme decides) read back once set.
+            let v = get(&config, key).or_else(|| matches!(kind(key), Some(Kind::Number(..))).then_some(Value::Number(12.0))).unwrap_or_else(|| panic!("{key} has no getter"));
             let mut changed = Config::default();
             set(&mut changed, key, v.clone());
             assert_eq!(get(&changed, key), Some(v), "{key}");
         }
+    }
+
+    #[test]
+    fn releases_one_field_line() {
+        let src = "tileide.appearance {\n  window_radius = 14,  -- corners\n  animations = true,\n}\ntileide.tiling {\n  gaps_in = 10,\n  gaps_out = 16,\n}\ntileide.sidebar { start_state = \"collapsed\" }\n";
+        let out = release(src, "appearance.window_radius").unwrap();
+        assert!(out.contains("  -- window_radius = 14,  -- corners  -- now set in Settings\n  animations = true,"), "{out}");
+        assert!(release(src, "tiling.gaps_out").unwrap().contains("-- gaps_out = 16,"));
+        // gaps_in in another table's call isn't touched.
+        assert_eq!(release("tileide.appearance {\n  gaps_in = 1,\n}\n", "tiling.gaps_in"), None);
+        // Several fields on one line: left for the user.
+        assert_eq!(release(src, "sidebar.start_expanded"), None);
+        assert_eq!(release("tileide.appearance { window_radius = 4 }\n", "appearance.window_radius"), None);
+        // A commented-out line doesn't count.
+        assert_eq!(release("tileide.tiling {\n  -- gaps_in = 3,\n}\n", "tiling.gaps_in"), None);
+        let loaded = |src: &str| {
+            let dir = std::env::temp_dir().join(format!("tileide-release-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("tileide.lua"), src).unwrap();
+            crate::load(&dir.join("tileide.lua"), crate::Limits::default()).unwrap().config
+        };
+        let config = loaded(&out);
+        assert!(!config.explicit.contains("appearance.window_radius") && config.explicit.contains("appearance.animations"));
     }
 
     #[test]

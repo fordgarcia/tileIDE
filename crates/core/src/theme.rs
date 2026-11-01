@@ -40,6 +40,31 @@ pub const SYNTAX_KEYS: [&str; 8] = ["keyword", "type", "string", "constant", "fu
 /// Theme file keys of `terminal = { … }`, in ANSI order.
 pub const ANSI_KEYS: [&str; 16] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_black", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan", "bright_white"];
 
+/// Settings → Themes & background: transparency in percent, blur in px; `None` = the
+/// theme decides.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SurfaceChoice {
+    pub sidebar_transparency: Option<f64>,
+    pub sidebar_blur: Option<f64>,
+    pub tile_transparency: Option<f64>,
+    pub tile_blur: Option<f64>,
+}
+
+/// One surface's fill opacity (0..1) and backdrop blur (px; drawn only over a background
+/// TileIDE paints itself).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer {
+    pub opacity: f64,
+    pub blur: f64,
+}
+
+/// The sidebar (rail, border and drawer: the frame) and the tiles (editors, terminals).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Surfaces {
+    pub sidebar: Layer,
+    pub tiles: Layer,
+}
+
 /// Smoked-glass tiles (`themes/theme-design.md` §4): a diagonal fill from `tile` at
 /// `opacity` to `bottom` at `bottom_opacity`, over a blurred, saturated copy of the
 /// full-screen background.
@@ -87,13 +112,22 @@ impl Theme {
         }
     }
 
-    /// The tile fill's lightest layer (colour, opacity), which legibility checks use.
-    /// `see_behind`: TileIDE draws the background, so it can dim it for legibility.
-    pub fn tile_fill(&self, tile_opacity: f64, see_behind: bool) -> (Rgb, f64) {
-        match self.glass {
-            Some(g) if see_behind => (self.tile, g.opacity),
-            Some(g) => (self.tile, g.opacity.max(g.min_tint)),
-            None => (self.tile, tile_opacity),
+    /// How see-through and blurred the sidebar and the tiles are: the user's choice
+    /// where there is one, else this theme's look (glass tiles: its opacity and blur;
+    /// solid ones: `legacy_tile_opacity`, from `background.tile_opacity`).
+    /// `see_behind`: TileIDE draws the background; where it can't, glass tiles keep their
+    /// `min_tint` floor (unless the user chose a transparency).
+    pub fn surfaces(&self, choice: SurfaceChoice, legacy_tile_opacity: f64, see_behind: bool) -> Surfaces {
+        let opacity = |percent: f64| (1.0 - percent / 100.0).clamp(0.0, 1.0);
+        let tile_opacity = match (choice.tile_transparency, self.glass) {
+            (Some(t), _) => opacity(t),
+            (None, Some(g)) if see_behind => g.opacity,
+            (None, Some(g)) => g.opacity.max(g.min_tint),
+            (None, None) => legacy_tile_opacity,
+        };
+        Surfaces {
+            sidebar: Layer { opacity: choice.sidebar_transparency.map_or(crate::token::FRAME_OPACITY, opacity), blur: choice.sidebar_blur.unwrap_or(0.0) },
+            tiles: Layer { opacity: tile_opacity, blur: choice.tile_blur.or(self.glass.map(|g| g.blur)).unwrap_or(0.0) },
         }
     }
 
@@ -223,6 +257,22 @@ pub fn over(top: Rgb, alpha: f64, under: Rgb) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surfaces_follow_the_theme_until_the_user_chooses() {
+        let solid = Theme::builtin();
+        let glass = Theme { glass: Some(Glass::default()), ..Theme::builtin() };
+        let none = SurfaceChoice::default();
+        let s = solid.surfaces(none, 0.92, true);
+        assert_eq!((s.sidebar.opacity, s.sidebar.blur, s.tiles.opacity, s.tiles.blur), (crate::token::FRAME_OPACITY, 0.0, 0.92, 0.0));
+        let g = glass.surfaces(none, 0.92, true);
+        assert_eq!((g.tiles.opacity, g.tiles.blur), (0.56, 30.0), "the glass look");
+        assert_eq!(glass.surfaces(none, 0.92, false).tiles.opacity, 0.80, "min_tint where TileIDE can't see behind");
+        let mine = SurfaceChoice { sidebar_transparency: Some(40.0), sidebar_blur: Some(12.0), tile_transparency: Some(70.0), tile_blur: Some(0.0) };
+        let m = glass.surfaces(mine, 0.92, false);
+        assert!((m.sidebar.opacity - 0.6).abs() < 1e-9 && m.sidebar.blur == 12.0);
+        assert!((m.tiles.opacity - 0.3).abs() < 1e-9 && m.tiles.blur == 0.0, "the user's choice wins over the theme and the floor");
+    }
 
     #[test]
     fn builtin_text_passes_aa() {

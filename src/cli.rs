@@ -90,6 +90,8 @@ pub enum Command {
     Render(Vec<String>),
     /// `--check-config [FILE]`.
     CheckConfig(Option<PathBuf>),
+    /// `dap-jdb`: the Java debug adapter on stdin/stdout (started by TileIDE itself).
+    DapJdb,
     Run(Box<Options>),
 }
 
@@ -100,6 +102,9 @@ const BACKGROUND_FLAGS: &[&str] = &["--bg", "--dim", "--tint", "--blur", "--fit"
 pub fn parse(args: &[String], cwd: &Path) -> Result<Command, String> {
     if args.first().map(String::as_str) == Some("render") {
         return Ok(Command::Render(args[1..].to_vec()));
+    }
+    if args.first().map(String::as_str) == Some("dap-jdb") {
+        return Ok(Command::DapJdb);
     }
     if args.first().map(String::as_str) == Some("--check-config") {
         return match args.get(1..) {
@@ -268,6 +273,7 @@ mod tests {
         assert!(parse(&args("missing-folder"), &dir).unwrap_err().contains("missing-folder"));
         assert!(parse(&args("--dim"), &dir).is_err());
         assert_eq!(parse(&args("--help"), &dir).unwrap(), Command::Help);
+        assert_eq!(parse(&args("dap-jdb"), &dir).unwrap(), Command::DapJdb);
         assert_eq!(parse(&args("-V"), &dir).unwrap(), Command::Version);
         std::fs::remove_dir_all(&dir).unwrap();
     }

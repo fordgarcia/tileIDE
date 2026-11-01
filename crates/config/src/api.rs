@@ -80,6 +80,8 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         if let Some(v) = f.number("ui_scale", crate::settings::UI_SCALE.0, crate::settings::UI_SCALE.1)? { a.ui_scale = v; set.push("ui_scale") }
         if let Some(v) = f.string("code_font")? { a.code_font = v; set.push("code_font") }
         if let Some(v) = f.number("code_size", crate::settings::CODE_SIZE.0, crate::settings::CODE_SIZE.1)? { a.code_size = v; set.push("code_size") }
+        if let Some(v) = f.number("tile_transparency", 0.0, crate::settings::TRANSPARENCY_MAX)? { a.tile_transparency = Some(v); set.push("tile_transparency") }
+        if let Some(v) = f.number("tile_blur", 0.0, crate::settings::BLUR_MAX)? { a.tile_blur = Some(v); set.push("tile_blur") }
         f.accept(&["opacity", "blur_hint"]);
         b.config.explicit.extend(set.into_iter().map(|k| format!("appearance.{k}")));
         f.finish(&mut b.warnings);
@@ -108,6 +110,8 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         }
         if let Some(v) = f.number("scale", crate::settings::RAIL_SCALE.0, crate::settings::RAIL_SCALE.1)? { s.scale = v; set.push("scale") }
         if let Some(v) = f.number("icon_scale", crate::settings::ICON_SCALE.0, crate::settings::ICON_SCALE.1)? { s.icon_scale = v; set.push("icon_scale") }
+        if let Some(v) = f.number("transparency", 0.0, crate::settings::TRANSPARENCY_MAX)? { s.transparency = Some(v); set.push("transparency") }
+        if let Some(v) = f.number("blur", 0.0, crate::settings::BLUR_MAX)? { s.blur = Some(v); set.push("blur") }
         f.accept(&["drawer_fillet", "show_system", "show_extensions"]);
         b.config.explicit.extend(set.into_iter().map(|k| format!("sidebar.{k}")));
         f.finish(&mut b.warnings);
@@ -135,6 +139,18 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         if let Some(v) = f.uint("gaps_out", 100)? { t.gaps_out = v; set.push("gaps_out") }
         if let Some(v) = f.number("column_width", 0.2, 1.0)? { t.column_width = v }
         b.config.explicit.extend(set.into_iter().map(|k| format!("tiling.{k}")));
+        f.finish(&mut b.warnings);
+        Ok(())
+    })?)?;
+
+    let b = shared.clone();
+    api.set("alerts", lua.create_function(move |lua, value: Value| {
+        let mut f = options(lua, "alerts", value)?;
+        let mut b = b.borrow_mut();
+        if let Some(v) = f.boolean("missing_tools")? {
+            b.config.alerts.missing_tools = v;
+            b.config.explicit.insert("alerts.missing_tools".into());
+        }
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -297,6 +313,10 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
         "hover" => Action::Hover,
         "definition" => Action::Definition,
         "complete" => Action::Complete,
+        "format" => Action::Format,
+        "rename" => Action::Rename,
+        "references" => Action::References,
+        "code_action" => Action::CodeAction,
         "extensions_section" => Action::ExtensionsSection,
         "settings" => Action::Settings,
         "keybinds" => Action::Keybinds,

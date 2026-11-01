@@ -74,12 +74,23 @@ pub fn render(args: &[String]) -> Result<(), String> {
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, (w * scale) as i32, (h * scale) as i32).map_err(|e| e.to_string())?;
     let cr = cairo::Context::new(&surface).map_err(|e| e.to_string())?;
     cr.scale(scale, scale);
-    let settings = crate::background::Settings::from_args(args)?;
-    let tile_opacity = settings.tile_opacity;
+    let mut settings = crate::background::Settings::from_args(args)?;
     let theme = match args.iter().position(|a| a == "--theme") {
         Some(i) => tileide_config::load_theme(std::path::Path::new(args.get(i + 1).ok_or(usage)?))?.0,
         None => tileide_core::theme::Theme::builtin(),
     };
+    // `--sidebar-transparency %`, `--sidebar-blur px`, `--tile-transparency %`, `--tile-blur px`.
+    let choice = tileide_core::theme::SurfaceChoice {
+        sidebar_transparency: number("--sidebar-transparency"),
+        sidebar_blur: number("--sidebar-blur"),
+        tile_transparency: number("--tile-transparency"),
+        tile_blur: number("--tile-blur"),
+    };
+    let surfaces = theme.surfaces(choice, settings.tile_opacity, settings.source != crate::background::Source::SeeThrough);
+    settings.tile_opacity = surfaces.tiles.opacity;
+    settings.tile_blur = surfaces.tiles.blur;
+    settings.frame_blur = surfaces.sidebar.blur;
+    let tile_opacity = surfaces.tiles.opacity;
     let mut backdrop = crate::background::Background::new(settings, theme.clone());
     if let Some(b) = backdrop.as_mut()
         && let Some(path) = b.image_path()
@@ -88,6 +99,7 @@ pub fn render(args: &[String]) -> Result<(), String> {
     }
     let background = backdrop.as_mut().and_then(|b| b.surface(w as i32, h as i32, scale).cloned());
     let frosted = backdrop.as_ref().and_then(|b| b.frosted().cloned());
+    let frosted_frame = backdrop.as_ref().and_then(|b| b.frosted_frame().cloned());
     let scene = draw::Scene {
         width: w,
         height: h,
@@ -110,6 +122,8 @@ pub fn render(args: &[String]) -> Result<(), String> {
         placeholder_tiles: !args.iter().any(|a| a == "--empty"),
         background: background.as_ref(),
         frosted: frosted.as_ref(),
+        frosted_frame: frosted_frame.as_ref(),
+        frame_opacity: surfaces.sidebar.opacity,
         tile_rects: &[],
         tile_opacity,
     };

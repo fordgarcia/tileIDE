@@ -56,12 +56,28 @@ pub const SERVERS: &[Server] = &[
     },
 ];
 
+/// Servers that run beside a language's main one and only add diagnostics (and
+/// formatting): linters. Optional: a missing one is mentioned once, nothing breaks.
+pub const LINTERS: &[Server] = &[Server {
+    name: "ruff",
+    label: "Ruff (Python linter)",
+    languages: &[("py", "python"), ("pyi", "python")],
+    candidates: &[&["ruff", "server"]],
+    install: "pacman -S ruff, or pip install ruff in the project's virtualenv",
+}];
+
 /// Other names `tileide.lsp` accepts.
 const ALIASES: &[(&str, &str)] = &[("cpp", "c"), ("c++", "c"), ("clangd", "c"), ("javascript", "typescript"), ("js", "typescript"), ("ts", "typescript"), ("py", "python")];
 
 pub fn by_name(name: &str) -> Option<&'static Server> {
     let name = ALIASES.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(name)).map_or(name, |(_, n)| n);
-    SERVERS.iter().find(|s| s.name.eq_ignore_ascii_case(name))
+    SERVERS.iter().chain(LINTERS).find(|s| s.name.eq_ignore_ascii_case(name))
+}
+
+/// The linters for a file, by extension.
+pub fn linters_for(path: &Path) -> Vec<&'static Server> {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase) else { return Vec::new() };
+    LINTERS.iter().filter(|s| s.languages.iter().any(|(e, _)| *e == ext)).collect()
 }
 
 /// The server and language id for a file, by extension.
@@ -71,18 +87,57 @@ pub fn for_file(path: &Path) -> Option<(&'static Server, &'static str)> {
 }
 
 /// The command to start `server`: the override if given, else the first candidate
-/// `exists` accepts (normally `on_path`).
-pub fn command(server: &Server, override_cmd: Option<&[String]>, exists: impl Fn(&str) -> bool) -> Option<Vec<String>> {
+/// whose program `find` locates (normally `locate`), with the program as found.
+pub fn command(server: &Server, override_cmd: Option<&[String]>, find: impl Fn(&str) -> Option<String>) -> Option<Vec<String>> {
     if let Some(cmd) = override_cmd {
         return Some(cmd.to_vec());
     }
-    server.candidates.iter().find(|c| exists(c[0])).map(|c| c.iter().map(|s| s.to_string()).collect())
+    server.candidates.iter().find_map(|c| {
+        let program = find(c[0])?;
+        Some(std::iter::once(program).chain(c[1..].iter().map(|s| s.to_string())).collect())
+    })
+}
+
+/// `program` on `PATH`, else in one of `extra` (its full path then). Apps started from a
+/// desktop launcher often get a shorter `PATH` than a shell: no version-manager tool
+/// folders, no npm globals.
+pub fn locate(program: &str, extra: &[std::path::PathBuf]) -> Option<String> {
+    if on_path(program) {
+        return Some(program.to_string());
+    }
+    extra.iter().map(|dir| dir.join(program)).find(|p| executable(p)).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Folders where user-installed servers usually live, best first: the project's
+/// virtualenvs' `bin`, `~/.local/bin`, npm/cargo globals, and every tool version mise
+/// installed (newest name first).
+pub fn user_dirs(venv_bins: &[std::path::PathBuf], home: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs = venv_bins.to_vec();
+    let Some(home) = home else { return dirs };
+    for d in [".local/bin", ".npm-global/bin", ".cargo/bin", ".local/share/pnpm", ".bun/bin"] {
+        dirs.push(home.join(d));
+    }
+    // ~/.local/share/mise/installs/<tool>/<version>/bin
+    let mise = home.join(".local/share/mise/installs");
+    let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&mise)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|tool| std::fs::read_dir(tool.path()).into_iter().flatten().flatten().map(|v| v.path()))
+        .filter(|p| !p.is_symlink())
+        .collect();
+    versions.sort_by(|a, b| b.cmp(a));
+    dirs.extend(versions.into_iter().map(|v| v.join("bin")).filter(|b| b.is_dir()));
+    dirs
+}
+
+fn executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// An executable file named `program` in a `PATH` directory (or the path itself).
 pub fn on_path(program: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let executable = |p: &Path| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
     if program.contains('/') {
         return executable(Path::new(program));
     }
@@ -112,11 +167,29 @@ mod tests {
     #[test]
     fn first_installed_candidate_or_the_override_wins() {
         let python = by_name("python").unwrap();
-        assert_eq!(command(python, None, |p| p == "pylsp"), Some(vec!["pylsp".to_string()]));
-        assert_eq!(command(python, None, |p| p != "basedpyright-langserver"), Some(vec!["pyright-langserver".into(), "--stdio".into()]));
-        assert_eq!(command(python, None, |_| false), None);
+        let only = |name: &'static str| move |p: &str| (p == name).then(|| format!("/opt/{p}"));
+        assert_eq!(command(python, None, only("pylsp")), Some(vec!["/opt/pylsp".to_string()]));
+        assert_eq!(command(python, None, only("pyright-langserver")), Some(vec!["/opt/pyright-langserver".into(), "--stdio".into()]));
+        assert_eq!(command(python, None, |_| None), None);
         let mine = vec!["my-ls".to_string()];
-        assert_eq!(command(python, Some(&mine), |_| false), Some(mine));
+        assert_eq!(command(python, Some(&mine), |_| None), Some(mine));
         assert!(on_path("sh") && !on_path("tileide-no-such-program"));
+        assert_eq!(locate("sh", &[]).as_deref(), Some("sh"));
+        let bin = std::env::temp_dir().join(format!("tileide-locate-{}", std::process::id()));
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("tileide-test-ls");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(locate("tileide-test-ls", std::slice::from_ref(&bin)), Some(tool.to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(&bin).unwrap();
+    }
+
+    #[test]
+    fn python_files_get_the_linter() {
+        assert_eq!(linters_for(Path::new("a.py")).iter().map(|s| s.name).collect::<Vec<_>>(), vec!["ruff"]);
+        assert!(linters_for(Path::new("a.rs")).is_empty());
+        assert_eq!(by_name("ruff").map(|s| s.name), Some("ruff"));
+        assert_eq!(for_file(Path::new("a.py")).map(|(s, _)| s.name), Some("python"), "the linter never replaces the main server");
     }
 }

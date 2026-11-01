@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.4.0-alpha.10 (2026-11-01): Tab completion, as in Jupyter
+
+### Changed
+- **Tab completes** in editors and notebook cells (Python first; the same code serves every language server): after a name or a `.` it asks for completions. One match is filled in at once (`np.random.default_r` → `default_rng`), several open the list (`np.random.` → `default_rng`, `Generator`, `bit_generator`, …), in a notebook including the running kernel's names (`df.pri` → `price`). At a line's start, after a space, or with text selected, Tab still indents.
+- The completion list shows what each item is (function, class, module, method, variable, …), like Jupyter.
+- **`Alt+Tab`** is bound to completion too (action `complete`, also still `Ctrl+Space`). Many desktops use Alt+Tab to switch windows (Omarchy's Hyprland does), and then it never reaches TileIDE; Tab covers it.
+
+## 0.4.0-alpha.9 (2026-11-01): sidebar and tile transparency + blur, DataFrame tables
+
+### Changed
+- **Settings → Themes & background:** Dim, Blur and Tiles are replaced by two groups, **Sidebar** (the rail, border and Files drawer) and **Tiles & terminals**, each with **Transparency** (0–90%) and **Blur** (0–60 px). They work in every mode and every theme. Until you move a slider each follows the theme's own look (Black Glass: 44% see-through tiles, 30 px blur). Also in `tileide.lua`: `tileide.sidebar { transparency, blur }`, `tileide.appearance { tile_transparency, tile_blur }`; set there, the slider is locked.
+- Blur is drawn by TileIDE over a background it paints itself (full-screen with Image, Gradient or Solid): the sidebar and the tiles each get their own blurred copy, so you can have sharp see-through tiles beside a frosted sidebar. Over the desktop (See-through, or windowed) the page says blur comes from the compositor (Hyprland: `decoration:blur`).
+- `background.dim` and `background.blur` still work from `tileide.lua` (they act on the whole background); `background.tile_opacity` is used only while `tile_transparency` is unset. Readability is still guarded: a background too bright behind see-through tiles is dimmed automatically, and the page says by how much.
+
+### Fixed
+- **The Tiles slider did nothing on glass themes** (Black Glass ignored it), and Dim/Blur/Tiles were greyed out in windowed mode. Transparency now applies in both modes and to every theme.
+
+### Added
+- **DataFrames show as tables** in notebook outputs (from their HTML): a header row, the index in bold, striped rows, wide frames scroll sideways, and pandas' "N rows × M columns" note underneath. Other HTML still shows as plain text.
+
+## 0.4.0-alpha.8 (2026-11-01): notebooks stay put, arrow keys between cells, Markdown rendered
+
+### Added
+- **↑ / ↓ move between cells**, as in JupyterLab: on a cell's first line ↑ goes to the cell above (cursor on its last line), on its last line ↓ goes to the cell below. Inside a cell the arrows move the cursor as usual; with the completion list open they pick from it.
+- **Markdown cells render:** headings, bold/italic, `code`, code blocks, lists, quotes, links and tables show formatted. Running a text cell (Shift+Enter, Ctrl+Enter, ▶) renders it; Enter or a double click edits it again. Notebooks open with their text cells rendered.
+
+### Fixed
+- **Running a cell no longer moves the page.** The old output stays (faded) until the new output replaces it, so the cell doesn't shrink and spring back; the last cell no longer jumps up. Output that grows above the cell you are typing in doesn't scroll either.
+- Clicking a cell or running it never scrolls; the page only moves when the cursor would leave the screen (typing past the bottom now scrolls with you).
+- Shift+Enter scrolls only as far as needed to show the next cell's first line.
+
+## 0.4.0-alpha.7 (2026-11-01): rename, references, quick fixes, kernel completion
+
+### Added
+- **Rename** (`F2`): renames a variable, function or class everywhere the language server knows of it, across files. Open files change in their editors (unsaved); files that aren't open are rewritten on disk.
+- **Find references** (`Shift+F12`): every use of the name at the cursor in a list (`app.py:12  x = area(3)`, or `cell 3:2` in a notebook); `↑`/`↓` and Enter go there.
+- **Quick fixes** (`Ctrl+.`): fixes and refactors for the cursor's line from every server on the file, e.g. Ruff's "Remove unused import", "Organize imports", "Fix all auto-fixable problems". Preferred fixes come first.
+- **Completion from the running kernel** in notebook cells: names that only exist at run time, such as a DataFrame's columns (`df.pr` → `price`), join pyright's suggestions (marked "kernel").
+- **Format a notebook cell** with `Ctrl+Shift+I` (Ruff). Cells with `%` or `!` lines are left alone, so magics are never lost.
+
+### Fixed
+- **Adding a notebook cell still jumped to the top.** Two causes: the scroll was computed in already-scrolled coordinates (it also hit Shift+Enter), and "+ Code" added below the *current* cell, which only changed when you clicked into a cell's editor, so after scrolling down the new cell landed under cell 1. Now any click in a cell makes it current, "+ Code" adds below the last visible cell when the current one is out of sight, and the new cell is scrolled into view.
+- **Shift+Enter now focuses the next (or new) cell and keeps it in view**, also when the output of the cell you ran pushes it down.
+- Edits that share a start position (formatters, quick fixes) are applied in the right order.
+
+## 0.4.0-alpha.6 (2026-11-01): Python and Jupyter as a full IDE
+
+### Added
+- **Code suggestions with Tab:** while you type, the best completion shows faded after the cursor (`prin` → `print`); `Tab` (or `Enter`) takes it, `↑`/`↓` pick another from the list.
+- **Signature help:** typing a call (`pd.DataFrame(`, `print(`) shows its parameters above the cursor, the current one in bold, with its doc line.
+- **Hover shows signatures** in the code font (`class DataFrame(data=None, index=None, …)`), then the documentation.
+- **Linting with Ruff** (`ruff server`, optional) beside pyright: its diagnostics show with pyright's. **Format the file** with `Ctrl+Shift+I` (`format` action).
+- Unused code (unused imports, variables) is faded instead of marked.
+- **Notebook cells get language support:** completion, suggestions, signature help, hover, diagnostics and go to definition, across cells (a name from an earlier cell is known). IPython lines (`%matplotlib`, `!pip`) are understood; rules that don't fit cells (a bare `df` at the end, imports in any cell) stay quiet.
+- `Alt+I`, `F12`, `Ctrl+Space` and `Ctrl+Shift+I` work in the current notebook cell.
+
+### Fixed
+- **Python completion didn't start when TileIDE was launched from the desktop:** language servers are now also looked for in the project's virtualenvs, `~/.local/bin`, npm/cargo globals and mise's install folders, and a server found that way runs with its own folder first on `PATH` (an npm-installed pyright needs the `node` next to it).
+- pyright analyses with the project's virtualenv, so installed packages (pandas, numpy, …) resolve.
+- **Adding a notebook cell jumped to the top.** The view now follows the new cell; deleting or moving a cell keeps it in view too.
+- **Closing a tile focused the first tile;** focus now goes back to the tile it was split from.
+
+### Known limits
+- Not yet: rename, find references, quick fixes, completion from the running kernel (e.g. DataFrame columns), formatting notebook cells.
+- JavaScript debugging and launch configs moved to v0.6 (language parity).
+
+## 0.4.0-alpha.5 (2026-11-01): Java and Cargo debugging, venvs, unlockable settings, alerts
+
+### Added
+- **Java debugging** (`F5` on a `.java` file) with the JDK's own `jdb`: TileIDE compiles the file with `javac -g` (other classes of its source tree are compiled as needed, packages are followed), then debugs it with breakpoints, stepping, the call stack and variables (objects and arrays expand). No Java debug adapter or language server is needed; TileIDE drives jdb itself (`tileide dap-jdb`, started by TileIDE).
+- **Cargo project debugging:** `F5` on a `.rs` file inside a Cargo project builds that binary (`cargo build -p … --bin …`; the binary is the one built from the file, else the package's) and debugs it with gdb.
+- **Settings → Alerts → Missing tools** (`tileide.alerts { missing_tools = false }`): turns off the banner popups about a missing language server, debugger, Jupyter or Python module. The message still shows where the action ran (run card, debug tile, notebook cell).
+- A Python script or notebook cell that stops on `ModuleNotFoundError` gets the install command for the Python that ran it (`<venv>/bin/python -m pip install x` in a virtualenv, `sudo pacman -S python-x` for the system Python).
+- **Unlock** on a setting your `tileide.lua` sets: TileIDE comments that line out (`-- … -- now set in Settings`), keeps its value, and the row becomes editable. A key that shares its line with other keys, or comes from a rice file, is left for you to remove.
+- Settings → Toolchains lists jdb, and finds Jupyter/debugpy for the distro's `/usr/bin/python3` too.
+
+### Fixed
+- **Virtualenvs in parent folders weren't found.** Running (`Alt+R`), debugging (`F5`) and notebooks now use the nearest virtualenv at or above the file's folder (up to the workspace folder): `.venv`, `venv`, `env`, or any folder with a `pyvenv.cfg`; an active `$VIRTUAL_ENV` comes first. Before, `Alt+R` and `F5` always used `python3` and notebooks looked only in the workspace folder itself.
+- Notebooks and Python debugging also try `/usr/bin/python3` when `python3` on PATH is another Python (mise, pyenv, asdf): that's where `pacman` installs `python-ipykernel` and `python-debugpy`.
+- A virtualenv without Jupyter no longer silently gives a kernel without its packages: an alert says so and how to add `ipykernel` to it.
+
+### Known limits
+- Java: single source trees compiled by `javac` (no Maven/Gradle classpath); breakpoints in nested or anonymous classes aren't set; the program has no stdin. JavaScript debugging is not built.
+- gdb prints "No source file named …" for a breakpoint set before the program loads; the breakpoint is still hit.
+
 ## 0.4.0-alpha.4 (2026-11-01): notebooks, debugging, toolchains
 
 ### Added

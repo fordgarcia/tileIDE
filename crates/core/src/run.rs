@@ -57,7 +57,7 @@ fn quote(s: &str) -> String {
 }
 
 /// The nearest folder at or above `from` (not above `stop`, if given) with a `Cargo.toml`.
-fn cargo_root(from: &Path, stop: Option<&Path>) -> Option<PathBuf> {
+pub fn cargo_root(from: &Path, stop: Option<&Path>) -> Option<PathBuf> {
     let mut dir = Some(from);
     while let Some(d) = dir {
         if d.join("Cargo.toml").is_file() {
@@ -109,10 +109,15 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
             _ => format!("No runner for .{ext} files. Add one in tileide.lua: tileide.runner(\".{ext}\", \"command {{file}}\")."),
         });
     };
-    if !found(program) {
+    // A Python file runs with its virtualenv's Python when there is one.
+    let venv = (*program == "python3").then(|| crate::python::venvs(&dir, folder, std::env::var_os("VIRTUAL_ENV").map(PathBuf::from).as_deref(), std::env::var_os("HOME").map(PathBuf::from).as_deref()).into_iter().next()).flatten();
+    if venv.is_none() && !found(program) {
         return Err(format!("{program} is not installed. Install it with: sudo pacman -S {}", package_for(program)));
     }
-    let steps = steps.iter().map(|step| step.iter().map(|part| fill(part, file, &out)).collect()).collect();
+    let mut steps: Vec<Vec<String>> = steps.iter().map(|step| step.iter().map(|part| fill(part, file, &out)).collect()).collect();
+    if let Some(python) = venv {
+        steps[0][0] = python.to_string_lossy().into_owned();
+    }
     Ok(Plan { label: name, steps, cwd: dir })
 }
 
@@ -201,6 +206,17 @@ mod tests {
         let p = plan(Some(&root.join("src/main.rs")), Some(&root), &BTreeMap::new(), Path::new("/o"), all).unwrap();
         assert_eq!((p.steps[0].join(" "), p.cwd.clone()), ("cargo run".to_string(), root.clone()));
         assert_eq!(plan(None, Some(&root), &BTreeMap::new(), Path::new("/o"), all).unwrap().label, "cargo run");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn python_files_use_the_nearest_virtualenv() {
+        let root = std::env::temp_dir().join(format!("tileide-run-venv-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        let p = plan(Some(&root.join("sub/deeper/a.py")), Some(&root), &BTreeMap::new(), Path::new("/o"), |_| false).unwrap();
+        assert_eq!(p.steps[0][0], root.join(".venv/bin/python").to_string_lossy());
         let _ = std::fs::remove_dir_all(root);
     }
 

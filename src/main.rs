@@ -11,6 +11,7 @@
 //!   to focus it.
 
 mod background;
+mod alerts;
 mod audio;
 mod bench;
 mod cli;
@@ -27,6 +28,7 @@ mod lsp;
 mod motion;
 mod notebook_view;
 mod overview;
+mod pick_card;
 mod quick_open;
 mod run_card;
 mod settings;
@@ -162,6 +164,10 @@ fn main() -> glib::ExitCode {
         }
         Ok(cli::Command::Render(rest)) => return report(bench::render(&rest)),
         Ok(cli::Command::CheckConfig(file)) => return check_config(file),
+        Ok(cli::Command::DapJdb) => {
+            tileide_dap::jdb::serve(std::io::stdin(), std::io::stdout());
+            return glib::ExitCode::SUCCESS;
+        }
         Err(message) => return report(Err(message)),
     };
     // Like `code .`: hand the shell back at once. Benchmarks stay attached to report.
@@ -367,7 +373,9 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             }
         });
         let quick_open = QuickOpen::new(&overlay, on_file, on_close.clone());
-        let (m5, m6, m7, m8) = (me.clone(), me.clone(), me.clone(), me.clone());
+        let (m5, m6, m7, m8, m_surface) = (me.clone(), me.clone(), me.clone(), me.clone(), me.clone());
+        // Dragging a slider re-bakes the backdrops: apply once it rests a moment.
+        let surface_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
         let themes_panel = themes_panel::ThemesPanel::new(themes_panel::Callbacks {
             preview: Rc::new(move |key| {
                 if let Some(app) = m5.upgrade() {
@@ -389,6 +397,18 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     app.import_theme();
                 }
             }),
+            surface: Rc::new(move |key, value| {
+                if let Some(t) = surface_timer.borrow_mut().take() {
+                    t.remove();
+                }
+                let (me, timer) = (m_surface.clone(), surface_timer.clone());
+                *surface_timer.borrow_mut() = Some(glib::timeout_add_local_once(Duration::from_millis(60), move || {
+                    timer.borrow_mut().take();
+                    if let Some(app) = me.upgrade() {
+                        app.change_setting(key, tileide_config::settings::Value::Number(value));
+                    }
+                }));
+            }),
         });
         let (m9, m10) = (me.clone(), me.clone());
         let extensions_panel = extensions_panel::ExtensionsPanel::new(
@@ -407,7 +427,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 }),
             },
         );
-        let (m11, m12, m13, m14) = (me.clone(), me.clone(), me.clone(), me.clone());
+        let (m11, m12, m13, m14, m16) = (me.clone(), me.clone(), me.clone(), me.clone(), me.clone());
         let settings_card = settings_ui::SettingsCard::new(
             &overlay,
             themes_panel.widget(),
@@ -423,6 +443,11 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                         && app.workspaces.borrow().active() != Active::Config
                     {
                         app.workspaces.borrow_mut().toggle_config();
+                    }
+                }),
+                unlock: Rc::new(move |key| {
+                    if let Some(app) = m16.upgrade() {
+                        app.unlock_setting(key);
                     }
                 }),
                 show_keybinds: Rc::new(move || {
@@ -545,6 +570,14 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     let start_expanded = config.sidebar.start_expanded && config.sidebar.show_files;
     problems.extend(init_extensions(&app_state));
     init_debug(&app_state);
+    let alerts = Rc::downgrade(&app_state);
+    alerts::set_hook(Rc::new(move |message| {
+        if let Some(app) = alerts.upgrade()
+            && app.config.borrow().alerts.missing_tools
+        {
+            app.notice(message);
+        }
+    }));
     app_state.apply_config(config, problems);
     extensions::event(tileide_extensions::Event::Startup);
     if start_expanded {
@@ -597,14 +630,50 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             (Some(app), _) if name == "open" => {
                 app.open_picked(quick_open::Target::NewTile, arg.as_ref().map(PathBuf::from));
             }
-            // `cursor:<line>`: the focused editor's cursor to a 1-based line.
-            (Some(app), _) if name == "cursor" => {
-                let editor = app.workspaces.borrow().current().borrow().focused_editor();
-                if let (Some(editor), Some(line)) = (editor, arg.as_deref().and_then(|l| l.parse::<i32>().ok())) {
+            // `type:<text>`: typed into the focused editor or cell, one character at a time.
+            (Some(app), _) if name == "type" => {
+                if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
+                    for c in arg.as_deref().unwrap_or("").replace("\\n", "\n").chars() {
+                        editor.buffer().insert_at_cursor(&c.to_string());
+                    }
+                }
+            }
+            // `tab`: the Tab key in the focused editor or cell (completes after a name or `.`).
+            (Some(app), _) if name == "tab" => {
+                if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
+                    let completed = lsp::tab_key(&editor);
+                    println!("test action: tab {}", if completed { "completes" } else { "indents" });
+                }
+            }
+            // `rename:<name>`: F2 at the cursor, answered with <name>.
+            (Some(app), _) if name == "rename" => {
+                if let (Some(editor), Some(new)) = (app.workspaces.borrow().current().borrow().focused_code(), arg.as_deref()) {
                     let buffer = editor.buffer();
-                    if let Some(it) = buffer.iter_at_line(line - 1) {
+                    lsp::rename_to(&editor, &buffer.iter_at_mark(&buffer.get_insert()), new);
+                }
+            }
+            // `cell:add` / `cell:delete`: the notebook's "+ Code" / the current cell's delete.
+            (Some(app), _) if name == "cell" => {
+                if let Some(nb) = app.workspaces.borrow().current().borrow().focused_notebook() {
+                    nb.test_action(arg.as_deref().unwrap_or(""));
+                }
+            }
+            // `cursor:<line>[:<column>]`: the focused editor's cursor, both 1-based.
+            (Some(app), _) if name == "cursor" => {
+                let editor = app.workspaces.borrow().current().borrow().focused_code();
+                let mut parts = arg.as_deref().unwrap_or("").split(':').map(|n| n.parse::<i32>().ok());
+                if let (Some(editor), Some(Some(line))) = (editor, parts.next()) {
+                    let column = parts.next().flatten().unwrap_or(1);
+                    let buffer = editor.buffer();
+                    if let Some(it) = buffer.iter_at_line_offset(line - 1, column - 1).or_else(|| buffer.iter_at_line(line - 1)) {
                         buffer.place_cursor(&it);
                     }
+                }
+            }
+            // `unlock:<key>`: Settings' Unlock button for that key.
+            (Some(app), _) if name == "unlock" => {
+                if let Some(key) = tileide_config::settings::KEYS.iter().map(|(k, _)| *k).find(|k| Some(*k) == arg.as_deref()) {
+                    app.unlock_setting(key);
                 }
             }
             // `screenshot:<file.png>`: the window as rendered (headless checks).
@@ -670,6 +739,8 @@ impl App {
             placeholder_tiles: false,
             background: None,
             frosted: None,
+            frosted_frame: None,
+            frame_opacity: self.surfaces().sidebar.opacity,
             tile_rects: &[],
             tile_opacity: self.tile_opacity(),
         }
@@ -796,6 +867,19 @@ impl App {
     }
 
     /// `on_switch` from outside a `Workspaces` borrow (e.g. after a tray pick).
+    /// Refreshes the Themes & background page after the current borrows end.
+    fn refresh_themes_panel_soon(&self) {
+        if !self.themes_shown() {
+            return;
+        }
+        let me = self.me.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(app) = me.upgrade() {
+                app.refresh_themes_panel();
+            }
+        });
+    }
+
     fn refresh(&self) {
         let info = self.workspaces.borrow().switch_info();
         if let Some(theme) = self.on_switch(&info) {
@@ -861,21 +945,46 @@ impl App {
             return;
         }
         let settings = self.background_choice(image, number);
-        let settings = settings.unwrap_or_else(|e| {
+        let mut settings = settings.unwrap_or_else(|e| {
             self.problems.borrow_mut().push(e);
             background::Settings::default()
         });
+        // Sidebar and tiles: their opacity drives legibility, their blur the backdrops.
+        let surfaces = self.surfaces_with(settings.source != background::Source::SeeThrough, settings.tile_opacity);
+        settings.tile_opacity = surfaces.tiles.opacity;
+        settings.tile_blur = surfaces.tiles.blur;
+        settings.frame_blur = surfaces.sidebar.blur;
         let key = Some((settings.clone(), self.theme_name.borrow().clone()));
         if *self.background_key.borrow() == key {
             return;
         }
         *self.background_key.borrow_mut() = key;
+        draw::set_tile_backdrop(settings.source != background::Source::SeeThrough && settings.tile_blur >= 1.0);
         *self.background.borrow_mut() = background::Background::new(settings, (**self.theme.borrow()).clone());
         load_background(self);
     }
 
     fn tile_opacity(&self) -> f64 {
-        self.background_key.borrow().as_ref().map_or(token::TILE_OPACITY, |(s, _)| s.tile_opacity)
+        self.surfaces().tiles.opacity
+    }
+
+    /// Settings → Themes & background → Sidebar / Tiles & terminals, in effect now.
+    fn surfaces(&self) -> tileide_core::theme::Surfaces {
+        let legacy = self.background_key.borrow().as_ref().map_or(self.config.borrow().background.tile_opacity, |(s, _)| s.tile_opacity);
+        let see_behind = self.background.borrow().is_some();
+        self.surfaces_with(see_behind, legacy)
+    }
+
+    /// `see_behind`: TileIDE paints the background; `legacy`: `background.tile_opacity`.
+    fn surfaces_with(&self, see_behind: bool, legacy: f64) -> tileide_core::theme::Surfaces {
+        let config = self.config.borrow();
+        let choice = tileide_core::theme::SurfaceChoice {
+            sidebar_transparency: config.sidebar.transparency,
+            sidebar_blur: config.sidebar.blur,
+            tile_transparency: config.appearance.tile_transparency,
+            tile_blur: config.appearance.tile_blur,
+        };
+        self.theme.borrow().surfaces(choice, legacy, see_behind)
     }
 
     fn reload_css(&self) {
@@ -891,7 +1000,7 @@ impl App {
             bg = theme::css(t.surface, 0.96),
             text = theme::css(t.text, 1.0),
             edge = theme::css(t.error, 0.8),
-            tiles = tile_view::css(t, self.geometry(), self.tile_opacity(), self.background.borrow().is_some()),
+            tiles = tile_view::css(t, self.geometry(), self.tile_opacity()),
             files = file_tree::css(t),
             overview = overview::css(t),
             quick_open = quick_open::css(t),
@@ -994,6 +1103,28 @@ impl App {
         self.refresh_config();
     }
 
+    /// Settings' "Unlock": comments the key's line out in `tileide.lua`, keeping its
+    /// value as a GUI setting (so nothing jumps), then reloads.
+    fn unlock_setting(&self, key: &'static str) {
+        let file = self.paths.file.clone();
+        let source = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) => return self.notice(format!("cannot read {}: {e}", file.display())),
+        };
+        let Some(released) = tileide_config::settings::release(&source, key) else {
+            return self.notice(format!("Settings can't unlock {key} by itself (it shares a line with other keys, or a rice sets it). Remove it from {} to change it here.", file.display()));
+        };
+        let value = tileide_config::settings::get(&self.config.borrow(), key);
+        if let Some(value) = value {
+            self.state.borrow_mut().settings.insert(key.to_string(), value);
+        }
+        self.save_state();
+        if let Err(e) = std::fs::write(&file, released) {
+            return self.notice(format!("cannot write {}: {e}", file.display()));
+        }
+        self.reload();
+    }
+
     fn schedule_save(&self) {
         if let Some(t) = self.save_timer.borrow_mut().take() {
             t.remove();
@@ -1039,7 +1170,7 @@ impl App {
     /// `Alt+=` / `Alt+-`: the code font of every tile, one point at a time.
     fn step_font_size(&self, by: i8) {
         if self.config.borrow().explicit.contains("appearance.code_size") {
-            self.notice("tileide.lua sets appearance.code_size; change it there.".into());
+            self.notice("tileide.lua sets appearance.code_size: change it there, or Unlock it in Settings (Alt+,).".into());
             return;
         }
         let (min, max) = tileide_config::settings::CODE_SIZE;
@@ -1108,6 +1239,9 @@ impl App {
             background,
             fullscreen: self.options.mode == Mode::Fullscreen,
             note: (!notes.is_empty()).then(|| notes.join(" ")),
+            surfaces: self.surfaces(),
+            can_blur: self.background.borrow().is_some(),
+            locked: themes_panel::SURFACE_KEYS.into_iter().filter(|k| self.config.borrow().explicit.contains(*k)).collect(),
         });
     }
 
@@ -1159,7 +1293,11 @@ impl App {
         }
         self.save_state();
         self.refresh();
+        // Blur sliders follow whether TileIDE now draws the background.
+        self.refresh_themes_panel_soon();
         self.reload_css();
+        // The sliders show the new theme's look where the user chose nothing.
+        self.refresh_themes_panel_soon();
     }
 
     /// "Import VS Code theme…": a theme `.json` or an extension `.vsix` becomes a theme
@@ -1393,18 +1531,38 @@ impl App {
                 }
             }
             Action::Hover => {
-                if let Some(editor) = view.borrow().focused_editor() {
+                if let Some(editor) = view.borrow().focused_code() {
                     lsp::hover_at_cursor(&editor);
                 }
             }
             Action::Definition => {
-                if let Some(editor) = view.borrow().focused_editor() {
+                if let Some(editor) = view.borrow().focused_code() {
                     lsp::definition_at_cursor(&editor);
                 }
             }
             Action::Complete => {
-                if let Some(editor) = view.borrow().focused_editor() {
-                    lsp::complete(&editor, true);
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::complete(&editor, lsp::Ask::Manual);
+                }
+            }
+            Action::Format => {
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::format(&editor);
+                }
+            }
+            Action::Rename => {
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::rename_at_cursor(&editor);
+                }
+            }
+            Action::References => {
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::references_at_cursor(&editor);
+                }
+            }
+            Action::CodeAction => {
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::code_actions_at_cursor(&editor);
                 }
             }
             Action::ExtensionsSection => self.toggle_extensions_section(),
@@ -1424,7 +1582,11 @@ impl App {
                 if !debug::is_paused() && file.is_some() && view.borrow().focused_dirty() {
                     view.borrow_mut().save_focused(self.window.upcast_ref());
                 }
-                debug::start_or_continue(file);
+                let folder = {
+                    let w = self.workspaces.borrow();
+                    w.folder(w.active())
+                };
+                debug::start_or_continue(file, folder);
             }
             Action::DebugStop => debug::stop(),
             Action::Breakpoint => {
@@ -1528,13 +1690,51 @@ fn interface_css(css: &str, font: &str, scale: f64) -> String {
 }
 
 /// Development: renders `window` to a PNG (`--test-actions screenshot:<file>@<s>`).
+/// Also saves each open popover (they are surfaces of their own) as `<path>-popoverN.png`
+/// and prints its text, so headless checks can read completion, hover and signature cards.
 fn screenshot(window: &gtk::Window, path: &str) -> Result<(), String> {
-    let paintable = gtk::WidgetPaintable::new(Some(window));
-    let snapshot = gtk::Snapshot::new();
-    paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
-    let node = snapshot.to_node().ok_or("nothing drawn")?;
-    let renderer = window.renderer().ok_or("no renderer")?;
-    renderer.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())
+    let render = |widget: &gtk::Widget, path: &str| -> Result<(), String> {
+        let paintable = gtk::WidgetPaintable::new(Some(widget));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, widget.width() as f64, widget.height() as f64);
+        let node = snapshot.to_node().ok_or("nothing drawn")?;
+        let renderer = window.renderer().ok_or("no renderer")?;
+        renderer.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())
+    };
+    // The window can come out empty for a frame (seen right after a popover opens);
+    // the popovers are still worth saving.
+    let window_result = render(window.upcast_ref(), path);
+    fn popovers(widget: &gtk::Widget, out: &mut Vec<gtk::Popover>) {
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            match c.downcast_ref::<gtk::Popover>() {
+                Some(p) if p.is_visible() => out.push(p.clone()),
+                _ => popovers(&c, out),
+            }
+            child = c.next_sibling();
+        }
+    }
+    let mut open = Vec::new();
+    popovers(window.upcast_ref(), &mut open);
+    for (i, p) in open.iter().enumerate() {
+        fn texts(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(l) = widget.downcast_ref::<gtk::Label>() {
+                out.push(l.text().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                texts(&c, out);
+                child = c.next_sibling();
+            }
+        }
+        let mut words = Vec::new();
+        texts(p.upcast_ref(), &mut words);
+        println!("popover {i} ({}): {}", p.css_classes().join(" "), words.join(" | ").replace('\n', "⏎"));
+        if let Err(e) = render(p.upcast_ref(), &format!("{}-popover{i}.png", path.trim_end_matches(".png"))) {
+            eprintln!("test action: popover {i}: {e}");
+        }
+    }
+    window_result
 }
 
 /// The visualizer strip under the file tree (drawer open).
@@ -1695,6 +1895,7 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
         let scale = area.native().and_then(|n| n.surface()).map_or(area.scale_factor() as f64, |s| s.scale());
         let background = s.background.borrow_mut().as_mut().and_then(|b| b.surface(width, height, scale).cloned());
         let frosted = s.background.borrow().as_ref().and_then(|b| b.frosted().cloned());
+        let frosted_frame = s.background.borrow().as_ref().and_then(|b| b.frosted_frame().cloned());
         let tile_rects = if frosted.is_some() { s.workspaces.borrow().current().borrow().tile_rects() } else { Vec::new() };
         let numbers = s.rail_dots();
         let now = area.frame_clock().map_or(0, |c| c.frame_time());
@@ -1710,6 +1911,7 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
         let mut scene = s.scene(&numbers, &clock);
         scene.background = background.as_ref();
         scene.frosted = frosted.as_ref();
+        scene.frosted_frame = frosted_frame.as_ref();
         scene.tile_rects = &tile_rects;
         let wave = s.visualizer.shown().filter(|_| s.config.borrow().sidebar.show_visualizer);
         scene.visualizer = wave.as_ref().map(|(bars, k)| (bars.as_slice(), *k));
@@ -1915,7 +2117,7 @@ fn connect_keys(state: &Rc<App>) {
             return glib::Propagation::Proceed;
         }
         // Editor actions leave their keys to a focused terminal (Ctrl+Space, F12).
-        if matches!(action, Action::Hover | Action::Definition | Action::Complete) && s.workspaces.borrow().current().borrow().focused_editor().is_none() {
+        if matches!(action, Action::Hover | Action::Definition | Action::Complete | Action::Format | Action::Rename | Action::References | Action::CodeAction) && s.workspaces.borrow().current().borrow().focused_code().is_none() {
             return glib::Propagation::Proceed;
         }
         s.run(&action);

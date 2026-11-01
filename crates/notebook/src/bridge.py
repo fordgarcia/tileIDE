@@ -3,9 +3,11 @@
 JSON lines with TileIDE on stdin/stdout, so TileIDE needs no ZeroMQ.
 
 argv: kernel name, working directory.
-in:  {"op": "execute", "id": N, "code": "..."} | {"op": "interrupt"} | {"op": "restart"} | {"op": "shutdown"}
+in:  {"op": "execute", "id": N, "code": "..."} | {"op": "complete", "id": N, "code": "...", "cursor": C}
+     {"op": "interrupt"} | {"op": "restart"} | {"op": "shutdown"}
 out: {"ev": "ready", "language": ...} | {"ev": "status", "state": ...} | {"ev": "count", "id", "count"}
      {"ev": "output", "id", "output": <nbformat output>} | {"ev": "clear", "id"} | {"ev": "done", "id"}
+     {"ev": "complete", "id", "matches": [...], "start", "end"} (cursor offsets in characters)
      {"ev": "restarted"} | {"ev": "fatal", "message": ...}
 """
 import json
@@ -62,6 +64,8 @@ def read_commands():
 
 threading.Thread(target=read_commands, daemon=True).start()
 pending = {}
+# Completion requests in flight: shell msg_id -> TileIDE's request id.
+completing = {}
 
 
 def output(kind, content):
@@ -82,6 +86,8 @@ while True:
             op = command.get("op")
             if op == "execute":
                 pending[kc.execute(command["code"], store_history=True)] = command["id"]
+            elif op == "complete":
+                completing[kc.complete(command["code"], command["cursor"])] = command["id"]
             elif op == "interrupt":
                 km.interrupt_kernel()
             elif op == "restart":
@@ -94,10 +100,14 @@ while True:
                 sys.exit(0)
     except queue.Empty:
         pass
-    # Replies on the shell channel aren't needed (iopub carries everything); drop them.
+    # Shell replies: completions are answered; the rest is on iopub already.
     try:
         while True:
-            kc.get_shell_msg(timeout=0)
+            reply = kc.get_shell_msg(timeout=0)
+            request = completing.pop(reply["parent_header"].get("msg_id"), None)
+            if request is not None:
+                c = reply["content"]
+                out(ev="complete", id=request, matches=c.get("matches", []), start=c.get("cursor_start", 0), end=c.get("cursor_end", 0))
     except queue.Empty:
         pass
     try:

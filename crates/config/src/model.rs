@@ -18,6 +18,7 @@ pub struct Config {
     /// `tileide.background` was called: the config then wins over the picker's saved choice.
     pub background_set: bool,
     pub tiling: Tiling,
+    pub alerts: Alerts,
     /// The user's binds, in order; they replace defaults with the same keys.
     pub binds: Vec<Bind>,
     pub workspaces: BTreeMap<u8, Workspace>,
@@ -28,6 +29,14 @@ pub struct Config {
     pub explicit: BTreeSet<String>,
     /// `tileide.runner(".ext", "command {file}")`: Alt+R commands by extension.
     pub runners: BTreeMap<String, String>,
+}
+
+/// Which messages pop up on the banner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alerts {
+    /// A tool, language server, debugger, Jupyter or Python module is missing. Off, the
+    /// message still shows where the action ran (run card, debug tile, notebook cell).
+    pub missing_tools: bool,
 }
 
 /// Overrides for one built-in language server.
@@ -62,6 +71,10 @@ pub struct Appearance {
     pub code_font: String,
     /// Points.
     pub code_size: f64,
+    /// Editors' and terminals' see-through (percent) and backdrop blur (px); `None` =
+    /// the theme's look.
+    pub tile_transparency: Option<f64>,
+    pub tile_blur: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +95,10 @@ pub struct Sidebar {
     pub icon_scale: f64,
     /// The discs and squares behind the rail's icons.
     pub icon_backgrounds: bool,
+    /// The frame's (rail, border, drawer) see-through (percent) and backdrop blur (px);
+    /// `None` = as designed.
+    pub transparency: Option<f64>,
+    pub blur: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +178,14 @@ pub enum Action {
     Definition,
     /// Language server: completion at the cursor.
     Complete,
+    /// Language server: format the file (Ruff for Python).
+    Format,
+    /// Language server: rename the symbol at the cursor everywhere.
+    Rename,
+    /// Language server: list every use of the symbol at the cursor.
+    References,
+    /// Language server: quick fixes for the cursor's line.
+    CodeAction,
     /// The drawer's Extensions section (installed extensions, weight meter).
     ExtensionsSection,
     /// Runs an extension command by id (e.g. "word-count.count").
@@ -208,6 +233,8 @@ impl Default for Config {
                 ui_scale: 1.0,
                 code_font: "monospace".into(),
                 code_size: 11.0,
+                tile_transparency: None,
+                tile_blur: None,
             },
             sidebar: Sidebar {
                 start_expanded: false,
@@ -222,10 +249,13 @@ impl Default for Config {
                 scale: 1.0,
                 icon_scale: 1.0,
                 icon_backgrounds: true,
+                transparency: None,
+                blur: None,
             },
             background: Background { mode: "see-through".into(), source: None, dim: 0, blur: 0, tile_opacity: 0.92, fit: "cover".into() },
             background_set: false,
             tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5 },
+            alerts: Alerts { missing_tools: true },
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),
@@ -301,6 +331,12 @@ pub fn default_binds(m: &str) -> Vec<Bind> {
         bind(&[m], "I", Action::Hover),
         bind(&[], "F12", Action::Definition),
         bind(&["CTRL"], "space", Action::Complete),
+        // Many desktops take Alt+Tab for window switching; Tab in the editor does the same.
+        bind(&[m], "Tab", Action::Complete),
+        bind(&["CTRL", "SHIFT"], "I", Action::Format),
+        bind(&[], "F2", Action::Rename),
+        bind(&["SHIFT"], "F12", Action::References),
+        bind(&["CTRL"], "period", Action::CodeAction),
         bind(&[m], "Escape", Action::Quit),
         bind(&["CTRL"], "S", Action::Save),
     ]);

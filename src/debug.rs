@@ -200,8 +200,16 @@ fn panel() -> Rc<Panel> {
     p
 }
 
-/// `F5`: continues a paused program, else builds and debugs `file`.
-pub fn start_or_continue(file: Option<PathBuf>) {
+/// Why a debug session didn't start.
+enum Failure {
+    /// No debugger or toolchain for the file (also an alert).
+    Missing(String),
+    Build(String),
+}
+
+/// `F5`: continues a paused program, else builds and debugs `file` (in the workspace
+/// `folder`, where its Cargo project and virtualenv are looked for).
+pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>) {
     if is_paused() {
         step("continue");
         return;
@@ -216,7 +224,7 @@ pub fn start_or_continue(file: Option<PathBuf>) {
     shown.clear();
     let Some(file) = file else {
         shown.set_state("Nothing to debug", Some("failed"));
-        shown.append("Focus a C, C++, Rust or Python file and press F5.\n");
+        shown.append("Focus a C, C++, Rust, Python or Java file and press F5.\n");
         return;
     };
     let name = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -224,18 +232,25 @@ pub fn start_or_continue(file: Option<PathBuf>) {
     shown.set_state("Building…", None);
     // Planning (it asks Python about debugpy) and building run off the main thread.
     let out_dir = glib::user_runtime_dir().join("tileide-run");
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(Plan, String), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Plan, String), Failure>>();
     std::thread::spawn(move || {
         let _ = std::fs::create_dir_all(&out_dir);
-        let python_has = |module: &str| std::process::Command::new("python3").args(["-c", &format!("import {module}")]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
-        let result = tileide_dap::plan(&file, &out_dir, tileide_core::run::on_path, python_has).and_then(|plan| {
+        let dir = file.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+        let host = tileide_dap::Host {
+            found: &tileide_core::run::on_path,
+            pythons: tileide_core::python::candidates(&dir, folder.as_deref()),
+            python_has: &tileide_core::python::imports,
+            bridge: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tileide")),
+            folder,
+        };
+        let result = tileide_dap::plan(&file, &out_dir, &host).map_err(Failure::Missing).and_then(|plan| {
             let mut log = String::new();
             for step in &plan.build {
                 log += &format!("$ {}\n", step.join(" "));
-                let out = std::process::Command::new(&step[0]).args(&step[1..]).current_dir(&plan.cwd).output().map_err(|e| format!("cannot run {}: {e}", step[0]))?;
+                let out = std::process::Command::new(&step[0]).args(&step[1..]).current_dir(&plan.cwd).output().map_err(|e| Failure::Build(format!("cannot run {}: {e}", step[0])))?;
                 log += &tileide_core::run::strip_ansi(&String::from_utf8_lossy(&out.stderr));
                 if !out.status.success() {
-                    return Err(log + "\nThe build failed; fix the errors above and press F5 again.\n");
+                    return Err(Failure::Build(log + "\nThe build failed; fix the errors above and press F5 again.\n"));
                 }
             }
             Ok((plan, log))
@@ -245,10 +260,16 @@ pub fn start_or_continue(file: Option<PathBuf>) {
     glib::timeout_add_local(std::time::Duration::from_millis(40), move || match rx.try_recv() {
         Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
         Err(_) => glib::ControlFlow::Break,
-        Ok(Err(message)) => {
+        Ok(Err(failure)) => {
             let p = panel();
             p.set_state("Can't debug", Some("failed"));
-            p.append(&message);
+            match failure {
+                Failure::Missing(message) => {
+                    p.append(&format!("{message}\n"));
+                    crate::alerts::missing(message);
+                }
+                Failure::Build(log) => p.append(&log),
+            }
             glib::ControlFlow::Break
         }
         Ok(Ok((plan, log))) => {

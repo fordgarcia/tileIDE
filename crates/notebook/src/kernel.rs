@@ -20,6 +20,8 @@ pub enum Event {
     Output { cell: u64, output: Value },
     Clear { cell: u64 },
     Done { cell: u64 },
+    /// Completion matches for request `id`, replacing chars `start..end` of its code.
+    Completions { id: u64, matches: Vec<String>, start: usize, end: usize },
     Restarted,
     /// The bridge or kernel failed; the kernel is gone.
     Fatal(String),
@@ -38,24 +40,29 @@ fn parse(line: &str) -> Option<Event> {
         "clear" => Event::Clear { cell: cell()? },
         "done" => Event::Done { cell: cell()? },
         "restarted" => Event::Restarted,
+        "complete" => Event::Completions {
+            id: v["id"].as_u64()?,
+            matches: v["matches"].as_array()?.iter().filter_map(|m| m.as_str().map(String::from)).collect(),
+            start: v["start"].as_u64()? as usize,
+            end: v["end"].as_u64()? as usize,
+        },
         "fatal" => Event::Fatal(v["message"].as_str().unwrap_or("kernel failed").to_string()),
         _ => return None,
     })
 }
 
-/// Pythons to try, best first: the workspace's virtualenv, then `python3` on PATH.
-pub fn pythons(folder: Option<&Path>) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = folder.into_iter().flat_map(|f| [".venv", "venv", "env"].map(|v| f.join(v).join("bin/python"))).filter(|p| p.is_file()).collect();
-    out.push(PathBuf::from("python3"));
-    out
+/// Pythons to try for a notebook in `dir`, best first (`tileide_core::python::candidates`:
+/// the nearest virtualenv up to the workspace `folder`, then `python3`, then the distro's).
+pub fn pythons(dir: &Path, folder: Option<&Path>) -> Vec<PathBuf> {
+    tileide_core::python::candidates(dir, folder)
 }
 
 /// Whether `python` can run the bridge (`jupyter_client` and `ipykernel` importable).
 pub fn has_jupyter(python: &Path) -> bool {
-    Command::new(python).args(["-c", "import jupyter_client, ipykernel"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    tileide_core::python::imports(python, "jupyter_client, ipykernel")
 }
 
-pub const INSTALL_HINT: &str = "Jupyter isn't installed for this Python. Install it with: sudo pacman -S python-ipykernel python-jupyter-client (or in the workspace's .venv: pip install ipykernel)";
+pub const INSTALL_HINT: &str = "No Python here has Jupyter (checked the virtualenvs at and above this notebook's folder, python3, and /usr/bin/python3). Install it with: sudo pacman -Syu python-ipykernel python-jupyter-client (or in a .venv: pip install ipykernel)";
 
 pub struct Kernel {
     child: Child,
@@ -100,6 +107,11 @@ impl Kernel {
 
     pub fn execute(&mut self, cell: u64, code: &str) -> Result<(), String> {
         self.send(json!({ "op": "execute", "id": cell, "code": code }))
+    }
+
+    /// Asks the kernel what can go at `cursor` (in characters) of `code`.
+    pub fn complete(&mut self, id: u64, code: &str, cursor: usize) -> Result<(), String> {
+        self.send(json!({ "op": "complete", "id": id, "code": code, "cursor": cursor }))
     }
 
     pub fn interrupt(&mut self) -> Result<(), String> {
@@ -173,6 +185,9 @@ mod tests {
         assert!(events.contains(&Event::Count { cell: 1, count: 1 }));
         assert!(events.iter().any(|e| matches!(e, Event::Output { output, .. } if output["text"] == "hello\n")));
         assert!(events.iter().any(|e| matches!(e, Event::Output { output, .. } if output["data"]["text/plain"] == "42")));
+        k.complete(7, "import os\nos.pa", 15).unwrap();
+        let events = wait(&|e| matches!(e, Event::Completions { .. }));
+        assert!(matches!(events.last(), Some(Event::Completions { id: 7, matches, start: 13, end: 15 }) if matches.iter().any(|m| m == "path")), "{:?}", events.last());
         k.execute(2, "1/0").unwrap();
         let events = wait(&|e| *e == Event::Done { cell: 2 });
         assert!(events.iter().any(|e| matches!(e, Event::Output { output, .. } if output["ename"] == "ZeroDivisionError")));

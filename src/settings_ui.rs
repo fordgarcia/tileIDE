@@ -42,6 +42,8 @@ pub fn css(t: &Theme) -> String {
 .settings .item .title {{ font-size: 14px; }}
 .settings .item .subtitle {{ font-size: 12px; color: {muted}; }}
 .settings .item .lock {{ font-size: 11px; color: {accent}; }}
+.settings button.unlock {{ min-height: 0; padding: 0 8px; border-radius: 9px; border: 1px solid {edge}; background: transparent; box-shadow: none; color: {accent}; font-size: 11px; }}
+.settings button.unlock:hover {{ background-color: {hover}; }}
 .settings .value {{ color: {muted}; font-size: 12px; font-feature-settings: \"tnum\"; }}
 .settings .empty {{ color: {muted}; padding: 24px 6px; }}
 .settings .footer {{ color: {muted}; font-size: 12px; padding: 6px 8px 0 8px; }}
@@ -67,6 +69,8 @@ pub struct Callbacks {
     /// A setting changed (already checked against its kind).
     pub change: Rc<dyn Fn(&'static str, Value)>,
     pub open_config: Rc<dyn Fn()>,
+    /// "Unlock" on a row `tileide.lua` sets: comment that line out there.
+    pub unlock: Rc<dyn Fn(&'static str)>,
     pub show_keybinds: Rc<dyn Fn()>,
     /// A page became visible (the Themes page refreshes itself from the app).
     pub page_shown: Rc<dyn Fn(Page)>,
@@ -87,7 +91,8 @@ struct Item {
     /// Lowercase title, subtitle, section and keywords.
     text: String,
     control: Option<Control>,
-    lock: gtk::Label,
+    /// "Set in tileide.lua" and its Unlock button.
+    lock: gtk::Box,
 }
 
 /// One setting row: (key, title, subtitle, extra search words).
@@ -136,6 +141,15 @@ const SECTIONS: &[(&str, &[Spec])] = &[
             ("sidebar.show_config", "Config folder", "Under the workspace dots", "config gear folder show hide"),
             ("sidebar.show_clock", "Clock", "", "time show hide"),
         ],
+    ),
+    (
+        "Alerts",
+        &[(
+            "alerts.missing_tools",
+            "Missing tools",
+            "A popup when a language server, debugger, Jupyter or a Python module is missing. Off, the message still shows in the run card, debug tile or notebook cell",
+            "alert notification popup banner missing dependency dependencies install module library package warning",
+        )],
     ),
     (
         "Keyboard",
@@ -350,6 +364,14 @@ impl SettingsCard {
                     });
                 }
                 None => {}
+            }
+            if let Some(button) = item.lock.last_child().and_downcast::<gtk::Button>() {
+                let weak = Rc::downgrade(self);
+                button.connect_clicked(move |_| {
+                    if let Some(v) = weak.upgrade() {
+                        (v.callbacks.unlock)(key);
+                    }
+                });
             }
         }
         for item in self.items.iter().filter(|i| i.key.is_none()) {
@@ -619,7 +641,12 @@ fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) ->
         s.set_wrap(true);
         text.append(&s);
     }
-    let lock = label("Set in tileide.lua", "lock");
+    let lock = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    lock.append(&label("Set in tileide.lua", "lock"));
+    let unlock = gtk::Button::with_label("Unlock");
+    unlock.add_css_class("unlock");
+    unlock.set_tooltip_text(Some("Comment this line out in tileide.lua so Settings can change it"));
+    lock.append(&unlock);
     lock.set_visible(false);
     text.append(&lock);
     widget.append(&text);

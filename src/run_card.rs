@@ -9,6 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -294,6 +295,19 @@ impl RunCard {
         }
         if self.output.buffer().char_count() == 0 {
             self.append("(no output)", Some(&self.note_tag));
+        }
+        // A Python script that stopped on a missing module: say how to install it.
+        let python = self.last.borrow().as_ref().and_then(|p| p.steps.last()).and_then(|s| s.first()).filter(|p| p.contains("python")).map(PathBuf::from);
+        if code != Some(0)
+            && let Some(python) = python
+        {
+            let buffer = self.output.buffer();
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            if let Some(module) = tileide_core::python::missing_module(&text) {
+                let hint = tileide_core::python::install_hint(&module, &python);
+                self.append(&format!("\n{hint}\n"), Some(&self.note_tag));
+                crate::alerts::missing(hint);
+            }
         }
     }
 

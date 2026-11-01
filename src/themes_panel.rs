@@ -13,7 +13,7 @@ use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use tileide_config::model::Background;
-use tileide_core::theme::{self, Rgb, Theme};
+use tileide_core::theme::{self, Rgb, Surfaces, Theme};
 
 /// Hovering a row this long previews it, so sweeping the pointer across doesn't flash.
 const PREVIEW_DWELL: Duration = Duration::from_millis(250);
@@ -30,8 +30,6 @@ pub enum Scope {
 
 type OnPreview = Rc<dyn Fn(Option<&str>)>;
 type OnApply = Rc<dyn Fn(&str, Scope)>;
-/// Writes a slider's value into the background being edited.
-type Setter = fn(&mut Background, f64);
 
 pub struct Callbacks {
     /// `None` ends the preview.
@@ -39,6 +37,8 @@ pub struct Callbacks {
     pub apply: OnApply,
     pub background: Rc<dyn Fn(Background, Scope)>,
     pub import: Rc<dyn Fn()>,
+    /// A Sidebar / Tiles & terminals slider moved: (settings key, value).
+    pub surface: Rc<dyn Fn(&'static str, f64)>,
 }
 
 /// What the section shows; the app builds it on every refresh.
@@ -56,7 +56,16 @@ pub struct Snapshot {
     pub fullscreen: bool,
     /// Why a pick may not show (the config pins something), if anything.
     pub note: Option<String>,
+    /// Sidebar and tiles as they are now (the theme's look until the user moves a slider).
+    pub surfaces: Surfaces,
+    /// TileIDE draws the background, so it can blur it under the sidebar and tiles.
+    pub can_blur: bool,
+    /// Surface keys `tileide.lua` sets (their sliders are locked).
+    pub locked: Vec<&'static str>,
 }
+
+/// The four surface sliders' settings keys, in `Controls::surface` order.
+pub const SURFACE_KEYS: [&str; 4] = ["sidebar.transparency", "sidebar.blur", "appearance.tile_transparency", "appearance.tile_blur"];
 
 pub fn css(t: &Theme) -> String {
     let c = theme::css;
@@ -105,10 +114,9 @@ struct Controls {
     gradient_bottom: gtk::ColorDialogButton,
     solid_row: gtk::Box,
     solid: gtk::ColorDialogButton,
-    dim: gtk::Scale,
-    blur: gtk::Scale,
-    blur_row: gtk::Box,
-    tile_opacity: gtk::Scale,
+    /// Sidebar transparency, sidebar blur, tile transparency, tile blur (`SURFACE_KEYS`).
+    surface: [gtk::Scale; 4],
+    blur_note: gtk::Label,
     picker: gtk::Box,
     windowed_note: gtk::Label,
     legibility: gtk::Label,
@@ -191,18 +199,30 @@ impl ThemesPanel {
         let solid_row = row_of(&[label("Colour").upcast_ref(), solid.upcast_ref()]);
         picker.append(&solid_row);
 
-        let (dim, dim_row) = slider("Dim", 0.0, 90.0, 5.0, "%");
-        picker.append(&dim_row);
-        let (blur, blur_row) = slider("Blur", 0.0, 60.0, 2.0, " px");
-        picker.append(&blur_row);
-        let (tile_opacity, opacity_row) = slider("Tiles", 88.0, 100.0, 1.0, "%");
-        picker.append(&opacity_row);
+        content.append(&picker);
+
+        // See-through and blur, in every mode (blur needs a background TileIDE draws).
+        let max = (tileide_config::settings::TRANSPARENCY_MAX, tileide_config::settings::BLUR_MAX);
+        content.append(&section("SIDEBAR"));
+        let (sidebar_t, row) = slider("Transparency", 0.0, max.0, 1.0, "%");
+        content.append(&row);
+        let (sidebar_b, row) = slider("Blur", 0.0, max.1, 1.0, " px");
+        content.append(&row);
+        content.append(&section("TILES & TERMINALS"));
+        let (tile_t, row) = slider("Transparency", 0.0, max.0, 1.0, "%");
+        content.append(&row);
+        let (tile_b, row) = slider("Blur", 0.0, max.1, 1.0, " px");
+        content.append(&row);
+        let blur_note = gtk::Label::new(Some("Blur shows over a background TileIDE draws: full-screen with Image, Gradient or Solid. Over the desktop (See-through, or windowed) blur comes from your compositor, e.g. Hyprland's decoration:blur."));
+        blur_note.add_css_class("note");
+        blur_note.set_wrap(true);
+        blur_note.set_xalign(0.0);
+        content.append(&blur_note);
         let legibility = gtk::Label::new(None);
         legibility.add_css_class("note");
         legibility.set_wrap(true);
         legibility.set_xalign(0.0);
-        picker.append(&legibility);
-        content.append(&picker);
+        content.append(&legibility);
 
         let root = gtk::ScrolledWindow::new();
         root.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -211,7 +231,7 @@ impl ThemesPanel {
 
         let panel = Rc::new(ThemesPanel {
             root,
-            c: Controls { scope_all, scope_workspace, note, list, modes, image_row, image_button, fit, gradient_row, gradient_top, gradient_bottom, solid_row, solid, dim, blur, blur_row, tile_opacity, picker, windowed_note, legibility },
+            c: Controls { scope_all, scope_workspace, note, list, modes, image_row, image_button, fit, gradient_row, gradient_top, gradient_bottom, solid_row, solid, surface: [sidebar_t, sidebar_b, tile_t, tile_b], blur_note, picker, windowed_note, legibility },
             callbacks,
             keys: RefCell::new(Vec::new()),
             workspace: Cell::new(None),
@@ -329,17 +349,11 @@ impl ThemesPanel {
                 }
             });
         }
-        let sliders: [(&gtk::Scale, Setter); 3] = [
-            (&c.dim, |b, v| b.dim = v as u32),
-            (&c.blur, |b, v| b.blur = v as u32),
-            (&c.tile_opacity, |b, v| b.tile_opacity = v / 100.0),
-        ];
-        for (scale, set) in sliders {
+        for (scale, key) in c.surface.iter().zip(SURFACE_KEYS) {
             let weak = Rc::downgrade(self);
             scale.connect_value_changed(move |s| {
                 if let Some(p) = weak.upgrade().filter(|p| !p.updating.get()) {
-                    set(&mut p.background.borrow_mut(), s.value());
-                    p.changed();
+                    (p.callbacks.surface)(key, s.value().round());
                 }
             });
         }
@@ -390,6 +404,20 @@ impl ThemesPanel {
 
         c.windowed_note.set_visible(!s.fullscreen);
         c.picker.set_sensitive(s.fullscreen);
+        let values = [
+            (1.0 - s.surfaces.sidebar.opacity) * 100.0,
+            s.surfaces.sidebar.blur,
+            (1.0 - s.surfaces.tiles.opacity) * 100.0,
+            s.surfaces.tiles.blur,
+        ];
+        for (i, (scale, value)) in c.surface.iter().zip(values).enumerate() {
+            scale.set_value(value.round());
+            let blur = i % 2 == 1;
+            let locked = s.locked.contains(&SURFACE_KEYS[i]);
+            scale.set_sensitive(!locked && (!blur || s.can_blur));
+            scale.set_tooltip_text(locked.then_some("Set in tileide.lua"));
+        }
+        c.blur_note.set_visible(!s.can_blur);
         self.show_background(&s.background);
         *self.background.borrow_mut() = s.background;
         self.updating.set(false);
@@ -400,7 +428,6 @@ impl ThemesPanel {
         let mode = MODES.iter().position(|(m, _)| *m == bg.mode).unwrap_or(0);
         c.modes[mode].set_active(true);
         c.image_row.set_visible(bg.mode == "image");
-        c.blur_row.set_visible(bg.mode == "image");
         c.gradient_row.set_visible(bg.mode == "gradient");
         c.solid_row.set_visible(bg.mode == "solid");
         if bg.mode == "image" {
@@ -418,9 +445,6 @@ impl ThemesPanel {
         {
             c.solid.set_rgba(&rgba(colour));
         }
-        c.dim.set_value(bg.dim as f64);
-        c.blur.set_value(bg.blur as f64);
-        c.tile_opacity.set_value((bg.tile_opacity * 100.0).round());
     }
 
     /// The background's contrast report (from the last bake), or `None` to hide it.
@@ -565,10 +589,11 @@ fn slider(name: &str, min: f64, max: f64, step: f64, unit: &'static str) -> (gtk
     let value = label("");
     value.set_width_chars(6);
     value.set_xalign(1.0);
+    value.set_text(&format!("{}{unit}", min.round()));
     let v = value.clone();
     scale.connect_value_changed(move |s| v.set_text(&format!("{}{unit}", s.value().round())));
     let name = label(name);
-    name.set_width_chars(5);
+    name.set_width_chars(12);
     name.set_xalign(0.0);
     let row = row_of(&[name.upcast_ref(), scale.upcast_ref(), value.upcast_ref()]);
     (scale, row)

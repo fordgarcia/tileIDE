@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The completion list: a themed card under the cursor. Typing keeps going to the
 //! editor and filters the list (fuzzy, like quick open); ↑/↓ or Ctrl+N/P select,
-//! Enter or Tab insert, Esc closes. `lsp.rs` decides when it opens.
+//! Enter or Tab insert, Esc closes. The selected item's missing letters also show
+//! faded after the cursor (`prin` → `print`), so Tab reads as "take the suggestion".
+//! `lsp.rs` decides when it opens.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,12 +25,16 @@ pub fn css(t: &Theme) -> String {
 popover.tileide-completion list {{ background: transparent; }}
 popover.tileide-completion row {{ border-radius: 8px; padding: 3px 8px; color: {text}; }}
 popover.tileide-completion row:selected {{ background-color: {select}; }}
-popover.tileide-completion .detail {{ color: {muted}; font-size: 0.9em; }}",
+popover.tileide-completion .detail {{ color: {muted}; font-size: 0.9em; }}
+popover.tileide-completion .kind {{ color: {accent}; font-size: 0.8em; }}
+textview label.tileide-ghost {{ color: {ghost}; padding: 0; margin: 0; }}",
         surface = c(t.surface, 0.98),
         text = c(t.text, 1.0),
         muted = c(t.muted, 1.0),
         edge = c(t.text, 0.12),
         select = c(t.accent, 0.18),
+        ghost = c(t.muted, 0.85),
+        accent = c(t.accent, 0.9),
     )
 }
 
@@ -48,6 +54,8 @@ pub struct Popup {
     popover: gtk::Popover,
     list: gtk::ListBox,
     scroll: gtk::ScrolledWindow,
+    /// The inline suggestion, a text-view overlay (the view removes it itself).
+    ghost: gtk::Label,
     state: RefCell<State>,
 }
 
@@ -76,7 +84,13 @@ impl Popup {
         // dispose loops forever on a child it didn't add itself (GTK 4.24).
         popover.set_parent(view);
 
-        let popup = Rc::new(Popup { view: view.downgrade(), popover, list, scroll, state: RefCell::new(State::default()) });
+        let ghost = gtk::Label::new(None);
+        ghost.add_css_class("tileide-ghost");
+        ghost.set_can_target(false);
+        ghost.set_visible(false);
+        view.add_overlay(&ghost, 0, 0);
+
+        let popup = Rc::new(Popup { view: view.downgrade(), popover, list, scroll, ghost, state: RefCell::new(State::default()) });
 
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -192,7 +206,41 @@ impl Popup {
         self.scroll.vadjustment().set_value(0.0);
         drop(st);
         self.align();
+        self.update_ghost();
         true
+    }
+
+    /// Shows the rest of the selected item after the cursor, faded: only when what's
+    /// typed is its start and the cursor ends the line (it would cover text otherwise).
+    fn update_ghost(&self) {
+        let Some(view) = self.view.upgrade() else { return };
+        let buffer = view.buffer();
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let tail = (|| {
+            let st = self.state.borrow();
+            let index = self.list.selected_row()?.index();
+            let item = st.items.get(*st.shown.get(usize::try_from(index).ok()?)?)?;
+            let anchor = buffer.iter_at_mark(st.anchor.as_ref()?);
+            let typed = buffer.text(&anchor, &cursor, false);
+            let mut end = cursor;
+            if !end.ends_line() {
+                end.forward_to_line_end();
+            }
+            if !buffer.text(&cursor, &end, false).trim().is_empty() {
+                return None;
+            }
+            let tail = item.insert.strip_prefix(typed.as_str())?;
+            (!tail.is_empty() && !tail.contains('\n')).then(|| tail.to_string())
+        })();
+        match tail {
+            Some(tail) => {
+                let at = view.iter_location(&cursor);
+                self.ghost.set_text(&tail);
+                view.move_overlay(&self.ghost, at.x(), at.y());
+                self.ghost.set_visible(true);
+            }
+            None => self.ghost.set_visible(false),
+        }
     }
 
     /// A popover centres on what it points at; shifting it by half its width keeps the
@@ -203,6 +251,7 @@ impl Popup {
     }
 
     pub fn hide(&self) {
+        self.ghost.set_visible(false);
         if self.popover.is_visible() {
             self.popover.popdown();
         }
@@ -212,6 +261,16 @@ impl Popup {
         }
         st.items.clear();
         st.shown.clear();
+    }
+
+    /// Tab completion: one match left is filled in at once (as Jupyter does). Returns
+    /// whether it was.
+    pub fn take_single(&self) -> bool {
+        if self.is_visible() && self.state.borrow().shown.len() == 1 {
+            self.accept();
+            return true;
+        }
+        false
     }
 
     fn step(&self, by: i32) {
@@ -226,6 +285,7 @@ impl Popup {
                 self.scroll.vadjustment().clamp_page(bounds.y() as f64, (bounds.y() + bounds.height()) as f64);
             }
         }
+        self.update_ghost();
     }
 
     /// Replaces the word (or the server's range, up to the cursor) with the pick.
@@ -255,6 +315,11 @@ fn row(item: &Completion) -> gtk::Box {
     let label = gtk::Label::new(Some(&item.label));
     label.set_xalign(0.0);
     row.append(&label);
+    if let Some(kind) = item.kind {
+        let tag = gtk::Label::new(Some(kind));
+        tag.add_css_class("kind");
+        row.append(&tag);
+    }
     if let Some(detail) = &item.detail {
         let detail = gtk::Label::new(Some(detail));
         detail.add_css_class("detail");

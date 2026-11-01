@@ -29,7 +29,7 @@ Tired of switching tiling window managers and customizing configs of IDE per swi
 
 <br>
 
-> **Status: v0.4.0-alpha.4** (Settings, Run, notebooks, debugger, audio visualizer). Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes (and VS Code theme import), language servers, extensions, and a Lua config that applies as you save it. No debugger yet. Install details: [docs/install-arch.md](docs/install-arch.md).
+> **Status: v0.4.0-alpha.5** (Settings, Run, notebooks, debugging for C/C++/Rust/Python/Java, audio visualizer). Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes (and VS Code theme import), language servers, extensions, and a Lua config that applies as you save it. Install details: [docs/install-arch.md](docs/install-arch.md).
 
 ![TileIDE](docs/1.png)
 ![TileIDE](docs/2.png)
@@ -80,16 +80,20 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 | `Alt+B` / `Alt+C` | files drawer / config workspace |
 | `Alt+D` / `Alt+Shift+W` | pick the workspace's folder / remove the workspace |
 | `Alt+R` | run the focused file (output card; `Ctrl+C` stop, `Esc` close); in a notebook, run all cells |
+| Notebook | `Shift+Enter` run and move on, `Ctrl+Enter` run; `↑`/`↓` at a cell's first/last line go to the next cell; `Enter` edits a rendered text cell |
 | `F9` / `F5` | breakpoint / debug (start or continue); `F10` over, `F11` into, `Shift+F11` out, `Shift+F5` stop |
 | `Alt+,` / `Alt+K` | settings / keybinds |
 | `Alt+=` / `Alt+-` | code font bigger / smaller |
 | `Alt+Shift+T` / `Alt+Shift+X` | settings: themes & background / extensions |
-| `Alt+I` / `F12` / `Ctrl+Space` | hover info / go to definition / complete (language servers) |
+| `Tab` | in an editor or cell, after a name or a `.`: complete (one match is filled in, else a list; as in Jupyter); elsewhere it indents. With the list open, `Tab` takes the selected item |
+| `Alt+I` / `F12` / `Alt+Tab` or `Ctrl+Space` | hover info / go to definition / complete (Alt+Tab only where the desktop doesn't use it for window switching) |
+| `Ctrl+Shift+I` | format the file, or the notebook cell (Ruff for Python) |
+| `F2` / `Shift+F12` / `Ctrl+.` | rename everywhere / list references / quick fixes |
 | `Alt+Z` / `Alt+Escape` | word wrap / quit (asks if unsaved) |
 
 Mouse: hovering a workspace dot previews its files (click to go, × to remove it); the file-tree button at the top opens the drawer; the folder-with-a-cog under the dots is the config workspace; the palette opens the theme tray; the gear above the clock opens Settings.
 
-Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
+Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `format`, `rename`, `references`, `code_action`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
 
 Extensions are programs in any language that run in their own process and start only when needed; the Extensions section shows what each one costs. See [docs/extensions.md](docs/extensions.md) and [docs/compatibility.md](docs/compatibility.md).
 

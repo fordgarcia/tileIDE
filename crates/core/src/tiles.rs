@@ -153,14 +153,16 @@ impl TileTree {
     }
 
     /// Removes a tile; its sibling takes the space. Focus moves to the sibling side only
-    /// if the closed tile had it (e.g. a terminal whose shell exited keeps focus elsewhere).
+    /// if the closed tile had it (e.g. a terminal whose shell exited keeps focus elsewhere):
+    /// to the tile it was split from, which is the sibling subtree's first leaf.
     pub fn close(&mut self, id: TileId) -> bool {
         if !self.contains(id) {
             return false;
         }
+        let heir = self.root.as_ref().and_then(|root| sibling(root, id)).map(first_leaf);
         self.root = self.root.take().and_then(|root| remove_leaf(root, id));
         if self.focused == Some(id) {
-            self.focused = self.root.as_ref().map(first_leaf);
+            self.focused = heir;
         }
         true
     }
@@ -212,6 +214,15 @@ fn first_leaf(node: &Node) -> TileId {
     match node {
         Node::Leaf(id) => *id,
         Node::Split { first, .. } => first_leaf(first),
+    }
+}
+
+/// The subtree sharing a split with leaf `target`.
+fn sibling(node: &Node, target: TileId) -> Option<&Node> {
+    let Node::Split { first, second, .. } = node else { return None };
+    match (first.as_ref(), second.as_ref()) {
+        (Node::Leaf(id), other) | (other, Node::Leaf(id)) if *id == target => Some(other),
+        _ => sibling(first, target).or_else(|| sibling(second, target)),
     }
 }
 
@@ -324,12 +335,29 @@ mod tests {
         let rects = t.layout(AREA, 8.0);
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[1].1.h, 600.0, "tile 1 takes the full column");
-        assert_eq!(t.focused(), Some(0));
+        assert_eq!(t.focused(), Some(1), "back to the tile 2 was split from");
         while let Some(id) = t.focused() {
             t.close(id);
         }
         assert!(t.layout(AREA, 8.0).is_empty());
         assert_eq!(t.focused(), None);
+    }
+
+    #[test]
+    fn close_focuses_the_tile_it_was_split_from() {
+        // 0 | (1 / (2 | 3)): closing 3 goes back to 2, closing 2 to 1, never to 0.
+        let mut t = TileTree::default();
+        t.split(0, None, None);
+        t.split(1, Some(Axis::Row), None);
+        t.split(2, Some(Axis::Column), None);
+        t.split(3, Some(Axis::Row), None);
+        t.close(3);
+        assert_eq!(t.focused(), Some(2));
+        t.close(2);
+        assert_eq!(t.focused(), Some(1));
+        t.focus(0);
+        t.close(0);
+        assert_eq!(t.focused(), Some(1), "first tile closed: its sibling takes focus");
     }
 
     #[test]

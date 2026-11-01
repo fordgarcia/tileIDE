@@ -6,6 +6,7 @@ pub mod drawer;
 pub mod extension;
 pub mod layout;
 pub mod motion;
+pub mod python;
 pub mod run;
 pub mod search;
 pub mod theme;

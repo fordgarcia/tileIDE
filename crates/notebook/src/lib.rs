@@ -4,6 +4,8 @@
 //! are kept) and the kernel bridge (`kernel`).
 
 pub mod kernel;
+pub mod markdown;
+pub mod table;
 
 use serde_json::{Map, Value, json};
 
@@ -197,6 +199,29 @@ impl Default for Notebook {
     }
 }
 
+/// A code cell as plain Python for language servers, line for line: IPython syntax
+/// (`%magic`, `!shell`, `obj?`) becomes a blank line, or `pass` when indented (a block
+/// can't be empty), and a `%%` cell magic blanks the whole cell. The line count never
+/// changes, so positions map back.
+pub fn python_view(source: &str) -> String {
+    let cell_magic = source.lines().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim_start().starts_with("%%"));
+    source
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let ipython = trimmed.starts_with('%') || trimmed.starts_with('!') || (trimmed.ends_with('?') && !trimmed.starts_with('#'));
+            if cell_magic || trimmed.is_empty() || (ipython && trimmed.len() == line.len()) {
+                String::new()
+            } else if ipython {
+                format!("{}pass", &line[..line.len() - trimmed.len()])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Adds a kernel output to a cell's outputs: consecutive stream text of the same
 /// stream joins the last output, as Jupyter shows it.
 pub fn push_output(outputs: &mut Vec<Value>, output: Value) {
@@ -219,6 +244,8 @@ pub enum Shown {
     Error(String),
     /// PNG bytes.
     Image(Vec<u8>),
+    /// An HTML table (a pandas DataFrame); the plain text comes along as a fallback.
+    Table(table::Table, String),
 }
 
 /// The richest output TileIDE can show: an image, else plain text (rich HTML is not
@@ -236,7 +263,11 @@ pub fn shown(output: &Value) -> Option<Shown> {
             if let Some(png) = data.get("image/png").map(|v| text(Some(v))).and_then(|b| base64(&b)) {
                 return Some(Shown::Image(png));
             }
-            data.get("text/plain").map(|v| Shown::Text(tileide_core::run::strip_ansi(&text(Some(v)))))
+            let plain = data.get("text/plain").map(|v| tileide_core::run::strip_ansi(&text(Some(v))));
+            if let Some(table) = data.get("text/html").and_then(|v| table::parse(&text(Some(v)))) {
+                return Some(Shown::Table(table, plain.unwrap_or_default()));
+            }
+            plain.map(Shown::Text)
         }
         _ => None,
     }
@@ -269,6 +300,16 @@ pub fn base64(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_become_python_line_for_line() {
+        let src = "%matplotlib inline\nimport pandas as pd\nfor x in y:\n    !echo hi\ndf?\n# why?\n";
+        let py = python_view(src);
+        assert_eq!(py, "\nimport pandas as pd\nfor x in y:\n    pass\n\n# why?\n");
+        assert_eq!(py.split('\n').count(), src.split('\n').count());
+        assert_eq!(python_view("\n%%bash\nls -l"), "\n\n");
+        assert_eq!(python_view(""), "");
+    }
 
     const SAMPLE: &str = r##"{
  "cells": [

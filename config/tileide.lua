@@ -18,6 +18,8 @@ tileide.appearance {
   -- ui_scale      = 1.0,                 -- 0.8 .. 1.5, TileIDE's own text
   -- code_font     = "monospace",         -- editors and terminals
   -- code_size     = 11,                  -- points; Alt+= / Alt+- change it
+  -- tile_transparency = 8,               -- %, 0 .. 90: editors and terminals (unset: the theme's look)
+  -- tile_blur         = 0,               -- px, 0 .. 60: blurs a TileIDE background behind them
 }
 
 tileide.sidebar {
@@ -33,6 +35,8 @@ tileide.sidebar {
   -- icon_backgrounds = true,             -- the circles and squares behind them
   -- show_themes     = true,              -- the palette button
   -- show_config     = true,              -- the Config folder under the workspace dots
+  -- transparency    = 5,                 -- %, 0 .. 90: the rail, border and Files drawer
+  -- blur            = 0,                 -- px, 0 .. 60: blurs a TileIDE background behind them
 }
 
 -- Full-screen only; a windowed TileIDE shows your desktop. Settings > Themes &
@@ -40,10 +44,10 @@ tileide.sidebar {
 -- tileide.background {
 --   mode         = "see-through",        -- see-through | image | gradient | solid
 --   source       = "~/Pictures/wall.jpg",-- image: a path; solid: "1A1B26"; gradient: "1A1B26,3B4261"
---   dim          = 0,                    -- % darkening
---   blur         = 0,                    -- px
---   tile_opacity = 0.92,                 -- 0.88 .. 1
+--   dim          = 0,                    -- % darkening of the whole background
+--   blur         = 0,                    -- px, the whole background
 --   fit          = "cover",              -- cover | contain | tile
+-- (Tiles' and the sidebar's see-through and blur: tileide.appearance / tileide.sidebar.)
 -- }
 
 tileide.tiling {
@@ -56,6 +60,9 @@ tileide.tiling {
 -- Alt+R runs the focused file. Add or replace a runner by extension ({file}, {dir},
 -- {stem}, {out} = a binary path); the command runs through sh -c.
 -- tileide.runner(".py", "python3 -u {file}")
+
+-- Banner popups when a language server, debugger, Jupyter or Python module is missing.
+-- tileide.alerts { missing_tools = true }
 
 -- keybinds: tileide.bind(mods, key, action, arg). These replace the built-in key with
 -- the same mods; everything else keeps its default (see the README).

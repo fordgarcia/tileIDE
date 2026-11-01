@@ -3,12 +3,12 @@
 pkgname = tileide
 pkgbase = tileide
 xdata = pkgtype=pkg
-pkgver = 0.4.0alpha4-1
+pkgver = 0.4.0alpha9-1
 pkgdesc = A tiling, riceable code editor for Hyprland
 url = https://github.com/fordgarcia/tileIDE
-builddate = 1793522731
+builddate = 1793545247
 packager = Unknown Packager
-size = 4924117
+size = 5577998
 arch = x86_64
 license = GPL-3.0-or-later
 depend = gtk4

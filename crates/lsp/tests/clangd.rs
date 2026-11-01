@@ -28,7 +28,7 @@ fn wait(rx: &mpsc::Receiver<Incoming>, what: &str, wanted: impl Fn(&Value) -> bo
 #[test]
 fn clangd_end_to_end() {
     let server = servers::by_name("c").unwrap();
-    let Some(cmd) = servers::command(server, None, servers::on_path) else {
+    let Some(cmd) = servers::command(server, None, |p| servers::locate(p, &[])) else {
         eprintln!("clangd not installed: skipped");
         return;
     };
@@ -37,7 +37,7 @@ fn clangd_end_to_end() {
     let text = std::fs::read_to_string(&file).unwrap().replacen("    return 0;", "    int b = undefined_name;\n    return 0;", 1);
 
     let (tx, rx) = mpsc::channel();
-    let mut c = Connection::spawn(&cmd, &fixture, move |m| {
+    let mut c = Connection::spawn(&cmd, &fixture, serde_json::Value::Null, move |m| {
         let _ = tx.send(m);
     })
     .unwrap();

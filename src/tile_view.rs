@@ -153,21 +153,21 @@ pub struct TileView {
     on_change: Rc<dyn Fn()>,
 }
 
-/// `tile_opacity`: the tile background's opacity (the full-screen background's control).
-/// Focused tile: a plain 2px accent border (no glow). The tile layer is clipped to the
-/// frame's rounded hole, so columns scrolled past an edge slide under the frame's curve.
-/// Glass themes ignore `tile_opacity`: a diagonal fill, a 1px top highlight, and the
-/// blurred backdrop the canvas paints under each tile (`draw::Scene::frosted`).
-/// `see_behind`: TileIDE paints the background (else the glass fill keeps `min_tint`).
-pub fn css(t: &Theme, g: Geometry, tile_opacity: f64, see_behind: bool) -> String {
+/// `tile_opacity`: the tile fill's opacity (Settings → Themes & background → Tiles &
+/// terminals; terminals are transparent on it). Focused tile: a plain 2px accent border
+/// (no glow). The tile layer is clipped to the frame's rounded hole, so columns
+/// scrolled past an edge slide under the frame's curve. Glass themes: a diagonal fill
+/// (its darker end follows the opacity), a 1px top highlight, and the blurred backdrop
+/// the canvas paints under each tile (`draw::Scene::frosted`).
+pub fn css(t: &Theme, g: Geometry, tile_opacity: f64) -> String {
     let (fill, edge, focus) = match t.glass {
         Some(glass) => {
-            let floor = if see_behind { 0.0 } else { glass.min_tint };
+            let bottom = (tile_opacity + glass.bottom_opacity - glass.opacity).clamp(0.0, 1.0);
             (
                 format!(
                     "background-image: linear-gradient(160deg, {}, {}); box-shadow: inset 0 1px {};",
-                    theme::css(t.tile, glass.opacity.max(floor)),
-                    theme::css(glass.bottom, glass.bottom_opacity.max(floor)),
+                    theme::css(t.tile, tile_opacity),
+                    theme::css(glass.bottom, bottom),
                     theme::css(t.text, 0.12),
                 ),
                 theme::css(t.text, glass.edge_opacity),
@@ -328,6 +328,11 @@ impl TileView {
         self.tiles.get(&self.layout.focused()?)?.input.downcast_ref::<sourceview5::View>().cloned()
     }
 
+    /// Where language actions apply: the focused editor, or a notebook's current cell.
+    pub fn focused_code(&self) -> Option<sourceview5::View> {
+        self.focused_editor().or_else(|| self.focused_notebook()?.current_view())
+    }
+
     /// The focused tile's notebook, if it is one.
     pub fn focused_notebook(&self) -> Option<Rc<crate::notebook_view::NotebookView>> {
         self.tiles.get(&self.layout.focused()?)?.notebook.clone()
@@ -385,7 +390,13 @@ impl TileView {
         let mut notebook = None;
         let (content, input, buffer, path) = match kind {
             Kind::Editor(Some(path)) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ipynb")) => {
-                let nb = crate::notebook_view::NotebookView::open(path, self.theme.clone(), self.folder.clone());
+                let me = self.me.clone();
+                let goto: lsp::Goto = Rc::new(move |path, at, encoding| {
+                    if let Some(view) = me.upgrade() {
+                        view.borrow_mut().goto(&path, at, encoding);
+                    }
+                });
+                let nb = crate::notebook_view::NotebookView::open(path, self.theme.clone(), self.folder.clone(), goto);
                 let root: gtk::Widget = nb.widget().clone().upcast();
                 notebook = Some(nb);
                 (root.clone(), root, None, Some(path.to_path_buf()))
@@ -808,8 +819,8 @@ impl TileView {
         }
         self.glide.shown = shown;
         self.container.queue_allocate();
-        // The canvas paints the glass backdrop under each tile, so it must follow them.
-        if self.theme.glass.is_some() {
+        // The canvas paints the blurred backdrop under each tile, so it must follow them.
+        if crate::draw::tile_backdrop() {
             (self.on_change)();
         }
     }

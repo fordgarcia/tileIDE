@@ -57,6 +57,8 @@ struct Host {
     title: gtk::Label,
     detail: gtk::Label,
     buttons: gtk::Box,
+    /// Text to type in (`prompt` only).
+    entry: gtk::Entry,
     /// The open dialog's answer; taken by the first choice, so it runs once.
     pending: RefCell<Option<Answer>>,
     /// Focus to give back when the dialog closes.
@@ -86,16 +88,20 @@ pub fn install(overlay: &gtk::Overlay) {
     detail.add_css_class("detail");
     detail.set_xalign(0.0);
     detail.set_wrap(true);
+    let entry = gtk::Entry::new();
+    entry.set_visible(false);
+    entry.set_margin_top(10);
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
     buttons.set_margin_top(14);
     card.append(&title);
     card.append(&detail);
+    card.append(&entry);
     card.append(&buttons);
     layer.append(&card);
     overlay.add_overlay(&layer);
 
-    let host = Rc::new(Host { layer, title, detail, buttons, pending: RefCell::new(None), restore: RefCell::new(None) });
+    let host = Rc::new(Host { layer, title, detail, entry, buttons, pending: RefCell::new(None), restore: RefCell::new(None) });
 
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -105,6 +111,10 @@ pub fn install(overlay: &gtk::Overlay) {
         let focus = |forward: bool| {
             h.buttons.child_focus(if forward { gtk::DirectionType::TabForward } else { gtk::DirectionType::TabBackward });
         };
+        // Arrows move the text cursor while typing.
+        if WidgetExt::is_visible(&h.entry) && matches!(key, gdk::Key::Left | gdk::Key::Right) {
+            return glib::Propagation::Proceed;
+        }
         match key {
             gdk::Key::Escape => answer(&h, 0),
             gdk::Key::Right => focus(true),
@@ -126,7 +136,30 @@ pub fn install(overlay: &gtk::Overlay) {
     });
     host.layer.add_controller(click);
 
+    let h = Rc::downgrade(&host);
+    host.entry.connect_activate(move |_| {
+        if let Some(h) = h.upgrade() {
+            answer(&h, 1);
+        }
+    });
+
     HOST.set(Some(host));
+}
+
+/// Asks for a line of text, `initial` selected: `on_answer` gets it (Enter or `ok`),
+/// or `None` (Cancel, Esc).
+pub fn prompt(title: &str, detail: &str, initial: &str, ok: &str, on_answer: impl FnOnce(Option<String>) + 'static) {
+    let Some(host) = HOST.with_borrow(|h| h.clone()) else {
+        on_answer(None);
+        return;
+    };
+    let entry = host.entry.clone();
+    let e = entry.clone();
+    ask(title, detail, &[("Cancel", Role::Cancel), (ok, Role::Primary)], 1, move |choice| on_answer((choice == 1).then(|| e.text().to_string())));
+    entry.set_text(initial);
+    entry.set_visible(true);
+    entry.grab_focus();
+    entry.select_region(0, -1);
 }
 
 pub fn is_open() -> bool {
@@ -145,6 +178,7 @@ pub fn ask(title: &str, detail: &str, buttons: &[(&str, Role)], default: usize, 
     if host.pending.borrow().is_some() {
         answer(&host, 0);
     }
+    host.entry.set_visible(false);
     host.title.set_text(title);
     host.detail.set_text(detail);
     host.detail.set_visible(!detail.is_empty());

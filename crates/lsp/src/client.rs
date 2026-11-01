@@ -33,10 +33,21 @@ fn write(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<(), String> {
 }
 
 impl Connection {
-    /// Starts `cmd` (program and arguments) in `dir`.
-    pub fn spawn(cmd: &[String], dir: &std::path::Path, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Connection, String> {
+    /// Starts `cmd` (program and arguments) in `dir`. `settings` answers the server's
+    /// `workspace/configuration` requests.
+    pub fn spawn(cmd: &[String], dir: &std::path::Path, settings: Value, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Connection, String> {
         let (program, args) = cmd.split_first().ok_or("empty command")?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        // A server found by full path runs with its folder first on PATH: an npm-installed
+        // one (`#!/usr/bin/env node`) then gets the node installed beside it, even when a
+        // version manager's shim has no default outside a project.
+        if let Some(dir) = std::path::Path::new(program).parent().filter(|d| d.is_absolute()) {
+            let rest = std::env::var_os("PATH").unwrap_or_default();
+            if let Ok(path) = std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&rest))) {
+                command.env("PATH", path);
+            }
+        }
+        let mut child = command
             .args(args)
             .current_dir(dir)
             .stdin(Stdio::piped())
@@ -49,9 +60,13 @@ impl Connection {
         let replies = stdin.clone();
         std::thread::spawn(move || {
             while let Ok(Some(message)) = read_message(&mut stdout) {
-                match answer_server_request(&message) {
+                match answer_server_request(&message, &settings) {
                     Some(answer) => {
                         let _ = write(&replies, &answer);
+                        // The edit itself is the app's to apply.
+                        if message["method"] == "workspace/applyEdit" {
+                            deliver(Incoming::Message(message));
+                        }
                     }
                     None => deliver(Incoming::Message(message)),
                 }

@@ -16,6 +16,20 @@ use tileide_core::theme::{Glass, Rgb, Theme};
 use tileide_core::tiles::Rect;
 use tileide_core::token::{self, Geometry, *};
 
+thread_local! {
+    static TILE_BACKDROP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the canvas paints a blurred backdrop under the tiles (then it must redraw
+/// whenever tiles move).
+pub fn tile_backdrop() -> bool {
+    TILE_BACKDROP.get()
+}
+
+pub fn set_tile_backdrop(on: bool) {
+    TILE_BACKDROP.set(on);
+}
+
 pub struct Scene<'a> {
     pub width: f64,
     pub height: f64,
@@ -46,11 +60,15 @@ pub struct Scene<'a> {
     pub placeholder_tiles: bool,
     /// Full-screen app background (spike 6), already baked at this size; `None` = see-through.
     pub background: Option<&'a ImageSurface>,
-    /// Glass themes: the blurred, saturated background painted under each tile.
+    /// The background blurred for under the tiles (Tiles & terminals → Blur).
     pub frosted: Option<&'a ImageSurface>,
+    /// The background blurred for under the frame (Sidebar → Blur).
+    pub frosted_frame: Option<&'a ImageSurface>,
+    /// The frame's fill opacity (Sidebar → Transparency).
+    pub frame_opacity: f64,
     /// The shown tiles, for the frosted backdrop.
     pub tile_rects: &'a [Rect],
-    /// Editor tile opacity (offscreen placeholder tiles; real tiles use CSS).
+    /// Tile fill opacity (the empty tile and offscreen placeholders; real tiles use CSS).
     pub tile_opacity: f64,
 }
 
@@ -196,8 +214,8 @@ pub fn tile_area(s: &Scene) -> Rect {
 
 pub fn draw(cr: &Context, s: &Scene) -> Result<(), Error> {
     let t = &*s.theme;
-    // design.md §4.2 opacities; the solid fallback makes every surface opaque.
-    let frame_alpha = if s.solid { 1.0 } else { FRAME_OPACITY };
+    // The solid fallback makes every surface opaque.
+    let frame_alpha = if s.solid { 1.0 } else { s.frame_opacity };
 
     // The full-screen background across the whole canvas, else transparent. Windowed
     // mode never gets one (spec §4.4).
@@ -225,12 +243,18 @@ pub fn draw(cr: &Context, s: &Scene) -> Result<(), Error> {
         cr.fill()?;
     }
     if s.placeholder_tiles {
-        draw_placeholder_tiles(cr, t, s.geometry, &placeholders, s.tile_opacity, s.background.is_some())?;
+        draw_placeholder_tiles(cr, t, s.geometry, &placeholders, s.tile_opacity)?;
     } else if s.empty {
         draw_empty_tile(cr, s, area)?;
     }
 
     // Drawn last so that in overlay mode the (near-solid) drawer covers the tiles' edge.
+    if let Some(frosted) = s.frosted_frame {
+        frame_path(cr, s);
+        cr.set_fill_rule(FillRule::EvenOdd);
+        cr.set_source_surface(frosted, 0.0, 0.0)?;
+        cr.fill()?;
+    }
     frame_path(cr, s);
     set(cr, t.surface, frame_alpha);
     cr.set_fill_rule(FillRule::EvenOdd);
@@ -271,11 +295,8 @@ fn draw_empty_tile(cr: &Context, s: &Scene, area: Rect) -> Result<(), Error> {
         return Ok(());
     }
     rounded_rect(cr, area, g.tile_radius);
-    match t.glass {
-        // The frosted backdrop is already under it; a light tint like a glass tile's.
-        Some(glass) => set(cr, t.tile, glass.opacity),
-        None => set(cr, t.tile, s.tile_opacity),
-    }
+    // Like a tile (any frosted backdrop is already under it).
+    set(cr, t.tile, s.tile_opacity);
     cr.fill_preserve()?;
     set(cr, t.text, 0.08);
     cr.set_line_width(2.0);
@@ -610,7 +631,7 @@ fn placeholder_tiles(g: Geometry, area: Rect) -> [(Rect, &'static str, bool); 3]
 }
 
 /// Paints like `tile_view::css`: a solid fill at `tile_opacity`, or the glass gradient.
-fn draw_placeholder_tiles(cr: &Context, t: &Theme, g: Geometry, tiles: &[(Rect, &str, bool)], tile_opacity: f64, see_behind: bool) -> Result<(), Error> {
+fn draw_placeholder_tiles(cr: &Context, t: &Theme, g: Geometry, tiles: &[(Rect, &str, bool)], tile_opacity: f64) -> Result<(), Error> {
     for &(r, label, focused) in tiles {
         let radius = g.tile_radius;
         if r.w <= 2.0 * radius || r.h <= 2.0 * radius {
@@ -618,7 +639,7 @@ fn draw_placeholder_tiles(cr: &Context, t: &Theme, g: Geometry, tiles: &[(Rect, 
         }
         rounded_rect(cr, r, radius);
         match t.glass {
-            Some(glass) => cr.set_source(glass_fill(t, glass, r, see_behind))?,
+            Some(glass) => cr.set_source(glass_fill(t, glass, r, tile_opacity))?,
             None => set(cr, t.tile, tile_opacity),
         }
         cr.fill()?;
@@ -643,15 +664,14 @@ fn draw_placeholder_tiles(cr: &Context, t: &Theme, g: Geometry, tiles: &[(Rect, 
 }
 
 /// CSS `linear-gradient(160deg, …)` across `r`: from the top-left-ish corner down.
-fn glass_fill(t: &Theme, glass: Glass, r: Rect, see_behind: bool) -> gtk4::cairo::LinearGradient {
-    let floor = if see_behind { 0.0 } else { glass.min_tint };
+fn glass_fill(t: &Theme, glass: Glass, r: Rect, opacity: f64) -> gtk4::cairo::LinearGradient {
     let (dx, dy) = (160f64.to_radians().sin(), -160f64.to_radians().cos());
     let half = (r.w * dx.abs() + r.h * dy.abs()) / 2.0;
     let (mx, my) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
     let gradient = gtk4::cairo::LinearGradient::new(mx - dx * half, my - dy * half, mx + dx * half, my + dy * half);
     let (a, b) = (t.tile, glass.bottom);
-    gradient.add_color_stop_rgba(0.0, a.0, a.1, a.2, glass.opacity.max(floor));
-    gradient.add_color_stop_rgba(1.0, b.0, b.1, b.2, glass.bottom_opacity.max(floor));
+    gradient.add_color_stop_rgba(0.0, a.0, a.1, a.2, opacity);
+    gradient.add_color_stop_rgba(1.0, b.0, b.1, b.2, (opacity + glass.bottom_opacity - glass.opacity).clamp(0.0, 1.0));
     gradient
 }
 
@@ -721,6 +741,8 @@ mod tests {
             placeholder_tiles: false,
             background: None,
             frosted: None,
+            frosted_frame: None,
+            frame_opacity: FRAME_OPACITY,
             tile_rects: &[],
             tile_opacity: TILE_OPACITY,
         }
