@@ -5,9 +5,9 @@
 # An AUR package would instead fetch a tagged release from the repository.
 
 pkgname=tileide
-pkgver=0.0.0
+pkgver=0.3.0alpha6
 pkgrel=1
-pkgdesc="A tiling, riceable code editor for Hyprland (v0.0 preview)"
+pkgdesc="A tiling, riceable code editor for Hyprland"
 arch=('x86_64' 'aarch64')
 url="https://github.com/fordgarcia/tileIDE"
 license=('GPL-3.0-or-later')
@@ -15,7 +15,9 @@ depends=('gtk4' 'gtksourceview5' 'vte4' 'gdk-pixbuf2' 'cairo' 'pango' 'glib2' 'g
 makedepends=('cargo')
 optdepends=('otf-space-grotesk: the intended UI font (AUR; falls back to the default sans)'
             'hyprland: the compositor TileIDE is designed and tested on')
-options=('!debug')
+# !lto: makepkg's -flto turns the vendored Luau (C++) into GCC LTO bitcode, which
+# Rust's linker cannot read (undefined lua_* symbols).
+options=('!debug' '!lto')
 
 _root="$(realpath "$startdir/../..")"
 
@@ -36,7 +38,7 @@ check() {
   cd "$_root"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR="$srcdir/target"
-  cargo test --frozen --release
+  cargo test --frozen --release --workspace
 }
 
 package() {

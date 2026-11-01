@@ -1,0 +1,12 @@
+[package]
+name = "tileide-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TileIDE's Lua config engine: sandboxed Luau, typed model, theme and state files"
+publish = false
+
+[dependencies]
+tileide-core = { path = "../core" }
+mlua = { version = "0.12.2", features = ["luau", "vendored"] }

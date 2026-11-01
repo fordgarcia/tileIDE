@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use gtk4::cairo::{self, Context, Filter, Format, ImageSurface, Operator, SurfacePattern};
 use gtk4::gdk_pixbuf::Pixbuf;
 
-use crate::draw::colour::{self, Rgb};
+use tileide_core::theme::{Rgb, Theme, contrast, over, rgb};
+use tileide_core::token;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
@@ -55,7 +56,7 @@ impl Default for Settings {
             source: Source::SeeThrough,
             dim: 0.0,
             tint: None,
-            tile_opacity: crate::draw::token::TILE_OPACITY,
+            tile_opacity: token::TILE_OPACITY,
             blur: 0.0,
             fit: Fit::Cover,
             auto_dim: true,
@@ -132,21 +133,23 @@ fn expand_home(path: &str) -> PathBuf {
 
 fn parse_hex(text: &str) -> Result<Rgb, String> {
     let hex = text.trim_start_matches('#');
-    u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6).map(colour::rgb).ok_or(format!("'{text}' is not an RRGGBB colour"))
+    u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6).map(rgb).ok_or(format!("'{text}' is not an RRGGBB colour"))
 }
 
 /// The baked background for one window size, plus what the legibility check found.
 pub struct Background {
     pub settings: Settings,
+    theme: Theme,
     image: Option<ImageSurface>,
-    baked: Option<(i32, i32, ImageSurface)>,
+    /// (width, height, background, glass backdrop) in device pixels.
+    baked: Option<(i32, i32, ImageSurface, Option<ImageSurface>)>,
 }
 
 impl Background {
     /// `None` for see-through. An image source is decoded separately (`decode`), off the
     /// main thread in the app, so it never delays the first frame.
-    pub fn new(settings: Settings) -> Option<Background> {
-        (settings.source != Source::SeeThrough).then_some(Background { settings, image: None, baked: None })
+    pub fn new(settings: Settings, theme: Theme) -> Option<Background> {
+        (settings.source != Source::SeeThrough).then_some(Background { settings, theme, image: None, baked: None })
     }
 
     pub fn image_path(&self) -> Option<PathBuf> {
@@ -170,12 +173,12 @@ impl Background {
         if width <= 0 || height <= 0 || (self.image_path().is_some() && self.image.is_none()) {
             return None;
         }
-        if !matches!(&self.baked, Some((w, h, _)) if *w == width && *h == height) {
+        if !matches!(&self.baked, Some((w, h, _, _)) if *w == width && *h == height) {
             let started = std::time::Instant::now();
             match self.bake(width, height, scale) {
-                Ok(surface) => {
+                Ok((surface, frosted)) => {
                     println!("background: baked {width}x{height} in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
-                    self.baked = Some((width, height, surface));
+                    self.baked = Some((width, height, surface, frosted));
                 }
                 Err(e) => {
                     eprintln!("background: {e}");
@@ -183,10 +186,16 @@ impl Background {
                 }
             }
         }
-        self.baked.as_ref().map(|(_, _, s)| s)
+        self.baked.as_ref().map(|(_, _, s, _)| s)
     }
 
-    fn bake(&mut self, width: i32, height: i32, scale: f64) -> Result<ImageSurface, cairo::Error> {
+    /// The glass themes' backdrop: the baked background, blurred and saturated. Valid
+    /// after `surface()` at the same size.
+    pub fn frosted(&self) -> Option<&ImageSurface> {
+        self.baked.as_ref().and_then(|(_, _, _, f)| f.as_ref())
+    }
+
+    fn bake(&mut self, width: i32, height: i32, scale: f64) -> Result<(ImageSurface, Option<ImageSurface>), cairo::Error> {
         let surface = ImageSurface::create(Format::Rgb24, width, height)?;
         {
             let cr = Context::new(&surface)?;
@@ -195,7 +204,7 @@ impl Background {
         let surface = blur(surface, self.settings.blur)?;
         let mut dim = self.settings.dim;
         if self.settings.auto_dim {
-            let needed = required_dim(&luminances(&surface), self.settings.tile_opacity, self.settings.tint, dim);
+            let needed = required_dim(&luminances(&surface), &self.theme, self.settings.tile_opacity, self.settings.tint, dim);
             if needed > dim {
                 eprintln!(
                     "background: text would fall below {MIN_CONTRAST}:1 on this background; dimming {:.0}% instead of {:.0}% (--no-auto-dim to keep it)",
@@ -213,11 +222,19 @@ impl Background {
         cr.set_source_rgba(0.0, 0.0, 0.0, dim);
         cr.paint()?;
         drop(cr);
-        let report = legibility(&luminances(&surface), self.settings.tile_opacity);
-        println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the window (minimum {MIN_CONTRAST}:1)", report.tile, report.window);
+        let report = legibility(&luminances(&surface), &self.theme, self.settings.tile_opacity);
+        println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the empty-workspace hint (minimum {MIN_CONTRAST}:1)", report.tile, report.hint);
+        let frosted = match self.theme.glass {
+            Some(g) => {
+                let f = blur_with(copy(&surface)?, g.blur * scale, |small| saturate(small, g.saturate))?;
+                f.set_device_scale(scale, scale);
+                Some(f)
+            }
+            None => None,
+        };
         // Drawn in logical units from here on.
         surface.set_device_scale(scale, scale);
-        Ok(surface)
+        Ok((surface, frosted))
     }
 
     fn paint_source(&self, cr: &Context, w: f64, h: f64) -> Result<(), cairo::Error> {
@@ -233,7 +250,7 @@ impl Background {
                 cr.set_source(&gradient)?;
                 cr.paint()
             }
-            (Source::Image(_), Some(image)) => paint_image(cr, image, w, h, self.settings.fit),
+            (Source::Image(_), Some(image)) => paint_image(cr, image, w, h, self.settings.fit, &self.theme),
             _ => Ok(()),
         }
     }
@@ -272,7 +289,7 @@ pub fn decode(path: &std::path::Path) -> Result<Decoded, String> {
     Ok(Decoded { width: w as i32, height: h as i32, pixels })
 }
 
-fn paint_image(cr: &Context, image: &ImageSurface, w: f64, h: f64, fit: Fit) -> Result<(), cairo::Error> {
+fn paint_image(cr: &Context, image: &ImageSurface, w: f64, h: f64, fit: Fit, theme: &Theme) -> Result<(), cairo::Error> {
     let (iw, ih) = (image.width() as f64, image.height() as f64);
     let pattern = SurfacePattern::create(image);
     pattern.set_filter(Filter::Good);
@@ -282,7 +299,7 @@ fn paint_image(cr: &Context, image: &ImageSurface, w: f64, h: f64, fit: Fit) -> 
         return cr.paint();
     }
     // Contain letterboxes on the frame colour.
-    let base = colour::SURFACE_BASE;
+    let base = theme.surface;
     cr.set_source_rgb(base.0, base.1, base.2);
     cr.paint()?;
     let scale = match fit {
@@ -300,8 +317,14 @@ fn paint_image(cr: &Context, image: &ImageSurface, w: f64, h: f64, fit: Fit) -> 
 /// Cheap blur: shrink by the radius, then scale back up with bilinear filtering.
 /// Good enough for a static background that is baked once.
 fn blur(surface: ImageSurface, radius: f64) -> Result<ImageSurface, cairo::Error> {
+    blur_with(surface, radius, Ok)
+}
+
+/// `blur` with a step on the shrunk copy. Saturation is linear in RGB, so applying it
+/// there gives the same result at a fraction of the pixels.
+fn blur_with(surface: ImageSurface, radius: f64, on_small: impl FnOnce(ImageSurface) -> Result<ImageSurface, cairo::Error>) -> Result<ImageSurface, cairo::Error> {
     if radius < 1.0 {
-        return Ok(surface);
+        return on_small(surface);
     }
     let (w, h) = (surface.width(), surface.height());
     let factor = radius.max(2.0);
@@ -315,6 +338,7 @@ fn blur(surface: ImageSurface, radius: f64) -> Result<ImageSurface, cairo::Error
         cr.set_source(&pattern)?;
         cr.paint()?;
     }
+    let small = on_small(small)?;
     let out = ImageSurface::create(Format::Rgb24, w, h)?;
     {
         let cr = Context::new(&out)?;
@@ -329,21 +353,34 @@ fn blur(surface: ImageSurface, radius: f64) -> Result<ImageSurface, cairo::Error
     Ok(out)
 }
 
-/// Relative luminance (WCAG 2) of an sRGB colour with 0..1 channels.
-pub fn luminance((r, g, b): Rgb) -> f64 {
-    let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+fn copy(surface: &ImageSurface) -> Result<ImageSurface, cairo::Error> {
+    let out = ImageSurface::create(Format::Rgb24, surface.width(), surface.height())?;
+    let cr = Context::new(&out)?;
+    cr.set_source_surface(surface, 0.0, 0.0)?;
+    cr.set_operator(Operator::Source);
+    cr.paint()?;
+    drop(cr);
+    Ok(out)
 }
 
-pub fn contrast(a: Rgb, b: Rgb) -> f64 {
-    let (la, lb) = (luminance(a), luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-}
-
-/// `top` at `alpha` over `under`, as cairo blends (in sRGB).
-fn over(top: Rgb, alpha: f64, under: Rgb) -> Rgb {
-    let mix = |t: f64, u: f64| t * alpha + u * (1.0 - alpha);
-    (mix(top.0, under.0), mix(top.1, under.1), mix(top.2, under.2))
+/// CSS `saturate()`: each channel moves away from (or toward) the pixel's luminance.
+fn saturate(mut surface: ImageSurface, amount: f64) -> Result<ImageSurface, cairo::Error> {
+    if (amount - 1.0).abs() < 1e-3 {
+        return Ok(surface);
+    }
+    surface.flush();
+    {
+        let mut data = surface.data().map_err(|_| cairo::Error::InvalidStatus)?;
+        for px in data.chunks_exact_mut(4) {
+            let v = u32::from_ne_bytes(px[..4].try_into().unwrap());
+            let (r, g, b) = (((v >> 16) & 0xFF) as f64, ((v >> 8) & 0xFF) as f64, (v & 0xFF) as f64);
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let c = |x: f64| (l + (x - l) * amount).round().clamp(0.0, 255.0) as u32;
+            px.copy_from_slice(&((c(r) << 16) | (c(g) << 8) | c(b)).to_ne_bytes());
+        }
+    }
+    surface.mark_dirty();
+    Ok(surface)
 }
 
 /// Sampled pixels of a baked RGB24 surface (about 4k samples).
@@ -367,28 +404,29 @@ fn luminances(surface: &ImageSurface) -> Vec<Rgb> {
 pub struct Legibility {
     /// Code text on an editor tile.
     pub tile: f64,
-    /// Hint text on the bare window fill (no tile).
-    pub window: f64,
+    /// The empty-workspace hint on its card (no tile).
+    pub hint: f64,
 }
 
 /// Worst contrast over the brightest 2% of the background is ignored (specks), so one
 /// glint doesn't force a darker background.
-pub fn legibility(pixels: &[Rgb], tile_opacity: f64) -> Legibility {
+pub fn legibility(pixels: &[Rgb], theme: &Theme, tile_opacity: f64) -> Legibility {
     let worst = |surface: Rgb, alpha: f64| {
-        let mut c: Vec<f64> = pixels.iter().map(|&p| contrast(colour::TEXT, over(surface, alpha, p))).collect();
+        let mut c: Vec<f64> = pixels.iter().map(|&p| contrast(theme.text, over(surface, alpha, p))).collect();
         c.sort_by(f64::total_cmp);
         c.get(c.len() / 50).copied().unwrap_or(f64::INFINITY)
     };
-    Legibility { tile: worst(colour::SURFACE_EDITOR, tile_opacity), window: worst(colour::SURFACE_BASE, crate::draw::WINDOW_ALPHA) }
+    let (fill, alpha) = theme.tile_fill(tile_opacity, true);
+    Legibility { tile: worst(fill, alpha), hint: worst(theme.surface, token::HINT_OPACITY) }
 }
 
 /// The smallest dim (5% steps, at least `dim`) at which both checks pass.
-fn required_dim(pixels: &[Rgb], tile_opacity: f64, tint: Option<(Rgb, f64)>, dim: f64) -> f64 {
+fn required_dim(pixels: &[Rgb], theme: &Theme, tile_opacity: f64, tint: Option<(Rgb, f64)>, dim: f64) -> f64 {
     let mut d = dim;
     while d < 1.0 {
         let shaded: Vec<Rgb> = pixels.iter().map(|&p| over((0.0, 0.0, 0.0), d, tint.map_or(p, |(t, s)| over(t, s, p)))).collect();
-        let l = legibility(&shaded, tile_opacity);
-        if l.tile >= MIN_CONTRAST && l.window >= MIN_CONTRAST {
+        let l = legibility(&shaded, theme, tile_opacity);
+        if l.tile >= MIN_CONTRAST && l.hint >= MIN_CONTRAST {
             return d;
         }
         d = (d + 0.05).min(1.0);
@@ -407,9 +445,9 @@ mod tests {
     #[test]
     fn parses_flags() {
         let s = Settings::from_args(&args("fullscreen --bg gradient:112233,445566 --dim 30 --tint FF0000@10 --tile-opacity 95 --blur 8 --fit contain")).unwrap();
-        assert_eq!(s.source, Source::Gradient(colour::rgb(0x112233), colour::rgb(0x445566)));
+        assert_eq!(s.source, Source::Gradient(rgb(0x112233), rgb(0x445566)));
         assert!((s.dim - 0.3).abs() < 1e-9);
-        assert_eq!(s.tint, Some((colour::rgb(0xFF0000), 0.1)));
+        assert_eq!(s.tint, Some((rgb(0xFF0000), 0.1)));
         assert!((s.tile_opacity - 0.95).abs() < 1e-9);
         assert_eq!((s.blur, s.fit), (8.0, Fit::Contain));
         assert_eq!(Settings::from_args(&args("fullscreen")).unwrap(), Settings::default());
@@ -440,15 +478,38 @@ mod tests {
     }
 
     #[test]
-    fn white_background_needs_dimming_and_dark_one_does_not() {
+    fn white_background_stays_legible_without_dimming() {
+        // With the window fill gone (2026-11-01), only tiles and the hint card carry text.
         let white = vec![(1.0, 1.0, 1.0); 100];
-        let l = legibility(&white, MIN_TILE_OPACITY);
-        assert!(l.tile >= MIN_CONTRAST, "tiles at 88% stay legible even on white");
-        assert!(l.window < MIN_CONTRAST, "the 60% window fill does not");
-        let d = required_dim(&white, MIN_TILE_OPACITY, None, 0.0);
-        assert!(d > 0.0 && d < 1.0);
-        let shaded: Vec<Rgb> = white.iter().map(|&p| over((0.0, 0.0, 0.0), d, p)).collect();
-        assert!(legibility(&shaded, MIN_TILE_OPACITY).window >= MIN_CONTRAST);
-        assert_eq!(required_dim(&vec![(0.1, 0.1, 0.1); 100], MIN_TILE_OPACITY, None, 0.2), 0.2, "keeps the user's dim when it passes");
+        let l = legibility(&white, &Theme::builtin(), MIN_TILE_OPACITY);
+        assert!(l.tile >= MIN_CONTRAST && l.hint >= MIN_CONTRAST);
+        assert_eq!(required_dim(&white, &Theme::builtin(), MIN_TILE_OPACITY, None, 0.0), 0.0);
+        assert_eq!(required_dim(&vec![(0.1, 0.1, 0.1); 100], &Theme::builtin(), MIN_TILE_OPACITY, None, 0.2), 0.2, "keeps the user's dim when it passes");
+    }
+
+    #[test]
+    fn glass_tiles_dim_a_bright_background() {
+        let glass = Theme { glass: Some(tileide_core::theme::Glass::default()), text: rgb(0xF2F2F4), tile: rgb(0x2C2C30), ..Theme::builtin() };
+        let white = vec![(1.0, 1.0, 1.0); 100];
+        assert!(legibility(&white, &glass, MIN_TILE_OPACITY).tile < MIN_CONTRAST, "tile_opacity does not apply to glass");
+        let dim = required_dim(&white, &glass, MIN_TILE_OPACITY, None, 0.0);
+        assert!(dim > 0.0 && dim < 1.0, "{dim}");
+    }
+
+    #[test]
+    fn saturate_keeps_grey_and_spreads_colour() {
+        let s = ImageSurface::create(Format::Rgb24, 2, 1).unwrap();
+        {
+            let cr = Context::new(&s).unwrap();
+            cr.set_source_rgb(0.5, 0.5, 0.5);
+            cr.rectangle(0.0, 0.0, 1.0, 1.0);
+            cr.fill().unwrap();
+            cr.set_source_rgb(0.4, 0.5, 0.6);
+            cr.rectangle(1.0, 0.0, 1.0, 1.0);
+            cr.fill().unwrap();
+        }
+        let p = luminances(&saturate(s, 2.0).unwrap());
+        assert!((p[0].0 - p[0].2).abs() < 0.01, "grey stays grey");
+        assert!(p[1].2 - p[1].0 > 0.25, "blue-grey gets bluer: {:?}", p[1]);
     }
 }

@@ -1,62 +1,52 @@
--- ~/.config/tileide/tileide.lua  (sample config; v0.0 shows it but does not apply it yet)
+-- ~/.config/tileide/tileide.lua
+-- Saved changes apply at once. A mistake shows an error banner and keeps the last
+-- working config. Check it from a shell with: tileide --check-config
 tileide.keys { mod = "ALT" }               -- TileIDE's own modifier; SUPER stays with your WM
 local mod = "ALT"
 
 tileide.appearance {
-  theme         = "dusk",                 -- themes/dusk.lua
-  opacity       = 0.82,
-  blur_hint     = true,                   -- asks compositor; ignored if unsupported
-  window_radius = 22,
-  gap_rail      = 24,                     -- 2a: rail <-> window
-  gap_outer     = 30,                     -- 2b: window <-> screen edge (top, right, bottom)
+  -- theme = "miasma",                    -- themes/<name>.lua. Unset, the theme tray (Alt+T) decides;
+                                          -- set here, it always wins over the tray.
+  window_radius = 14,                     -- tile corners; the frame's corners follow (14 + gaps_out)
+  animations    = true,                   -- tiles glide, workspaces and overlays fade in
 }
 
 tileide.sidebar {
-  start_state   = "collapsed",
-  drawer_fillet = 22,                     -- concave join between rail and drawer
+  start_state     = "collapsed",          -- collapsed | expanded (the Files drawer)
   show_launcher   = true,
   show_workspaces = true,
   show_label      = true,
-  show_clock      = true,                 -- read-only data
-  show_system     = true,                 -- read-only data: network, bluetooth, battery
-  show_files      = true,                 -- drawer sections
-  show_extensions = true,
-  show_themes     = true,
-  show_config     = true,
+  show_clock      = true,
+  show_files      = true,
+  show_themes     = true,                 -- the palette button
+  show_config     = true,                 -- the gear
 }
 
+-- Full-screen only; a windowed TileIDE shows your desktop.
 tileide.background {
-  mode         = "see-through",           -- see-through | desktop | image | gradient | solid
-  source       = "~/Pictures/Backgrounds/dusk.jpg",
-  dim          = 30,                      -- % darkening, protects legibility
-  blur         = 0,                       -- px, app-drawn modes only
-  tile_opacity = 0.92,
+  mode         = "see-through",           -- see-through | image | gradient | solid
+  -- source    = "~/Pictures/wall.jpg",   -- image: a path; solid: "1A1B26"; gradient: "1A1B26,3B4261"
+  dim          = 0,                       -- % darkening
+  blur         = 0,                       -- px
+  tile_opacity = 0.92,                    -- 0.88 .. 1
+  fit          = "cover",                 -- cover | contain | tile
 }
 
-tileide.tiling { layout = "dwindle", gaps_in = 8, gaps_out = 12 }
+tileide.tiling {
+  layout       = "dwindle",               -- dwindle | columns (scrolling, niri-style); Alt+V toggles
+  gaps_in      = 10,
+  gaps_out     = 16,
+  column_width = 0.5,                     -- new columns, as a share of the width
+}
 
--- keybinds: tileide.bind(mods, key, action, arg)
-for i = 1, 9 do
-  tileide.bind(mod,            tostring(i), "workspace", i)
-  tileide.bind(mod .. " SHIFT", tostring(i), "moveto",    i)
-end
-tileide.bind(mod, "B",  "sidebar",   "toggle")
-tileide.bind(mod, "V",  "split",     "vertical")
-tileide.bind(mod, "H",  "focus",     "left")
-tileide.bind(mod, "C",  "workspace", "config")
-tileide.bind(mod, "P",  "palette")
-tileide.bind("",  "F5", "run")
+-- keybinds: tileide.bind(mods, key, action, arg). These replace the built-in key with
+-- the same mods; everything else keeps its default (see the README).
+tileide.bind(mod, "V", "layout", "toggle")
+tileide.bind(mod, "S", "split",  "vertical")   -- the next tile opens below (stacks in columns)
 
--- workspaces
-tileide.workspace(1, { name = "code",  layout = "dwindle" })
-tileide.workspace(2, { name = "notes", folder = "~/notes",
-                       extensions = "markdown-only",
-                       background = "~/Pictures/Backgrounds/paper.jpg" })
+-- workspaces 1..10 (Alt+0 is 10)
+tileide.workspace(1, { name = "code" })
+-- tileide.workspace(2, { name = "notes", folder = "~/notes", layout = "columns", theme = "dune-teal" })
 
--- extension policy, language servers, toolchains
-tileide.extension("tileide.markdown-preview", { mode = "on-demand" })
-tileide.lsp("rust", { cmd = "rust-analyzer" })
-tileide.toolchain("python", { path = "/usr/bin/python3" })   -- discovered automatically; this overrides
-
--- a rice is just another Lua file; require() is limited to the config dir
-require("rices.nord")
+-- a rice is just another Lua file; require() is limited to ~/.config/tileide
+-- require("rices.nord")

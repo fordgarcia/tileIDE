@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Colours only (`themes/theme-design.md`). Every drawing path and stylesheet takes a
+//! `Theme`; nothing else holds colour literals. Themes load from `themes/*.lua`
+//! (`tileide-config`); the built-in one is the fallback when a theme file fails.
+
+/// 0..1 RGB.
+pub type Rgb = (f64, f64, f64);
+
+pub const fn rgb(hex: u32) -> Rgb {
+    (((hex >> 16) & 0xFF) as f64 / 255.0, ((hex >> 8) & 0xFF) as f64 / 255.0, (hex & 0xFF) as f64 / 255.0)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Theme {
+    pub name: String,
+    /// Picks the editor's light or dark syntax scheme.
+    pub dark: bool,
+    /// Frame, rail and drawer.
+    pub surface: Rgb,
+    /// Editor and terminal tiles.
+    pub tile: Rgb,
+    pub text: Rgb,
+    pub muted: Rgb,
+    pub accent: Rgb,
+    /// Text drawn on an accent fill (filled rail buttons).
+    pub on_accent: Rgb,
+    pub error: Rgb,
+    /// The theme tray's strip: surface, a mid (wallpaper) tone, accent.
+    pub strip: [Rgb; 3],
+    /// Translucent "glass" tiles (Black Glass); `None` = solid tiles at `tile_opacity`.
+    pub glass: Option<Glass>,
+}
+
+/// Smoked-glass tiles (`themes/theme-design.md` §4): a diagonal fill from `tile` at
+/// `opacity` to `bottom` at `bottom_opacity`, over a blurred, saturated copy of the
+/// full-screen background.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glass {
+    pub opacity: f64,
+    pub bottom: Rgb,
+    pub bottom_opacity: f64,
+    /// Unfocused border, in the text colour.
+    pub edge_opacity: f64,
+    /// Focused border, in the accent colour.
+    pub focus_opacity: f64,
+    /// Backdrop blur in px (app-drawn full-screen backgrounds only).
+    pub blur: f64,
+    pub saturate: f64,
+    /// Fill opacity floor where TileIDE cannot see what is behind the tiles
+    /// (see-through and windowed), so it cannot dim for legibility.
+    pub min_tint: f64,
+}
+
+impl Glass {
+    /// The design's values (theme-design.md §4).
+    pub const fn default() -> Glass {
+        Glass { opacity: 0.56, bottom: (0.0, 0.0, 0.0), bottom_opacity: 0.66, edge_opacity: 0.24, focus_opacity: 0.60, blur: 30.0, saturate: 1.7, min_tint: 0.80 }
+    }
+}
+
+impl Theme {
+    /// "Dusk", warm since 0.3.0-alpha.3 (design.md §4.3 had a cool teal).
+    pub fn builtin() -> Theme {
+        Theme {
+            name: "Dusk".into(),
+            dark: true,
+            surface: rgb(0x14110F),
+            tile: rgb(0x201B18),
+            text: rgb(0xEDE6DD),
+            muted: rgb(0xA99D90),
+            accent: rgb(0xF0A37A),
+            on_accent: rgb(0x14110F),
+            error: rgb(0xE8735F),
+            strip: [rgb(0x14110F), rgb(0x6B5244), rgb(0xF0A37A)],
+            glass: None,
+        }
+    }
+
+    /// The tile fill's lightest layer (colour, opacity), which legibility checks use.
+    /// `see_behind`: TileIDE draws the background, so it can dim it for legibility.
+    pub fn tile_fill(&self, tile_opacity: f64, see_behind: bool) -> (Rgb, f64) {
+        match self.glass {
+            Some(g) if see_behind => (self.tile, g.opacity),
+            Some(g) => (self.tile, g.opacity.max(g.min_tint)),
+            None => (self.tile, tile_opacity),
+        }
+    }
+
+    /// The terminal's 16 ANSI colours, so prompts, `ls` and `git` output match the theme
+    /// instead of VTE's stock xterm palette. Red is the theme's `error`; the other hues
+    /// are soft and pulled a little toward `accent`; every colour is nudged in lightness
+    /// until it reads on the tile (≥ 4.5:1).
+    pub fn terminal_palette(&self) -> [Rgb; 16] {
+        let (bg, dark) = (self.tile, self.dark);
+        let (normal_l, bright_l) = if dark { (0.68, 0.76) } else { (0.38, 0.30) };
+        let tone = |hue: f64, s: f64, l: f64| legible(over(self.accent, 0.12, from_hsl(hue, s, l)), bg, dark);
+        let (red_h, red_s, red_l) = to_hsl(self.error);
+        // ANSI order after black: red, green, yellow, blue, magenta, cyan.
+        let hues = [red_h, 100.0, 42.0, 215.0, 320.0, 180.0];
+        let mut p = [(0.0, 0.0, 0.0); 16];
+        for (i, hue) in hues.into_iter().enumerate() {
+            p[1 + i] = tone(hue, 0.45, normal_l);
+            p[9 + i] = tone(hue, 0.55, bright_l);
+        }
+        p[1] = legible(self.error, bg, dark);
+        p[9] = legible(from_hsl(red_h, red_s, red_l + if dark { 0.08 } else { -0.08 }), bg, dark);
+        // Black and white keep their usual meaning (darkest, lightest) in both modes.
+        let (ink, paper) = if dark { (self.surface, self.text) } else { (self.text, self.surface) };
+        p[0] = if dark { over(self.text, 0.15, ink) } else { ink };
+        p[7] = over(ink, 0.2, paper);
+        p[8] = legible(self.muted, bg, dark);
+        p[15] = paper;
+        p
+    }
+}
+
+/// Moves `c` away from `bg` in lightness (lighter on dark themes) until it reaches 4.5:1.
+fn legible(c: Rgb, bg: Rgb, dark: bool) -> Rgb {
+    let (h, s, mut l) = to_hsl(c);
+    let mut out = c;
+    while contrast(out, bg) < 4.5 && (0.0..=1.0).contains(&l) {
+        l += if dark { 0.02 } else { -0.02 };
+        out = from_hsl(h, s, l.clamp(0.0, 1.0));
+    }
+    out
+}
+
+/// Hue in degrees, saturation and lightness 0..1.
+fn to_hsl((r, g, b): Rgb) -> (f64, f64, f64) {
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d == 0.0 {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, s, l)
+}
+
+fn from_hsl(h: f64, s: f64, l: f64) -> Rgb {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h.rem_euclid(360.0) / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
+}
+
+/// CSS `rgba()` for GTK stylesheets.
+pub fn css(c: Rgb, alpha: f64) -> String {
+    format!("rgba({}, {}, {}, {alpha})", (c.0 * 255.0).round(), (c.1 * 255.0).round(), (c.2 * 255.0).round())
+}
+
+pub fn luminance((r, g, b): Rgb) -> f64 {
+    let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// WCAG 2 contrast ratio.
+pub fn contrast(a: Rgb, b: Rgb) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `top` at `alpha` over `under`, as cairo blends (in sRGB).
+pub fn over(top: Rgb, alpha: f64, under: Rgb) -> Rgb {
+    let mix = |t: f64, u: f64| t * alpha + u * (1.0 - alpha);
+    (mix(top.0, under.0), mix(top.1, under.1), mix(top.2, under.2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_text_passes_aa() {
+        let t = Theme::builtin();
+        for bg in [t.surface, t.tile] {
+            assert!(contrast(t.text, bg) >= 4.5);
+            assert!(contrast(t.muted, bg) >= 4.5);
+        }
+        assert!(contrast(t.on_accent, t.accent) >= 4.5);
+    }
+
+    #[test]
+    fn terminal_colours_read_on_the_tile() {
+        let light = Theme { dark: false, surface: rgb(0xF2E8D8), tile: rgb(0xFBF5EA), text: rgb(0x2B241C), muted: rgb(0x6E6253), accent: rgb(0x2E6B5E), error: rgb(0xB3402A), ..Theme::builtin() };
+        for t in [Theme::builtin(), light] {
+            let p = t.terminal_palette();
+            for i in (1..=6).chain(8..=14) {
+                assert!(contrast(p[i], t.tile) >= 4.5, "{}: colour {i} is {:.2}:1", t.name, contrast(p[i], t.tile));
+            }
+            assert_eq!(p[1], t.error, "{}: red is the theme's own", t.name);
+            assert!(to_hsl(p[2]).0 > 60.0 && to_hsl(p[2]).0 < 160.0, "{}: green stays green", t.name);
+            assert!(luminance(p[0]) < luminance(p[15]), "{}: black is darker than white", t.name);
+        }
+    }
+
+    #[test]
+    fn hsl_round_trips() {
+        for c in [rgb(0xE8735F), rgb(0x2E6B5E), rgb(0x808080), rgb(0xFFF1E0)] {
+            let (h, s, l) = to_hsl(c);
+            let back = from_hsl(h, s, l);
+            assert!((back.0 - c.0).abs() < 1e-9 && (back.1 - c.1).abs() < 1e-9 && (back.2 - c.2).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn css_rounds_channels() {
+        assert_eq!(css(rgb(0x4FD1D9), 0.5), "rgba(79, 209, 217, 0.5)");
+    }
+}

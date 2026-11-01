@@ -3,29 +3,49 @@
 //! (new file, new folder, refresh, collapse all). Clicking a file opens it in a tile.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
+use tileide_core::theme::{self, Theme};
+use tileide_core::token;
 
-pub const CSS: &str = "
-.drawer { font-family: \"Space Grotesk\"; font-size: 13px; color: #E6E8EC; }
-.drawer .header { padding: 10px 8px 6px 14px; }
-.drawer .title { font-weight: 500; }
-.drawer button { min-width: 26px; min-height: 26px; padding: 0; border: none; box-shadow: none; background: transparent; color: #9AA1AD; }
-.drawer button:hover { background-color: rgba(255, 255, 255, 0.08); color: #E6E8EC; }
-.drawer list, .drawer row, .drawer scrolledwindow { background: transparent; }
-.drawer row { padding: 3px 8px; border-radius: 6px; }
-.drawer row:hover { background-color: rgba(255, 255, 255, 0.05); }
-.drawer row:selected { background-color: rgba(79, 209, 217, 0.18); color: #E6E8EC; }
-.drawer entry { min-height: 24px; font-family: \"Space Grotesk\"; }
-.drawer entry.error { border-color: #E06C75; }
-.peek { background-color: rgba(14, 16, 19, 0.97); border-radius: 12px; border: 1px solid rgba(79, 209, 217, 0.35); }
-.peek .go { padding: 8px 14px; font-weight: 500; color: #4FD1D9; border-radius: 12px 12px 0 0; }
-";
+/// Drawer and peek styles. Hover and selection tints derive from the theme's text and
+/// accent, so they work on light and dark themes alike.
+pub fn css(t: &Theme) -> String {
+    let c = theme::css;
+    format!(
+        "
+.drawer {{ font-family: \"{font}\"; font-size: 13px; color: {text}; }}
+.drawer .header {{ padding: 10px 8px 6px 14px; }}
+.drawer .title {{ font-weight: 500; }}
+.drawer button {{ min-width: 26px; min-height: 26px; padding: 0; border: none; box-shadow: none; background: transparent; color: {muted}; }}
+.drawer button:hover {{ background-color: {hover}; color: {text}; }}
+.drawer list, .drawer row, .drawer scrolledwindow {{ background: transparent; }}
+.drawer row {{ padding: 3px 8px; border-radius: 8px; color: {text}; }}
+.drawer row image {{ color: {muted}; }}
+.drawer row:hover {{ background-color: {row_hover}; }}
+.drawer row:selected {{ background-color: {selected}; color: {text}; }}
+.drawer entry {{ min-height: 24px; font-family: \"{font}\"; }}
+.drawer entry.error {{ border-color: {error}; }}
+.peek {{ background-color: {peek}; border-radius: 12px; border: 1px solid {peek_edge}; }}
+.peek .go {{ padding: 8px 14px; font-weight: 500; color: {accent}; border-radius: 12px 12px 0 0; }}
+",
+        font = token::UI_FONT,
+        text = c(t.text, 1.0),
+        muted = c(t.muted, 1.0),
+        hover = c(t.text, 0.08),
+        row_hover = c(t.text, 0.05),
+        selected = c(t.accent, 0.18),
+        error = c(t.error, 1.0),
+        peek = c(t.surface, 0.97),
+        peek_edge = c(t.accent, 0.35),
+        accent = c(t.accent, 1.0),
+    )
+}
 
 #[derive(Clone, Copy)]
 enum NewKind {
@@ -36,6 +56,8 @@ enum NewKind {
 pub struct FileTree {
     root: PathBuf,
     expanded: HashSet<PathBuf>,
+    /// Expanded folders of roots shown before, restored when one is shown again.
+    remembered: HashMap<PathBuf, HashSet<PathBuf>>,
     selected: Option<PathBuf>,
     /// One path per list row, in order (the inline name entry has no path).
     rows: Vec<PathBuf>,
@@ -62,6 +84,7 @@ impl FileTree {
         let tree = Rc::new(RefCell::new(FileTree {
             root,
             expanded: HashSet::new(),
+            remembered: HashMap::new(),
             selected: None,
             rows: Vec::new(),
             list: list.clone(),
@@ -89,13 +112,15 @@ impl FileTree {
         &self.container
     }
 
-    /// Shows another folder (workspace switch); folds everything and clears the selection.
+    /// Shows another folder (workspace switch). Each root keeps the folders that were
+    /// open the last time it was shown.
     pub fn set_root(&mut self, root: &Path) {
         if root == self.root {
             return;
         }
-        self.root = root.to_path_buf();
-        self.expanded.clear();
+        let expanded = self.remembered.remove(root).unwrap_or_default();
+        let previous = std::mem::replace(&mut self.expanded, expanded);
+        self.remembered.insert(std::mem::replace(&mut self.root, root.to_path_buf()), previous);
         self.selected = None;
         self.title.set_text(&folder_name(root));
         self.rebuild();

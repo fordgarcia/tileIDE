@@ -29,7 +29,7 @@ Tired of switching tiling window managers and customizing configs of IDE per swi
 
 <br>
 
-> **Status: v0.0.0 preview.** A first build to try, not yet a daily editor: the config file isn't applied yet, and language features (completion, debugger) aren't in the UI yet.
+> **Status: v0.2.0.** Tiling editors and terminals (dwindle or niri-style scrolling columns), workspaces, a Files drawer, themes, and a Lua config that applies as you save it. Language features (completion, debugger) aren't in the UI yet. Install details: [docs/install-arch.md](docs/install-arch.md).
 
 ![TileIDE with three tiles](docs/screenshot.png)
 
@@ -64,15 +64,20 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 
 | Keys | Action |
 |---|---|
-| `Alt+Return` / `Alt+E` | new terminal / new file |
-| `Alt+W` / `Ctrl+S` | close tile / save |
+| `Alt+Return` / `Alt+E` | new terminal / open a file in a new tile (search; Enter on an empty search = blank file) |
+| `Alt+F` | open a file in the focused tile (search) |
+| `Alt+W` / `Ctrl+S` | close tile (asks if unsaved) / save |
 | `Alt+H/J/K/L` (+`Shift`) | move focus (resize) |
+| `Alt+Ctrl+Shift+H/J/K/L` | move the tile (column) |
+| `Alt+V` / `Alt+S` | dwindle ⇄ scrolling columns / next tile opens below |
+| `Alt+T` / `Alt+O` | theme tray / workspace overview |
 | `Alt+1…9, 0` | workspaces |
 | `Alt+B` / `Alt+C` | files drawer / config workspace |
-| `Alt+Z` / `Alt+Escape` | word wrap / quit |
+| `Alt+Z` / `Alt+Escape` | word wrap / quit (asks if unsaved) |
 
-Mouse: the top circle opens the files drawer, a workspace dot previews its files, the gear opens the config.
-Config lives in `~/.config/tileide/` (created on first run).
+Mouse: the top circle opens the files drawer, a workspace dot previews its files, the palette opens the theme tray, the gear opens the config.
+
+Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`.
 
 **Known limits:** tested on Hyprland only; on Hyprland, opening another app on TileIDE's workspace takes it out of full-screen.
 

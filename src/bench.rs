@@ -61,7 +61,7 @@ pub fn rss() -> Option<String> {
 
 /// Offscreen frame at 2x scale over a light checkerboard, so translucency and curves are visible.
 pub fn render(args: &[String]) -> Result<(), String> {
-    let usage = "usage: tileide render <out.png> <drawer 0..1> [--overlay] [background flags]";
+    let usage = "usage: tileide render <out.png> <drawer 0..1> [--overlay] [--theme FILE.lua] [background flags]";
     let out = args.first().ok_or(usage)?;
     let open: f64 = args.get(1).and_then(|p| p.parse().ok()).ok_or(usage)?;
     let (w, h, scale) = (1280.0, 720.0, 2.0);
@@ -70,18 +70,27 @@ pub fn render(args: &[String]) -> Result<(), String> {
     cr.scale(scale, scale);
     let settings = crate::background::Settings::from_args(args)?;
     let tile_opacity = settings.tile_opacity;
-    let mut backdrop = crate::background::Background::new(settings);
+    let theme = match args.iter().position(|a| a == "--theme") {
+        Some(i) => tileide_config::load_theme(std::path::Path::new(args.get(i + 1).ok_or(usage)?))?.0,
+        None => tileide_core::theme::Theme::builtin(),
+    };
+    let mut backdrop = crate::background::Background::new(settings, theme.clone());
     if let Some(b) = backdrop.as_mut()
         && let Some(path) = b.image_path()
     {
         b.set_image(crate::background::decode(&path)?)?;
     }
     let background = backdrop.as_mut().and_then(|b| b.surface(w as i32, h as i32, scale).cloned());
+    let frosted = backdrop.as_ref().and_then(|b| b.frosted().cloned());
     let scene = draw::Scene {
         width: w,
         height: h,
+        theme: std::rc::Rc::new(theme),
+        geometry: tileide_core::token::Geometry::default(),
+        modules: draw::Modules::default(),
+        themes_open: false,
         solid: false,
-        drawer: draw::token::DRAWER_WIDTH * open.clamp(0.0, 1.0),
+        drawer: tileide_core::token::DRAWER_WIDTH * open.clamp(0.0, 1.0),
         push: !args.iter().any(|a| a == "--overlay"),
         workspaces: &[1, 2, 3],
         active: Some(2),
@@ -90,6 +99,8 @@ pub fn render(args: &[String]) -> Result<(), String> {
         empty: false,
         placeholder_tiles: true,
         background: background.as_ref(),
+        frosted: frosted.as_ref(),
+        tile_rects: &[],
         tile_opacity,
     };
     cr.push_group();
