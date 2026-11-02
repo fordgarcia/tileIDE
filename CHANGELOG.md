@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.5.0-alpha.3 (2026-11-02): the Wikipedia rice
+
+### Added
+- **A second rice: Wikipedia** (Settings → Layout → Rice, or `tileide.appearance { rice = "wikipedia" }`). A top bar (Files toggle, the workspace's name, a file search that opens `Alt+E`, Settings and All keybinds links, a toggle for the workspace list), **Files on the left** (the drawer, opened when you switch), **workspaces on the right** (a card per workspace with its tile count, New workspace, Themes, Settings, the clock; "hide" folds it away), and **tiles stacked top to bottom**: the focused tile takes the height, the ones above and below peek in (Next-tile peek), `Alt+↑/↓` moves between them. Each tile has a header: a dot, its name (• when unsaved), "2 of 3" and ×. `Alt+V` toggles the stack and dwindle. Switching back to Default restores the rail and each workspace's configured layout.
+- New layout `stack` (`tileide.tiling { layout = "stack" }`, `tileide.bind(…, "layout", "stack")`), usable in the default rice too.
+- **Settings → Alerts → Tile limit reached**: turn off the popup when a new tile is refused (`tileide.alerts { tile_limit = false }`).
+- The **version** at the bottom right of Settings.
+
+### Fixed
+- With animations off, the first workspace still faded in at start.
+
+## 0.5.0-alpha.2 (2026-11-02): borders, welcome, next-tile peek
+
+### Added
+- **Borders** (Settings → Layout, or `tileide.appearance { … }`): **Tile border** width (0–8 px; at 0 the focused tile still shows an accent outline) and colour, and an **Outer border**: a line around the area the tiles sit in (off by default). Colours come from the theme: Subtle, Accent, Text or Muted.
+- **New welcome** on an empty workspace: Welcome, three cards to start from (Open a file `Alt+E`, New terminal `Alt+Return`, Open a folder `Alt+D`; click them or press the keys) in the theme's colours, and "Nothing open yet" with a new picture. Text wraps instead of overlapping.
+- **Next-tile peek** in the columns layout (`Alt+V`): 40 px of the column beside the focused one stays in sight on each side that has one, so you can tell more tiles are there. **Settings → Layout → Next-tile peek** (0 turns it off), or `tileide.tiling { peek = … }`.
+
+### Changed
+- **No size limit on tiles.** Splitting no longer stops when tiles get small (0.4.1 stopped at 160×120 px, about 5 tiles in dwindle); a tiny tile clips its content instead. The only limit is **Most tiles per workspace** (default 16, up to 64).
+
+## 0.5.0-alpha.1 (2026-11-02): typing aids, plainer rail
+
+### Added
+- **Brackets and quotes close themselves** in editors and notebook cells: typing `(`, `[`, `{`, `"` or `'` adds the partner with the cursor between; typing the partner steps over it; Backspace between an empty pair removes both; with text selected, the pair goes around it. Quotes stay plain inside words (`don't`). **Settings → Editor → Close brackets and quotes**, or `tileide.editor { auto_close = false }`.
+- **Notebooks: Backspace in an empty cell deletes it** and goes on at the end of the cell above (the first cell is never deleted this way).
+- **Settings → Sidebar → Pills**: hide the two rounded shapes the rail's buttons sit on (`tileide.sidebar { pills = false }`). With **Icon backgrounds** off too, the rail is plain icons.
+
+### Changed
+- The **matching-bracket highlight is off** by default. **Settings → Editor → Highlight matching brackets** (`tileide.editor { match_brackets = true }`) brings it back.
+
+## 0.4.1 (2026-11-02): fixes
+
+### Fixed
+- **Too many tiles closed the app.** Splitting again and again shrank tiles until a terminal got a negative size and GTK aborted. A new tile that would be smaller than 160×120 px is now refused with a notice, and each workspace holds at most 16 tiles (**Settings → Most tiles per workspace**, or `tileide.tiling { max_tiles = … }`, 1–64).
+- **Notebook outputs ignored the font size.** Outputs, DataFrame tables and rendered Markdown now use the code font and size (`Alt+=` / `Alt+-`, Settings).
+- **Image background: moving the Tiles & terminals sliders blanked the background.** Every slider step decoded the image again and drew see-through until it was done; the decoded image is now kept and only re-baked.
+- **Python projects inside the workspace folder** (e.g. a workspace `pickiso/` with `lab/.venv`): pyright and Ruff now start in the folder of the virtualenv nearest the file, and also find a virtualenv above the workspace folder. Before, pyright ran without the project's packages (false "unknown attribute" errors on pandas, `read_csv(...).to_string()`) and Ruff from the virtualenv wasn't used.
+- A project's virtualenv tools (e.g. its `ruff`) now win over the ones on `PATH`.
+
+## 0.4.0 (2026-11-01): Settings, run and debug, notebooks, Python as a full IDE
+
+The alphas below in one release:
+- **Settings** card (`Alt+,`) with search, locks and Unlock; keybinds card (`Alt+K`); font size keys; motion styles; rail rework; hover peek.
+- **Audio visualizer** in the rail.
+- **Run** (`Alt+R`, output card) and **debugging** (`F5`/`F9`…): Python (debugpy), C/C++ and Cargo (gdb), Java (jdb); Settings → Toolchains; missing-tool alerts with the install command.
+- **Jupyter notebooks** (`.ipynb`): kernels through the user's Jupyter, outputs (text, errors, images, DataFrame tables), rendered Markdown, ↑/↓ between cells, Shift+Enter, runs that keep the page still.
+- **Python as a full IDE**, in files and notebook cells: pyright + Ruff (diagnostics, formatting with `Ctrl+Shift+I`, quick fixes with `Ctrl+.`), Tab completion as in Jupyter (with the kernel's names), signature help, hover with signatures, rename (`F2`), references (`Shift+F12`).
+- **Sidebar and Tiles & terminals transparency + blur** (Settings → Themes & background).
+- Fixes: closing a tile returns focus to the tile it was split from; language servers found when TileIDE starts from the desktop launcher.
+
+Known limits: JavaScript debugging and launch configs are planned for v0.6; more Python/notebook work (command mode, kernel picker, test runner, variable view) for v0.5.
+
 ## 0.4.0-alpha.10 (2026-11-01): Tab completion, as in Jupyter
 
 ### Changed

@@ -20,6 +20,7 @@ use tileide_config::model::{Tiling, Workspace};
 use tileide_core::layout::LayoutKind;
 use tileide_core::theme::Theme;
 use tileide_core::tiles::Rect;
+use tileide_core::token::Rice;
 
 use crate::tile_view::{Kind, TileView};
 
@@ -89,6 +90,8 @@ pub struct Workspaces {
     on_switch: Option<OnSwitch>,
     /// Alt+Z, shared by every editor in every workspace.
     wrap: bool,
+    /// `appearance.rice`: the Wikipedia rice stacks every workspace's tiles.
+    rice: Rice,
 }
 
 /// `~/x` → `$HOME/x`.
@@ -122,6 +125,7 @@ impl Workspaces {
             on_change,
             on_switch: None,
             wrap: false,
+            rice: Rice::Default,
         };
         w.go(1);
         w
@@ -161,10 +165,14 @@ impl Workspaces {
             let mut view = view.borrow_mut();
             view.set_gap(self.gap);
             view.set_column_width(tiling.column_width);
+            view.set_max_tiles(tiling.max_tiles);
+            view.set_peek(tiling.peek);
             view.set_folder(self.folder(Active::Number(n)));
         }
         if let Some(view) = &self.config {
             view.borrow_mut().set_gap(self.gap);
+            view.borrow_mut().set_max_tiles(tiling.max_tiles);
+            view.borrow_mut().set_peek(tiling.peek);
         }
         self.tiling = tiling;
         self.notify_switch();
@@ -312,10 +320,43 @@ impl Workspaces {
         self.numbered.keys().map(|&n| Active::Number(n)).chain(self.config.iter().map(|_| Active::Config)).filter_map(|w| self.folder(w)).collect()
     }
 
+    /// The layout workspace `n` (`None` = Config) starts with in the current rice.
+    fn layout_for(&self, n: Option<u8>) -> LayoutKind {
+        match (self.rice, n) {
+            (Rice::Wikipedia, _) => LayoutKind::Stack,
+            (Rice::Default, Some(n)) => self.settings.get(&n).and_then(|w| w.layout).unwrap_or(self.tiling.layout),
+            (Rice::Default, None) => LayoutKind::Dwindle,
+        }
+    }
+
+    fn apply_rice(&self, view: &Rc<RefCell<TileView>>, n: Option<u8>) {
+        let wiki = self.rice == Rice::Wikipedia;
+        let scrolling = if wiki { LayoutKind::Stack } else { LayoutKind::Columns };
+        view.borrow_mut().set_rice(scrolling, self.layout_for(n), wiki);
+    }
+
+    /// Switching rice puts every workspace in that rice's layout (the stack, or back to
+    /// the configured one).
+    pub fn set_rice(&mut self, rice: Rice) {
+        if rice == self.rice {
+            return;
+        }
+        self.rice = rice;
+        for (&n, view) in &self.numbered {
+            self.apply_rice(view, Some(n));
+        }
+        if let Some(view) = &self.config {
+            self.apply_rice(view, None);
+        }
+        (self.on_change)();
+    }
+
     fn new_view(&self, layout: LayoutKind, folder: Option<PathBuf>) -> Rc<RefCell<TileView>> {
         let view = TileView::new(layout, self.tiling.column_width, self.gap, self.theme.clone(), folder, self.on_change.clone());
         view.borrow_mut().set_area(self.area, self.stage);
         view.borrow_mut().set_wrap(self.wrap);
+        view.borrow_mut().set_max_tiles(self.tiling.max_tiles);
+        view.borrow_mut().set_peek(self.tiling.peek);
         self.overlay.add_overlay(view.borrow().widget());
         view
     }
@@ -326,8 +367,8 @@ impl Workspaces {
             return;
         }
         if !self.numbered.contains_key(&n) {
-            let layout = self.settings.get(&n).and_then(|w| w.layout).unwrap_or(self.tiling.layout);
-            let view = self.new_view(layout, self.folder(Active::Number(n)));
+            let view = self.new_view(self.layout_for(Some(n)), self.folder(Active::Number(n)));
+            self.apply_rice(&view, Some(n));
             self.numbered.insert(n, view);
             self.fresh = self.folder(Active::Number(n)).is_none();
         }
@@ -349,7 +390,8 @@ impl Workspaces {
             return;
         }
         if self.config.is_none() {
-            let view = self.new_view(LayoutKind::Dwindle, Some(self.config_dir()));
+            let view = self.new_view(self.layout_for(None), Some(self.config_dir()));
+            self.apply_rice(&view, None);
             view.borrow_mut().add(Kind::Editor(Some(&self.config_path)));
             self.config = Some(view);
         }

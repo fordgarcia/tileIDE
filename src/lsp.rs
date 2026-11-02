@@ -185,6 +185,8 @@ pub fn cells_changed(any_cell: &sourceview5::Buffer) {
 fn attach_doc(buffer: &sourceview5::Buffer, view: &sourceview5::View, path: PathBuf, root: Option<&Path>, goto: Goto, cells: Option<Rc<Cells>>) {
     detach(buffer);
     let (Some(root), Some((spec, language))) = (root, servers::for_file(&path)) else { return };
+    let project = (spec.name == "python").then(|| tileide_core::python::project_root(&path, root)).flatten();
+    let root = project.as_deref().unwrap_or(root);
     let Some(servers) = HUB.with_borrow_mut(|hub| {
         let main = start(hub, root, spec)?;
         Some(std::iter::once(main).chain(servers::linters_for(&path).into_iter().filter_map(|l| start(hub, root, l))).collect::<Vec<usize>>())
@@ -653,10 +655,12 @@ fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
         return None;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let venvs = tileide_core::python::venvs(root, Some(root), std::env::var_os("VIRTUAL_ENV").map(PathBuf::from).as_deref(), home.as_deref());
+    // From the server's root up to home: a workspace folder can sit inside the project
+    // whose virtualenv is above it.
+    let venvs = tileide_core::python::venvs(root, None, std::env::var_os("VIRTUAL_ENV").map(PathBuf::from).as_deref(), home.as_deref());
     let venv_bins: Vec<PathBuf> = venvs.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
-    let extra = servers::user_dirs(&venv_bins, home.as_deref());
-    let Some(cmd) = servers::command(spec, setting.and_then(|s| s.cmd.as_deref()), |p| servers::locate(p, &extra)) else {
+    let extra = servers::user_dirs(home.as_deref());
+    let Some(cmd) = servers::command(spec, setting.and_then(|s| s.cmd.as_deref()), |p| servers::locate(p, &venv_bins, &extra)) else {
         hub.failed.insert(key);
         crate::alerts::missing(format!("No {} language server found. To get one: {}.", spec.label, spec.install));
         return None;
@@ -668,6 +672,7 @@ fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
     };
     let id = hub.servers.len();
     let deliver = move |message: Incoming| glib::MainContext::default().invoke(move || receive(id, message));
+    println!("lsp: starting {} for {}", cmd.join(" "), root.display());
     let mut conn = match Connection::spawn(&cmd, root, settings, deliver) {
         Ok(conn) => conn,
         Err(e) => {
@@ -1080,6 +1085,11 @@ fn mark_line(mark: &sourceview5::Mark) -> i32 {
 }
 
 /// Every diagnostic on `line`, for the gutter icon's tooltip.
+/// Every diagnostic on `buffer`, as `line: message` (headless checks).
+pub fn all_messages(buffer: &sourceview5::Buffer) -> Vec<String> {
+    with_doc(buffer, |d| d.diagnostics.values().flatten().map(|x| format!("{}: {}", x.range.start.line + 1, describe(x))).collect()).unwrap_or_default()
+}
+
 fn line_messages(buffer: &sourceview5::Buffer, line: i32) -> Option<String> {
     let list = with_doc(buffer, |d| d.diagnostics.values().flatten().filter(|x| x.range.start.line as i32 <= line && line <= x.range.end.line as i32).map(describe).collect::<Vec<_>>())?;
     (!list.is_empty()).then(|| list.join("\n"))

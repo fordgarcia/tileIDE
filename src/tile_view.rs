@@ -18,7 +18,7 @@ use crate::{lsp, motion};
 use tileide_core::layout::{Layout, LayoutKind};
 use tileide_core::theme::{self, Theme};
 use tileide_core::tiles::{Axis, Direction, Rect, TileId};
-use tileide_core::token::Geometry;
+use tileide_core::token::{self, Geometry};
 use tileide_lsp::protocol::Position;
 use tileide_lsp::text::Encoding;
 use vte4::prelude::*;
@@ -33,6 +33,8 @@ pub enum Kind<'a> {
 
 struct Tile {
     frame: gtk::Box,
+    /// The Wikipedia rice's header: a dot, the name, "2 of 3" and ×.
+    head: Head,
     /// What receives keyboard focus (the text view or the terminal).
     input: gtk::Widget,
     /// Editors only.
@@ -40,6 +42,38 @@ struct Tile {
     path: Option<PathBuf>,
     /// `.ipynb` files open as notebooks.
     notebook: Option<Rc<crate::notebook_view::NotebookView>>,
+}
+
+struct Head {
+    root: gtk::Box,
+    name: gtk::Label,
+    position: gtk::Label,
+}
+
+impl Head {
+    fn new(on_close: impl Fn() + 'static) -> Head {
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        root.add_css_class("tile-head");
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("dot");
+        dot.set_valign(gtk::Align::Center);
+        let name = gtk::Label::new(None);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        name.set_hexpand(true);
+        name.set_xalign(0.0);
+        let position = gtk::Label::new(None);
+        position.add_css_class("position");
+        let close = gtk::Button::with_label("×");
+        close.add_css_class("flat");
+        close.set_tooltip_text(Some("Close (Alt+W)"));
+        close.connect_clicked(move |_| on_close());
+        root.append(&dot);
+        root.append(&name);
+        root.append(&position);
+        root.append(&close);
+        root.set_visible(false);
+        Head { root, name, position }
+    }
 }
 
 /// Tiles glide from where they are shown to where the layout puts them: opening,
@@ -61,6 +95,70 @@ struct Glide {
 
 fn tracing() -> bool {
     std::env::var_os("TILEIDE_TRACE_GLIDE").is_some()
+}
+
+/// A tile frame's layout manager: children stack from the top at their natural height
+/// (the header), and the last one (the content) gets the rest, but never less than
+/// `token::MIN_TILE`. A tile may shrink to a sliver (no limit on splits); the frame
+/// clips what doesn't fit. Without the floor a terminal in a tiny tile gets a negative
+/// size and GTK aborts.
+mod floor {
+    use gtk::subclass::prelude::*;
+    use gtk::{glib, prelude::*};
+    use gtk4 as gtk;
+    use tileide_core::token::MIN_TILE;
+
+    #[derive(Default)]
+    pub struct Imp;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Imp {
+        const NAME: &'static str = "TileideFloorLayout";
+        type Type = FloorLayout;
+        type ParentType = gtk::LayoutManager;
+    }
+
+    impl ObjectImpl for Imp {}
+
+    impl LayoutManagerImpl for Imp {
+        fn request_mode(&self, _: &gtk::Widget) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::ConstantSize
+        }
+
+        fn measure(&self, _: &gtk::Widget, _: gtk::Orientation, _: i32) -> (i32, i32, i32, i32) {
+            (0, 0, -1, -1)
+        }
+
+        fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _: i32) {
+            let width = width.max(MIN_TILE.0 as i32);
+            let mut y = 0;
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                if !c.should_layout() {
+                    continue;
+                }
+                let _ = c.measure(gtk::Orientation::Horizontal, -1);
+                if child.is_some() {
+                    let (_, natural, _, _) = c.measure(gtk::Orientation::Vertical, width);
+                    c.size_allocate(&gtk::Allocation::new(0, y, width, natural), -1);
+                    y += natural;
+                } else {
+                    c.size_allocate(&gtk::Allocation::new(0, y, width, (height - y).max(MIN_TILE.1 as i32)), -1);
+                }
+            }
+        }
+    }
+
+    glib::wrapper! {
+        pub struct FloorLayout(ObjectSubclass<Imp>) @extends gtk::LayoutManager;
+    }
+
+    impl FloorLayout {
+        pub fn new() -> FloorLayout {
+            glib::Object::new()
+        }
+    }
 }
 
 /// A layout manager that gives each child exactly the rect stored for its widget name
@@ -151,16 +249,40 @@ pub struct TileView {
     folder: Option<PathBuf>,
     /// Called when tiles appear or disappear, so the canvas can redraw its empty hint.
     on_change: Rc<dyn Fn()>,
+    /// `tiling.max_tiles`.
+    max_tiles: usize,
+    /// What `Alt+V` toggles to from dwindle: columns, or the Wikipedia rice's stack.
+    scrolling: LayoutKind,
+    /// Tiles show a header (Wikipedia rice).
+    heads: bool,
+}
+
+/// Shows a message on the app's banner.
+type Notice = Rc<dyn Fn(String)>;
+
+thread_local! {
+    static NOTICE: RefCell<Option<Notice>> = const { RefCell::new(None) };
+    /// `alerts.tile_limit`: the refusal pops up on the banner.
+    static LIMIT_ALERT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub fn set_limit_alert(on: bool) {
+    LIMIT_ALERT.set(on);
+}
+
+pub fn set_notice(notice: Notice) {
+    NOTICE.set(Some(notice));
 }
 
 /// `tile_opacity`: the tile fill's opacity (Settings → Themes & background → Tiles &
-/// terminals; terminals are transparent on it). Focused tile: a plain 2px accent border
-/// (no glow). The tile layer is clipped to the frame's rounded hole, so columns
+/// terminals; terminals are transparent on it). Border: `appearance.tile_border` (width,
+/// colour); the focused tile's is the accent, no glow. The tile layer is clipped to the frame's rounded hole, so columns
 /// scrolled past an edge slide under the frame's curve. Glass themes: a diagonal fill
 /// (its darker end follows the opacity), a 1px top highlight, and the blurred backdrop
 /// the canvas paints under each tile (`draw::Scene::frosted`).
 pub fn css(t: &Theme, g: Geometry, tile_opacity: f64) -> String {
-    let (fill, edge, focus) = match t.glass {
+    let (edge_rgb, edge_alpha) = g.tile_edge.paint(t);
+    let (fill, focus) = match t.glass {
         Some(glass) => {
             let bottom = (tile_opacity + glass.bottom_opacity - glass.opacity).clamp(0.0, 1.0);
             (
@@ -170,21 +292,33 @@ pub fn css(t: &Theme, g: Geometry, tile_opacity: f64) -> String {
                     theme::css(glass.bottom, bottom),
                     theme::css(t.text, 0.12),
                 ),
-                theme::css(t.text, glass.edge_opacity),
                 theme::css(t.accent, glass.focus_opacity),
             )
         }
-        None => (format!("background-color: {};", theme::css(t.tile, tile_opacity)), theme::css(t.text, 0.08), theme::css(t.accent, 1.0)),
+        None => (format!("background-color: {};", theme::css(t.tile, tile_opacity)), theme::css(t.accent, 1.0)),
     };
+    // Without a border the focused tile still shows: an outline inside its edge, which
+    // (unlike a border) doesn't move the content.
+    let focus_rule = if g.tile_border > 0.0 { format!("border-color: {focus};") } else { format!("outline: 2px solid {focus}; outline-offset: -2px;") };
     format!(
         ".tiles {{ border-radius: {stage_radius}px; }}
-.tile {{ {fill} color: {text}; border-radius: {radius}px; border: 2px solid {edge}; }}
-.tile.focused {{ border-color: {focus}; }}
+.tile {{ {fill} color: {text}; border-radius: {radius}px; border: {border}px solid {edge}; }}
+.tile.focused {{ {focus_rule} }}
 .tile textview, .tile textview text, .tile scrolledwindow, .tile vte-terminal, .tile textview border, .tile textview gutter, .tile textview gutterrenderer {{ background-color: transparent; background-image: none; }}
 .tile textview text {{ color: {text}; }}
-.tile vte-terminal {{ padding: 18px 24px; }}",
+.tile vte-terminal {{ padding: 18px 24px; }}
+.tile-head {{ padding: 8px 10px 8px 16px; border-bottom: 1px solid {head_edge}; font-size: 13px; }}
+.tile-head .dot {{ min-width: 8px; min-height: 8px; border-radius: 4px; background-color: {muted}; }}
+.tile.focused .tile-head .dot {{ background-color: {accent}; }}
+.tile-head .position {{ color: {muted}; font-size: 11px; }}
+.tile-head button {{ min-height: 20px; min-width: 20px; padding: 0 6px; color: {muted}; }}",
         text = theme::css(t.text, 1.0),
         radius = g.tile_radius,
+        border = g.tile_border,
+        head_edge = theme::css(t.text, 0.08),
+        muted = theme::css(t.muted, 1.0),
+        accent = theme::css(t.accent, 1.0),
+        edge = theme::css(edge_rgb, edge_alpha),
         stage_radius = g.frame_radius(),
     )
 }
@@ -214,6 +348,9 @@ impl TileView {
             theme,
             folder,
             on_change,
+            max_tiles: token::MAX_TILES as usize,
+            scrolling: LayoutKind::Columns,
+            heads: false,
         }));
         view.borrow_mut().me = Rc::downgrade(&view);
         view
@@ -254,6 +391,16 @@ impl TileView {
     pub fn set_gap(&mut self, gap: f64) {
         if gap != self.gap {
             self.gap = gap;
+            self.relayout();
+        }
+    }
+
+    pub fn set_max_tiles(&mut self, max: u32) {
+        self.max_tiles = max.max(1) as usize;
+    }
+
+    pub fn set_peek(&mut self, peek: f64) {
+        if self.layout.set_peek(peek, self.area, self.gap) {
             self.relayout();
         }
     }
@@ -371,6 +518,13 @@ impl TileView {
         self.theme = theme;
     }
 
+    /// Why a new tile can't open: the workspace holds `tiling.max_tiles` already. Size
+    /// is no limit: tiles may get tiny (`floor` keeps their content safe).
+    fn refusal(&self) -> Option<String> {
+        (self.tiles.len() >= self.max_tiles)
+            .then(|| format!("This workspace has {} tiles, the most allowed (Settings → Most tiles per workspace). Close one first.", self.max_tiles))
+    }
+
     /// Opens a tile next to the focused one: a new column in the columns layout, a
     /// split in dwindle (see `split_next` for the direction).
     pub fn add(&mut self, kind: Kind) {
@@ -382,6 +536,14 @@ impl TileView {
             self.layout.focus(id, self.area, self.gap);
             self.relayout();
             self.apply_focus(true);
+            return;
+        }
+        if let Some(refusal) = self.refusal() {
+            if LIMIT_ALERT.get() {
+                NOTICE.with_borrow(|notice| notice.as_ref().map(|n| n(refusal)));
+            } else {
+                println!("tiles: {refusal}");
+            }
             return;
         }
         // The new tile grows out of the one it splits from.
@@ -436,6 +598,19 @@ impl TileView {
         frame.set_widget_name(&format!("tile-{id}"));
         frame.add_css_class("tile");
         frame.set_overflow(gtk::Overflow::Hidden);
+        frame.set_layout_manager(Some(floor::FloorLayout::new()));
+        let me = self.me.clone();
+        let head = Head::new(move || {
+            let Some(view) = me.upgrade() else { return };
+            let Ok(mut view) = view.try_borrow_mut() else { return };
+            let (area, gap) = (view.area, view.gap);
+            view.layout.focus(id, area, gap);
+            if let Some(window) = view.container.root().and_downcast::<gtk::Window>() {
+                view.close_focused(&window);
+            }
+        });
+        head.root.set_visible(self.heads);
+        frame.append(&head.root);
         content.set_hexpand(true);
         content.set_vexpand(true);
         frame.append(&content);
@@ -458,7 +633,7 @@ impl TileView {
 
         self.container.append(&frame);
         motion::fade_in(&frame);
-        self.tiles.insert(id, Tile { frame, input, buffer, path, notebook });
+        self.tiles.insert(id, Tile { frame, head, input, buffer, path, notebook });
         // The language server (a process start and the whole file sent) waits until the
         // tile has settled, so it never costs a frame of the opening glide.
         let me = self.me.clone();
@@ -486,11 +661,45 @@ impl TileView {
         self.layout.pending_axis = Some(axis);
     }
 
-    /// `None` toggles between dwindle and columns.
+    /// The rice: what `Alt+V` toggles to, the layout to use now, and tile headers.
+    pub fn set_rice(&mut self, scrolling: LayoutKind, layout: LayoutKind, heads: bool) {
+        self.scrolling = scrolling;
+        self.heads = heads;
+        for tile in self.tiles.values() {
+            tile.head.root.set_visible(heads);
+        }
+        if layout != self.layout.kind() {
+            self.layout.set_kind(layout, self.area, self.gap);
+            self.relayout();
+        }
+        self.apply_focus(false);
+    }
+
+    /// Each header's name and "n of m", in reading order.
+    fn refresh_heads(&self) {
+        if !self.heads {
+            return;
+        }
+        let order = self.layout.ids();
+        for (i, id) in order.iter().enumerate() {
+            let Some(tile) = self.tiles.get(id) else { continue };
+            let name = match (&tile.path, &tile.notebook) {
+                (Some(path), _) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+                (None, _) if tile.input.is::<vte4::Terminal>() => "Terminal".to_string(),
+                (None, _) if tile.buffer.is_some() => "Untitled".to_string(),
+                _ => "Panel".to_string(),
+            };
+            let dirty = tile.buffer.as_ref().is_some_and(|b| b.is_modified());
+            tile.head.name.set_text(&if dirty { format!("{name} •") } else { name });
+            tile.head.position.set_text(&format!("{} of {}", i + 1, order.len()));
+        }
+    }
+
+    /// `None` toggles between dwindle and the rice's scrolling layout.
     pub fn set_layout(&mut self, kind: Option<LayoutKind>) {
         match kind {
             Some(kind) => self.layout.set_kind(kind, self.area, self.gap),
-            None => self.layout.toggle_kind(self.area, self.gap),
+            None => self.layout.toggle_kind(self.area, self.gap, self.scrolling),
         }
         self.relayout();
         self.apply_focus(true);
@@ -794,6 +1003,19 @@ impl TileView {
         self.place();
     }
 
+    /// Headless checks: the code region and every tile's target rect, focused marked.
+    pub fn describe(&self) -> String {
+        let focused = self.layout.focused();
+        let a = self.area;
+        let tiles: Vec<String> = self
+            .layout
+            .layout(a, self.gap, self.layout.scroll())
+            .into_iter()
+            .map(|(id, r)| format!("{}{id} x {:.0}..{:.0}", if Some(id) == focused { "*" } else { "" }, r.x - a.x, r.x + r.w - a.x))
+            .collect();
+        format!("area w {:.0}: {}", a.w, tiles.join(", "))
+    }
+
     /// Where the shown tiles are, in window coordinates (for the glass backdrop).
     pub fn tile_rects(&self) -> Vec<Rect> {
         let stage = self.stage;
@@ -831,6 +1053,7 @@ impl TileView {
     }
 
     fn apply_focus(&self, grab: bool) {
+        self.refresh_heads();
         let focused = self.layout.focused();
         for (id, tile) in &self.tiles {
             if Some(*id) == focused {
@@ -987,6 +1210,7 @@ fn editor(path: Option<&Path>, wrap: bool, theme: &Theme) -> (gtk::Widget, gtk::
     view.set_left_margin(8);
     view.set_top_margin(8);
     view.set_wrap_mode(wrap_mode(wrap));
+    crate::editing::attach(&view);
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_child(Some(&view));

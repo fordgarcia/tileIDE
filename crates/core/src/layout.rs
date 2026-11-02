@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One workspace's layout: dwindle (`TileTree`) or scrolling columns (`Columns`).
+//! One workspace's layout: dwindle (`TileTree`), scrolling columns (`Columns`), or a
+//! vertical stack (the Wikipedia rice: `Columns` turned on its side, so tiles scroll
+//! up and down with the next one peeking in).
 //! Tile ids are allocated here, so switching between the two keeps every tile.
 
 use crate::columns::Columns;
@@ -9,13 +11,34 @@ use crate::tiles::{Axis, Direction, Rect, TileId, TileTree};
 pub enum LayoutKind {
     Dwindle,
     Columns,
+    Stack,
 }
 
 #[derive(Debug)]
 enum Inner {
     Dwindle(TileTree),
     Columns(Columns),
+    /// Columns in transposed coordinates (x ↔ y): each "column" is a full-width row.
+    Stack(Columns),
 }
+
+/// x ↔ y: the stack runs `Columns` in this space.
+fn t(r: Rect) -> Rect {
+    Rect { x: r.y, y: r.x, w: r.h, h: r.w }
+}
+
+/// Up/down in the stack are left/right for its `Columns`.
+fn td(d: Direction) -> Direction {
+    match d {
+        Direction::Left => Direction::Up,
+        Direction::Right => Direction::Down,
+        Direction::Up => Direction::Left,
+        Direction::Down => Direction::Right,
+    }
+}
+
+/// A stack row fills the region's height (minus the peeks).
+const STACK_ROW: f64 = 1.0;
 
 #[derive(Debug)]
 pub struct Layout {
@@ -25,6 +48,8 @@ pub struct Layout {
     column_width: f64,
     /// Set by `split`: the axis the next new tile uses (`Column` stacks in columns).
     pub pending_axis: Option<Axis>,
+    /// See `Columns::peek`.
+    peek: f64,
 }
 
 /// Keyboard resize step: a fraction of the parent split (dwindle) or of the region (columns).
@@ -35,14 +60,16 @@ impl Layout {
         let inner = match kind {
             LayoutKind::Dwindle => Inner::Dwindle(TileTree::default()),
             LayoutKind::Columns => Inner::Columns(Columns::default()),
+            LayoutKind::Stack => Inner::Stack(Columns::default()),
         };
-        Layout { inner, next_id: 0, column_width, pending_axis: None }
+        Layout { inner, next_id: 0, column_width, pending_axis: None, peek: 0.0 }
     }
 
     pub fn kind(&self) -> LayoutKind {
         match self.inner {
             Inner::Dwindle(_) => LayoutKind::Dwindle,
             Inner::Columns(_) => LayoutKind::Columns,
+            Inner::Stack(_) => LayoutKind::Stack,
         }
     }
 
@@ -50,10 +77,30 @@ impl Layout {
         self.column_width = width;
     }
 
+    /// `tiling.peek`: how much of the next column shows (columns layout). False if unchanged.
+    pub fn set_peek(&mut self, peek: f64, area: Rect, gap: f64) -> bool {
+        if peek == self.peek {
+            return false;
+        }
+        self.peek = peek;
+        match &mut self.inner {
+            Inner::Columns(c) => {
+                c.peek = peek;
+                c.ensure_visible(area, gap);
+            }
+            Inner::Stack(c) => {
+                c.peek = peek;
+                c.ensure_visible(t(area), gap);
+            }
+            Inner::Dwindle(_) => {}
+        }
+        true
+    }
+
     pub fn focused(&self) -> Option<TileId> {
         match &self.inner {
             Inner::Dwindle(t) => t.focused(),
-            Inner::Columns(c) => c.focused(),
+            Inner::Columns(c) | Inner::Stack(c) => c.focused(),
         }
     }
 
@@ -64,13 +111,25 @@ impl Layout {
                 c.focus(id);
                 c.ensure_visible(area, gap);
             }
+            Inner::Stack(c) => {
+                c.focus(id);
+                c.ensure_visible(t(area), gap);
+            }
+        }
+    }
+
+    /// Tiles in reading order.
+    pub fn ids(&self) -> Vec<TileId> {
+        match &self.inner {
+            Inner::Dwindle(t) => t.ids(),
+            Inner::Columns(c) | Inner::Stack(c) => c.ids(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match &self.inner {
             Inner::Dwindle(t) => t.is_empty(),
-            Inner::Columns(c) => c.is_empty(),
+            Inner::Columns(c) | Inner::Stack(c) => c.is_empty(),
         }
     }
 
@@ -78,14 +137,16 @@ impl Layout {
     pub fn scroll(&self) -> f64 {
         match &self.inner {
             Inner::Dwindle(_) => 0.0,
-            Inner::Columns(c) => c.scroll(),
+            Inner::Columns(c) | Inner::Stack(c) => c.scroll(),
         }
     }
 
     /// After the code region changed size: keeps the focused column in sight.
     pub fn fit(&mut self, area: Rect, gap: f64) {
-        if let Inner::Columns(c) = &mut self.inner {
-            c.ensure_visible(area, gap);
+        match &mut self.inner {
+            Inner::Columns(c) => c.ensure_visible(area, gap),
+            Inner::Stack(c) => c.ensure_visible(t(area), gap),
+            Inner::Dwindle(_) => {}
         }
     }
 
@@ -103,6 +164,11 @@ impl Layout {
                 c.insert(id, axis == Some(Axis::Column), self.column_width);
                 c.ensure_visible(area, gap);
             }
+            // A split stacks side by side within the row (`Row` = beside, transposed).
+            Inner::Stack(c) => {
+                c.insert(id, axis == Some(Axis::Row), STACK_ROW);
+                c.ensure_visible(t(area), gap);
+            }
         }
         id
     }
@@ -115,6 +181,11 @@ impl Layout {
                 c.ensure_visible(area, gap);
                 closed
             }
+            Inner::Stack(c) => {
+                let closed = c.close(id);
+                c.ensure_visible(t(area), gap);
+                closed
+            }
         }
     }
 
@@ -123,6 +194,7 @@ impl Layout {
         match &self.inner {
             Inner::Dwindle(t) => t.layout(area, gap),
             Inner::Columns(c) => c.layout(area, gap, scroll),
+            Inner::Stack(c) => c.layout(t(area), gap, scroll).into_iter().map(|(id, r)| (id, t(r))).collect(),
         }
     }
 
@@ -132,6 +204,10 @@ impl Layout {
             Inner::Columns(c) => {
                 c.focus_direction(direction);
                 c.ensure_visible(area, gap);
+            }
+            Inner::Stack(c) => {
+                c.focus_direction(td(direction));
+                c.ensure_visible(t(area), gap);
             }
         }
     }
@@ -143,6 +219,10 @@ impl Layout {
                 c.resize_focused(direction, RESIZE_STEP * 2.0);
                 c.ensure_visible(area, gap);
             }
+            Inner::Stack(c) => {
+                c.resize_focused(td(direction), RESIZE_STEP * 2.0);
+                c.ensure_visible(t(area), gap);
+            }
         }
     }
 
@@ -152,6 +232,10 @@ impl Layout {
             Inner::Columns(c) => {
                 c.move_focused(direction);
                 c.ensure_visible(area, gap);
+            }
+            Inner::Stack(c) => {
+                c.move_focused(td(direction));
+                c.ensure_visible(t(area), gap);
             }
         }
     }
@@ -164,23 +248,32 @@ impl Layout {
         }
         let ids = match &self.inner {
             Inner::Dwindle(t) => t.ids(),
-            Inner::Columns(c) => c.ids(),
+            Inner::Columns(c) | Inner::Stack(c) => c.ids(),
         };
         let focused = self.focused();
         self.inner = match kind {
             LayoutKind::Dwindle => Inner::Dwindle(TileTree::from_ids(&ids, focused, area, gap)),
             LayoutKind::Columns => {
                 let mut c = Columns::from_ids(&ids, focused, self.column_width);
+                c.peek = self.peek;
                 c.ensure_visible(area, gap);
                 Inner::Columns(c)
+            }
+            LayoutKind::Stack => {
+                let mut c = Columns::from_ids(&ids, focused, STACK_ROW);
+                c.peek = self.peek;
+                c.ensure_visible(t(area), gap);
+                Inner::Stack(c)
             }
         };
     }
 
-    pub fn toggle_kind(&mut self, area: Rect, gap: f64) {
+    /// `Alt+V`: dwindle ⇄ the rice's scrolling layout (`Columns`, or `Stack` in the
+    /// Wikipedia rice).
+    pub fn toggle_kind(&mut self, area: Rect, gap: f64, scrolling: LayoutKind) {
         let next = match self.kind() {
-            LayoutKind::Dwindle => LayoutKind::Columns,
-            LayoutKind::Columns => LayoutKind::Dwindle,
+            LayoutKind::Dwindle => scrolling,
+            LayoutKind::Columns | LayoutKind::Stack => LayoutKind::Dwindle,
         };
         self.set_kind(next, area, gap);
     }
@@ -193,16 +286,35 @@ mod tests {
     const AREA: Rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
 
     #[test]
+    fn the_stack_runs_down_with_the_next_tile_peeking_in() {
+        let mut l = Layout::new(LayoutKind::Stack, 0.5);
+        l.set_peek(40.0, AREA, 10.0);
+        let ids: Vec<_> = (0..3).map(|_| l.add(AREA, 10.0)).collect();
+        l.focus(ids[1], AREA, 10.0);
+        let rects = l.layout(AREA, 10.0, l.scroll());
+        let r = |id| rects.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(r(ids[1]).w, AREA.w, "rows are full width");
+        assert!(r(ids[1]).y >= 50.0 - 1e-6 && r(ids[1]).y + r(ids[1]).h <= 550.0 + 1e-6, "{:?}", r(ids[1]));
+        assert!(r(ids[0]).y + r(ids[0]).h >= 40.0 - 1e-6 && r(ids[2]).y <= 560.0 + 1e-6, "both neighbours peek in");
+        l.focus_direction(Direction::Down, AREA, 10.0);
+        assert_eq!(l.focused(), Some(ids[2]));
+        l.toggle_kind(AREA, 10.0, LayoutKind::Stack);
+        assert_eq!(l.kind(), LayoutKind::Dwindle);
+        l.toggle_kind(AREA, 10.0, LayoutKind::Stack);
+        assert_eq!((l.kind(), l.focused()), (LayoutKind::Stack, Some(ids[2])));
+    }
+
+    #[test]
     fn toggling_keeps_tiles_order_and_focus() {
         let mut l = Layout::new(LayoutKind::Dwindle, 0.5);
         let ids: Vec<_> = (0..3).map(|_| l.add(AREA, 10.0)).collect();
         l.focus(ids[1], AREA, 10.0);
-        l.toggle_kind(AREA, 10.0);
+        l.toggle_kind(AREA, 10.0, LayoutKind::Columns);
         assert_eq!(l.kind(), LayoutKind::Columns);
         assert_eq!(l.focused(), Some(ids[1]));
         let order: Vec<_> = l.layout(AREA, 10.0, 0.0).iter().map(|r| r.0).collect();
         assert_eq!(order, ids, "dwindle reading order becomes column order");
-        l.toggle_kind(AREA, 10.0);
+        l.toggle_kind(AREA, 10.0, LayoutKind::Columns);
         assert_eq!(l.kind(), LayoutKind::Dwindle);
         assert_eq!(l.layout(AREA, 10.0, 0.0).len(), 3);
         assert_eq!(l.focused(), Some(ids[1]));
@@ -226,7 +338,7 @@ mod tests {
     fn ids_stay_unique_across_layouts() {
         let mut l = Layout::new(LayoutKind::Columns, 0.5);
         let a = l.add(AREA, 10.0);
-        l.toggle_kind(AREA, 10.0);
+        l.toggle_kind(AREA, 10.0, LayoutKind::Columns);
         let b = l.add(AREA, 10.0);
         assert_ne!(a, b);
     }

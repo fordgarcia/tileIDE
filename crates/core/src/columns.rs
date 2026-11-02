@@ -19,6 +19,9 @@ pub struct Columns {
     focused: Option<TileId>,
     /// Horizontal scroll of the strip in px (0 = first column at the left edge).
     scroll: f64,
+    /// How much of a neighbouring column stays in sight beside the focused one (px), so
+    /// you can tell more columns are there (`tiling.peek`).
+    pub peek: f64,
 }
 
 const MIN_WIDTH_FRACTION: f64 = 0.2;
@@ -27,7 +30,7 @@ impl Columns {
     /// One column per tile, in the given order.
     pub fn from_ids(ids: &[TileId], focused: Option<TileId>, width: f64) -> Columns {
         let columns = ids.iter().map(|&id| Column { tiles: vec![id], width }).collect();
-        Columns { columns, focused: focused.or(ids.first().copied()), scroll: 0.0 }
+        Columns { columns, focused: focused.or(ids.first().copied()), scroll: 0.0, peek: 0.0 }
     }
 
     pub fn focused(&self) -> Option<TileId> {
@@ -90,8 +93,10 @@ impl Columns {
         self.columns.iter().flat_map(|c| c.tiles.iter().copied()).collect()
     }
 
-    fn column_width(col: &Column, area: Rect) -> f64 {
-        (col.width * area.w).max(MIN_COLUMN_WIDTH.min(area.w))
+    /// Never so wide that a column between two others hides both neighbours' peeks.
+    fn column_width(&self, col: &Column, area: Rect, gap: f64) -> f64 {
+        let widest = if self.peek > 0.0 { (area.w - 2.0 * (self.peek + gap)).max(area.w / 2.0) } else { area.w };
+        (col.width * area.w).max(MIN_COLUMN_WIDTH.min(area.w)).min(widest)
     }
 
     /// Left edge of each column relative to the strip's start, and its width. A lone
@@ -102,7 +107,7 @@ impl Columns {
         self.columns
             .iter()
             .map(|col| {
-                let w = if alone { area.w } else { Self::column_width(col, area) };
+                let w = if alone { area.w } else { self.column_width(col, area, gap) };
                 let span = (x, w);
                 x += w + gap;
                 span
@@ -124,16 +129,19 @@ impl Columns {
         out
     }
 
-    /// Scrolls the least amount that shows the whole focused column, never past the ends.
+    /// Scrolls the least amount that shows the whole focused column, plus `peek` of
+    /// each neighbour it has, never past the ends.
     pub fn ensure_visible(&mut self, area: Rect, gap: f64) {
         let spans = self.spans(area, gap);
         let total = spans.last().map_or(0.0, |(x, w)| x + w);
         if let Some((c, _)) = self.focused.and_then(|f| self.position(f)) {
             let (x, w) = spans[c];
-            if x < self.scroll {
-                self.scroll = x;
-            } else if x + w > self.scroll + area.w {
-                self.scroll = x + w - area.w;
+            let side = |has: bool| if has && self.peek > 0.0 { self.peek + gap } else { 0.0 };
+            let (left, right) = (x - side(c > 0), x + w + side(c + 1 < spans.len()));
+            if left < self.scroll {
+                self.scroll = left;
+            } else if right > self.scroll + area.w {
+                self.scroll = right - area.w;
             }
         }
         self.scroll = self.scroll.clamp(0.0, (total - area.w).max(0.0));
@@ -201,6 +209,26 @@ mod tests {
         assert_eq!(rects[0].1, Rect { x: 100.0, y: 20.0, w: 500.0, h: 600.0 });
         assert_eq!(rects[1].1.x, 610.0);
         assert_eq!(rects[2].1.x, 1120.0, "third column starts off-screen");
+    }
+
+    #[test]
+    fn neighbours_peek_in_beside_the_focused_column() {
+        let area = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+        let mut c = Columns { peek: 40.0, ..Columns::default() };
+        for id in 0..4 {
+            c.insert(id, false, 0.95);
+            c.ensure_visible(area, 10.0);
+        }
+        let shown = |c: &Columns, id| c.layout(area, 10.0, c.scroll()).into_iter().find(|(i, _)| *i == id).unwrap().1;
+        // Focused: the last column, fully shown, with 40 px of the one before it.
+        let last = shown(&c, 3);
+        assert!(last.x >= 50.0 - 1e-6 && last.x + last.w <= 1000.0 + 1e-6, "{last:?}");
+        assert!(shown(&c, 2).x + shown(&c, 2).w >= 40.0 - 1e-6, "the previous column peeks in");
+        // A middle column shows both neighbours' edges.
+        c.focus(1);
+        c.ensure_visible(area, 10.0);
+        let middle = shown(&c, 1);
+        assert!(middle.x >= 50.0 - 1e-6 && middle.x + middle.w <= 950.0 + 1e-6, "{middle:?}");
     }
 
     #[test]

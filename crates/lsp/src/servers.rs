@@ -98,21 +98,19 @@ pub fn command(server: &Server, override_cmd: Option<&[String]>, find: impl Fn(&
     })
 }
 
-/// `program` on `PATH`, else in one of `extra` (its full path then). Apps started from a
-/// desktop launcher often get a shorter `PATH` than a shell: no version-manager tool
-/// folders, no npm globals.
-pub fn locate(program: &str, extra: &[std::path::PathBuf]) -> Option<String> {
-    if on_path(program) {
-        return Some(program.to_string());
-    }
-    extra.iter().map(|dir| dir.join(program)).find(|p| executable(p)).map(|p| p.to_string_lossy().into_owned())
+/// `program` in one of `first` (the project's virtualenvs: their tools match the project),
+/// else on `PATH`, else in one of `extra` (a full path for both folder lists). Apps
+/// started from a desktop launcher often get a shorter `PATH` than a shell: no
+/// version-manager tool folders, no npm globals.
+pub fn locate(program: &str, first: &[std::path::PathBuf], extra: &[std::path::PathBuf]) -> Option<String> {
+    let in_dirs = |dirs: &[std::path::PathBuf]| dirs.iter().map(|dir| dir.join(program)).find(|p| executable(p)).map(|p| p.to_string_lossy().into_owned());
+    in_dirs(first).or_else(|| on_path(program).then(|| program.to_string())).or_else(|| in_dirs(extra))
 }
 
-/// Folders where user-installed servers usually live, best first: the project's
-/// virtualenvs' `bin`, `~/.local/bin`, npm/cargo globals, and every tool version mise
-/// installed (newest name first).
-pub fn user_dirs(venv_bins: &[std::path::PathBuf], home: Option<&Path>) -> Vec<std::path::PathBuf> {
-    let mut dirs = venv_bins.to_vec();
+/// Folders where user-installed servers usually live, best first: `~/.local/bin`,
+/// npm/cargo globals, and every tool version mise installed (newest name first).
+pub fn user_dirs(home: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
     let Some(home) = home else { return dirs };
     for d in [".local/bin", ".npm-global/bin", ".cargo/bin", ".local/share/pnpm", ".bun/bin"] {
         dirs.push(home.join(d));
@@ -174,14 +172,19 @@ mod tests {
         let mine = vec!["my-ls".to_string()];
         assert_eq!(command(python, Some(&mine), |_| None), Some(mine));
         assert!(on_path("sh") && !on_path("tileide-no-such-program"));
-        assert_eq!(locate("sh", &[]).as_deref(), Some("sh"));
+        assert_eq!(locate("sh", &[], &[]).as_deref(), Some("sh"));
         let bin = std::env::temp_dir().join(format!("tileide-locate-{}", std::process::id()));
         std::fs::create_dir_all(&bin).unwrap();
         let tool = bin.join("tileide-test-ls");
         std::fs::write(&tool, "#!/bin/sh\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(locate("tileide-test-ls", std::slice::from_ref(&bin)), Some(tool.to_string_lossy().into_owned()));
+        assert_eq!(locate("tileide-test-ls", &[], std::slice::from_ref(&bin)), Some(tool.to_string_lossy().into_owned()));
+        let venv_sh = bin.join("sh");
+        std::fs::write(&venv_sh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&venv_sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(locate("sh", std::slice::from_ref(&bin), &[]), Some(venv_sh.to_string_lossy().into_owned()), "a virtualenv's tool beats PATH's");
+        assert_eq!(locate("sh", &[], std::slice::from_ref(&bin)).as_deref(), Some("sh"), "other user folders don't");
         std::fs::remove_dir_all(&bin).unwrap();
     }
 

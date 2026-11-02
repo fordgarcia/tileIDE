@@ -19,6 +19,7 @@ mod completion;
 mod debug;
 mod dialog;
 mod draw;
+mod editing;
 mod extensions;
 mod extensions_panel;
 mod keybinds_card;
@@ -37,6 +38,7 @@ mod themes_panel;
 mod tile_view;
 mod toolchains;
 mod tray;
+mod wiki;
 mod workspaces;
 
 use std::cell::{Cell, RefCell};
@@ -90,6 +92,10 @@ struct Peek {
 struct App {
     /// For callbacks that must run after the current borrow ends (idle).
     me: Weak<App>,
+    /// The Wikipedia rice's top bar and workspace list.
+    bars: Rc<wiki::Bars>,
+    /// Wikipedia rice: the workspace list shows (its "hide" and the top bar's toggle).
+    workspace_list: Cell<bool>,
     options: Options,
     window: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
@@ -263,6 +269,8 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
         problems.push(format!("{}: {e}; ignored", paths.state.display()));
         State::default()
     });
+    // Before the first workspace fades in: with animations off it must just appear.
+    motion::set_enabled(tileide_config::settings::apply(config.clone(), &state.settings).appearance.animations);
     let fullscreen = options.mode == Mode::Fullscreen;
     if !fullscreen && options.background.is_some() {
         eprintln!("background: ignored outside full-screen mode (spec §4.4)");
@@ -325,6 +333,35 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     panel.append(&wave);
     overlay.add_overlay(&panel);
     let peek = build_peek(&overlay, &workspaces);
+    // The Wikipedia rice's bars: above the tiles and the drawer, below every card.
+    // Built before the app, so their callbacks reach it through `link`.
+    let link: Rc<std::cell::OnceCell<Weak<App>>> = Rc::default();
+    let call = |f: fn(&App)| -> Rc<dyn Fn()> {
+        let link = link.clone();
+        Rc::new(move || {
+            if let Some(app) = link.get().and_then(Weak::upgrade) {
+                f(&app);
+            }
+        })
+    };
+    let go_link = link.clone();
+    let bars = wiki::Bars::new(
+        &overlay,
+        wiki::Callbacks {
+            toggle_files: call(|app| app.toggle_drawer()),
+            search: call(|app| app.open_quick(quick_open::Target::NewTile)),
+            settings: call(|app| app.toggle_settings(settings_ui::Page::General)),
+            keybinds: call(|app| app.run(&Action::Keybinds)),
+            toggle_list: call(|app| app.toggle_workspace_list()),
+            go: Rc::new(move |n| {
+                if let Some(app) = go_link.get().and_then(Weak::upgrade) {
+                    app.workspaces.borrow_mut().go(n);
+                }
+            }),
+            new_workspace: call(|app| app.workspaces.borrow_mut().create_next()),
+            themes: call(|app| app.open_tray()),
+        },
+    );
 
     let banner = gtk::Label::new(None);
     banner.add_css_class("banner");
@@ -345,6 +382,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     overlay.add_overlay(&banner);
 
     let app_state = Rc::new_cyclic(|me: &Weak<App>| {
+        let _ = link.set(me.clone());
         let me1 = me.clone();
         let on_apply: Rc<dyn Fn(&str)> = Rc::new(move |key: &str| {
             if let Some(app) = me1.upgrade() {
@@ -504,6 +542,8 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             panel,
             files,
             peek,
+            bars,
+            workspace_list: Cell::new(true),
             workspaces,
             clock: RefCell::new(now_clock()),
             background: RefCell::new(None),
@@ -551,7 +591,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 return None;
             }
             let extension = app.drawer.try_borrow().map_or(0.0, |d| d.extension());
-            Some(gdk::Rectangle::new(0, 0, (token::rail_width() + extension).round() as i32, overlay.height()))
+            Some(gdk::Rectangle::new(0, 0, (token::left_inset() + extension).round() as i32, overlay.height()))
         });
         // The peek's ×: removes that workspace (asks first if it holds work).
         let me = Rc::downgrade(&app_state);
@@ -638,6 +678,20 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     }
                 }
             }
+            // `keys:<text>`: typed through the typing aids (`\b` = Backspace), then the
+            // line printed with `|` at the cursor.
+            (Some(app), _) if name == "keys" => {
+                if let Some(buffer) = app.workspaces.borrow().current().borrow().focused_code().and_then(|e| e.buffer().downcast::<sourceview5::Buffer>().ok()) {
+                    for c in arg.as_deref().unwrap_or("").replace("\\b", "\x08").chars() {
+                        editing::type_char(&buffer, c);
+                    }
+                    let at = buffer.iter_at_mark(&buffer.get_insert());
+                    let line = buffer.iter_at_line(at.line()).unwrap_or(at);
+                    let mut end = at;
+                    end.forward_to_line_end();
+                    println!("test action: keys → {}|{}", buffer.text(&line, &at, false), buffer.text(&at, &end, false));
+                }
+            }
             // `tab`: the Tab key in the focused editor or cell (completes after a name or `.`).
             (Some(app), _) if name == "tab" => {
                 if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
@@ -667,6 +721,28 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     let buffer = editor.buffer();
                     if let Some(it) = buffer.iter_at_line_offset(line - 1, column - 1).or_else(|| buffer.iter_at_line(line - 1)) {
                         buffer.place_cursor(&it);
+                    }
+                }
+            }
+            // `set:<key>=<number|true|false>`: a Settings control changed to that value.
+            (Some(app), _) if name == "set" => {
+                use tileide_config::settings::Value;
+                if let Some((key, value)) = arg.as_deref().and_then(|a| a.split_once('=')) {
+                    let value = match value {
+                        "true" | "false" => Value::Bool(value == "true"),
+                        v => v.parse().map_or_else(|_| Value::Text(v.into()), Value::Number),
+                    };
+                    app.change_setting(key, value);
+                }
+            }
+            // `tiles`: the workspace's tile rects, printed.
+            (Some(app), _) if name == "tiles" => println!("tiles: {}", app.workspaces.borrow().current().borrow().describe()),
+            // `diagnostics`: the focused editor's or cell's diagnostics, printed.
+            (Some(app), _) if name == "diagnostics" => {
+                if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
+                    let buffer = editor.buffer().downcast::<sourceview5::Buffer>().ok();
+                    for message in buffer.map(|b| lsp::all_messages(&b)).unwrap_or_default() {
+                        println!("diagnostic {message}");
                     }
                 }
             }
@@ -722,6 +798,7 @@ impl App {
                 themes: s.show_themes,
                 config: s.show_config,
                 icon_backgrounds: s.icon_backgrounds,
+                pills: s.pills,
             },
             themes_open: self.tray.is_open(),
             visualizer: None,
@@ -752,6 +829,10 @@ impl App {
             tile_radius: config.appearance.window_radius as f64,
             gaps_in: config.tiling.gaps_in as f64,
             gaps_out: config.tiling.gaps_out as f64,
+            tile_border: config.appearance.tile_border,
+            tile_edge: config.appearance.tile_border_color,
+            frame_border: config.appearance.frame_border,
+            frame_edge: config.appearance.frame_border_color,
         }
     }
 
@@ -786,6 +867,7 @@ impl App {
                 app.notice(message);
             }
         });
+        tile_view::set_notice(notice.clone());
         problems.extend(lsp::configure(&config.lsp, notice));
         *self.raw_config.borrow_mut() = config;
         *self.problems.borrow_mut() = problems;
@@ -797,15 +879,27 @@ impl App {
         let config = tileide_config::settings::apply(self.raw_config.borrow().clone(), &self.state.borrow().settings);
         let a = &config.appearance;
         motion::set_enabled(a.animations);
+        editing::configure(config.editor.auto_close, config.editor.match_brackets);
+        tile_view::set_limit_alert(config.alerts.tile_limit);
         tileide_core::motion::set_profile(a.motion, a.motion_speed);
         token::set_ui_font(&a.ui_font, a.ui_scale);
         token::set_rail(config.sidebar.scale, config.sidebar.icon_scale);
+        let entering_wiki = a.rice == token::Rice::Wikipedia && token::rice() != a.rice;
+        token::set_rice(a.rice, self.workspace_list.get());
+        self.bars.show(a.rice == token::Rice::Wikipedia, self.workspace_list.get());
+        self.workspaces.borrow_mut().set_rice(a.rice);
+        // The Wikipedia rice's left sidebar is Files: open it on the way in.
+        if entering_wiki && !self.drawer.borrow().is_open() {
+            self.drawer.borrow_mut().toggle();
+        }
         self.visualizer.set_enabled(config.sidebar.show_visualizer);
-        // Widgets placed beside the rail follow its width.
-        let rail = token::rail_width();
-        self.panel.set_margin_start(rail as i32);
-        self.banner.set_margin_start((rail + 16.0) as i32);
-        self.peek.widget.set_margin_start((rail + PEEK_GAP) as i32);
+        // Widgets placed beside the rail (or the Wikipedia rice's bars) follow its size.
+        let left = token::left_inset();
+        self.panel.set_margin_start(left as i32);
+        self.panel.set_margin_top(token::top_inset() as i32);
+        self.banner.set_margin_start((left + 16.0) as i32);
+        self.banner.set_margin_top((token::top_inset() + 10.0) as i32);
+        self.peek.widget.set_margin_start((token::rail_width() + PEEK_GAP) as i32);
         let (tiling, per_workspace) = (config.tiling.clone(), config.workspaces.clone());
         if self.settings_card.is_open() {
             self.settings_card.refresh(&config);
@@ -960,7 +1054,12 @@ impl App {
         }
         *self.background_key.borrow_mut() = key;
         draw::set_tile_backdrop(settings.source != background::Source::SeeThrough && settings.tile_blur >= 1.0);
-        *self.background.borrow_mut() = background::Background::new(settings, (**self.theme.borrow()).clone());
+        let old = self.background.borrow_mut().take();
+        let mut new = background::Background::new(settings, (**self.theme.borrow()).clone());
+        if let Some(b) = &mut new {
+            b.keep_image(old);
+        }
+        *self.background.borrow_mut() = new;
         load_background(self);
     }
 
@@ -994,14 +1093,16 @@ impl App {
         let css = format!(
             "window, window.background {{ background: transparent; font-family: \"{font}\"; }}
 .banner {{ background-color: {bg}; color: {text}; border: 1px solid {edge}; border-radius: 10px; padding: 8px 14px; font-size: 13px; }}
-{tiles}\n{files}\n{overview}\n{quick_open}\n{dialog}\n{lsp}\n{completion}\n{themes}\n{extensions}\n{settings}\n{run}\n{notebook}\n{debug}
-.tile textview, .tile vte-terminal {{ font-family: \"{code_font}\"; font-size: {code_size}pt; }}",
+{tiles}\n{files}\n{wiki}\n{overview}\n{quick_open}\n{dialog}\n{lsp}\n{completion}\n{themes}\n{extensions}\n{settings}\n{run}\n{notebook}\n{debug}
+.tile textview, .tile vte-terminal, .notebook .output, .notebook .frame-table label {{ font-family: \"{code_font}\"; font-size: {code_size}pt; }}
+.notebook .cell .rendered {{ font-size: {code_size}pt; }}",
             font = token::UI_FONT,
             bg = theme::css(t.surface, 0.96),
             text = theme::css(t.text, 1.0),
             edge = theme::css(t.error, 0.8),
             tiles = tile_view::css(t, self.geometry(), self.tile_opacity()),
             files = file_tree::css(t),
+            wiki = wiki::css(t),
             overview = overview::css(t),
             quick_open = quick_open::css(t),
             dialog = dialog::css(t),
@@ -1486,6 +1587,32 @@ impl App {
         }
     }
 
+    /// The Wikipedia rice's title, workspace cards and clock (cheap when nothing changed).
+    fn refresh_bars(&self) {
+        if token::rice() != token::Rice::Wikipedia {
+            return;
+        }
+        let workspaces = self.workspaces.borrow();
+        let summaries = workspaces.summaries();
+        let title = match workspaces.active() {
+            Active::Config => "Config".to_string(),
+            Active::Number(_) => summaries.iter().find(|s| s.active).map_or_else(String::new, wiki::name),
+        };
+        self.bars.refresh(&summaries, &title);
+        let clock = self.clock.borrow();
+        self.bars.set_clock(&clock.0, &clock.1);
+    }
+
+    /// Wikipedia rice: shows or hides the workspace list on the right.
+    fn toggle_workspace_list(&self) {
+        let shown = !self.workspace_list.get();
+        self.workspace_list.set(shown);
+        token::set_rice(token::rice(), shown);
+        self.bars.show(token::rice() == token::Rice::Wikipedia, shown);
+        self.sync();
+        self.area.queue_draw();
+    }
+
     fn toggle_drawer(&self) {
         let config = self.config.borrow();
         if !config.sidebar.show_files && !self.drawer.borrow().is_open() {
@@ -1657,7 +1784,7 @@ impl App {
 
     fn near_resize_edge(&self, x: f64) -> bool {
         let drawer = self.drawer.borrow();
-        drawer.is_open() && (x - (token::rail_width() + drawer.width)).abs() <= RESIZE_GRAB
+        drawer.is_open() && (x - (token::left_inset() + drawer.width)).abs() <= RESIZE_GRAB
     }
 }
 
@@ -1703,7 +1830,20 @@ fn screenshot(window: &gtk::Window, path: &str) -> Result<(), String> {
     };
     // The window can come out empty for a frame (seen right after a popover opens);
     // the popovers are still worth saving.
-    let window_result = render(window.upcast_ref(), path);
+    // Headless (Broadway with no viewer) the frame clock stalls: no layout, no paint, and
+    // a widget paintable only copies what was painted. Lay out and snapshot directly.
+    let direct = |path: &str| -> Result<(), String> {
+        let child = window.child().ok_or("no content")?;
+        // Layout is stalled too: lay the content out at the window's size first.
+        let _ = child.measure(gtk::Orientation::Horizontal, -1);
+        child.allocate(window.width(), window.height(), -1, None);
+        let snapshot = gtk::Snapshot::new();
+        window.snapshot_child(&child, &snapshot);
+        let node = snapshot.to_node().ok_or("nothing drawn")?;
+        let renderer = window.renderer().ok_or("no renderer")?;
+        renderer.render_texture(&node, Some(&gtk::graphene::Rect::new(0.0, 0.0, window.width() as f32, window.height() as f32))).save_to_png(path).map_err(|e| e.to_string())
+    };
+    let window_result = render(window.upcast_ref(), path).or_else(|_| direct(path));
     fn popovers(widget: &gtk::Widget, out: &mut Vec<gtk::Popover>) {
         let mut child = widget.first_child();
         while let Some(c) = child {
@@ -1839,7 +1979,7 @@ fn watch_config(state: &Rc<App>) {
 
 /// Decodes an image background on a worker thread, then redraws with it.
 fn load_background(state: &App) {
-    let Some(path) = state.background.borrow().as_ref().and_then(background::Background::image_path) else {
+    let Some(path) = state.background.borrow().as_ref().filter(|b| b.needs_image()).and_then(background::Background::image_path) else {
         state.area.queue_draw();
         return;
     };
@@ -1890,6 +2030,15 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
     state.area.set_draw_func(move |area, cr, width, height| {
         let begin = Instant::now();
         take_decoded(&s);
+        if token::rice() == token::Rice::Wikipedia {
+            // Not while painting: changing widgets there queues a relayout mid-frame.
+            let me = s.me.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(app) = me.upgrade() {
+                    app.refresh_bars();
+                }
+            });
+        }
         // Cheap clone (refcounted); baked only when the size changes.
         // The fractional scale (e.g. 1.5), so the paint is a 1:1 copy, not a resample.
         let scale = area.native().and_then(|n| n.surface()).map_or(area.scale_factor() as f64, |s| s.scale());
@@ -1976,7 +2125,15 @@ fn connect_mouse(state: &Rc<App>) {
         }
         let numbers = s.rail_dots();
         let clock = s.clock.borrow().clone();
-        let hit = draw::rail_hit(&s.scene(&numbers, &clock), x, y);
+        let scene = s.scene(&numbers, &clock);
+        let (hit, welcome) = (draw::rail_hit(&scene, x, y), draw::welcome_hit(&scene, x, y));
+        drop(scene);
+        match welcome {
+            Some(draw::Welcome::OpenFile) => s.open_quick(quick_open::Target::NewTile),
+            Some(draw::Welcome::Terminal) => s.run(&Action::Terminal),
+            Some(draw::Welcome::Folder) => s.open_folder_search(),
+            None => {}
+        }
         match hit {
             Some(draw::RailHit::Launcher) => s.toggle_drawer(),
             // Hovering a dot previews it; a click goes there.
@@ -2018,7 +2175,10 @@ fn connect_mouse(state: &Rc<App>) {
     motion.set_propagation_phase(gtk::PropagationPhase::Capture);
     let s = state.clone();
     motion.connect_motion(move |_, x, y| {
-        let cursor = s.near_resize_edge(x).then_some("col-resize");
+        let numbers = s.rail_dots();
+        let clock = s.clock.borrow().clone();
+        let over_card = draw::welcome_hit(&s.scene(&numbers, &clock), x, y).is_some();
+        let cursor = if s.near_resize_edge(x) { Some("col-resize") } else { over_card.then_some("pointer") };
         s.window.set_cursor_from_name(cursor);
         s.hover_rail(x, y);
         s.track_peek(x, y);

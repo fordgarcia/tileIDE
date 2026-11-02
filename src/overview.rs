@@ -130,6 +130,7 @@ impl Overview {
             let layout = match s.layout {
                 LayoutKind::Dwindle => "dwindle",
                 LayoutKind::Columns => "columns",
+                LayoutKind::Stack => "stack",
             };
             let folder = s.folder.as_ref().map_or_else(|| "Alt+D picks one".into(), |f| f.display().to_string());
             let detail = gtk::Label::new(Some(&format!("{tiles} · {layout}\n{folder}")));

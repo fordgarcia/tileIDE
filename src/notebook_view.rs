@@ -31,12 +31,12 @@ pub fn css(t: &Theme) -> String {
 .notebook .cell.current {{ border-color: {accent_edge}; }}
 .notebook .cell .count {{ font-family: monospace; font-size: 12px; color: {muted}; padding-left: 6px; }}
 .notebook .cell textview, .notebook .cell textview text {{ background: transparent; }}
-.notebook .output {{ font-family: monospace; font-size: 0.95em; color: {text}; padding: 4px 10px; }}
+.notebook .output {{ color: {text}; padding: 4px 10px; }}
 .notebook .output.error {{ color: {error}; }}
 .notebook .outputs {{ border-top: 1px solid {edge}; margin-top: 4px; padding-top: 4px; }}
 .notebook .outputs.stale {{ opacity: 0.45; }}
 .notebook .frame-table {{ margin: 4px 10px; }}
-.notebook .frame-table label {{ font-family: monospace; font-size: 0.92em; padding: 3px 10px; color: {text}; }}
+.notebook .frame-table label {{ padding: 3px 10px; color: {text}; }}
 .notebook .frame-table label.th {{ font-weight: bold; }}
 .notebook .frame-table label.head {{ border-bottom: 1px solid {edge}; }}
 .notebook .frame-table label.odd {{ background-color: {chip}; }}
@@ -399,6 +399,7 @@ impl NotebookView {
         view.set_left_margin(8);
         view.set_top_margin(4);
         view.set_bottom_margin(6);
+        crate::editing::attach(&view);
         frame.append(&view);
         let markdown = gtk::Label::new(None);
         markdown.set_wrap(true);
@@ -466,6 +467,10 @@ impl NotebookView {
             let way = match k {
                 gdk::Key::Up | gdk::Key::KP_Up => Way::Up,
                 gdk::Key::Down | gdk::Key::KP_Down => Way::Down,
+                gdk::Key::BackSpace if (mods & gtk::accelerator_get_default_mod_mask()).is_empty() => {
+                    let Some(i) = v.index(key) else { return glib::Propagation::Proceed };
+                    return if v.backspace_empty(i) { glib::Propagation::Stop } else { glib::Propagation::Proceed };
+                }
                 _ => return glib::Propagation::Proceed,
             };
             let Some(view) = c.widget().and_downcast::<sourceview5::View>() else { return glib::Propagation::Proceed };
@@ -820,13 +825,15 @@ impl NotebookView {
     }
 
     /// Headless checks (`--test-actions cell:<verb>`): `add`, `delete`, `run`, `shift-enter`
-    /// (as the key on the current cell), `arrow-up`/`arrow-down` (as the keys at a cell's
+    /// (as the key on the current cell), `backspace` (as the key in the current cell, any
+    /// cursor position), `arrow-up`/`arrow-down` (as the keys at a cell's
     /// edge), `focus-<n>`, `scroll-end`, `state` (printed).
     pub fn test_action(&self, verb: &str) {
         let i = self.current.get();
         match verb {
             "add" => self.add_below(CellKind::Code),
             "delete" => self.delete_current(),
+            "backspace" => println!("notebook: backspace {}", if self.backspace_empty(i) { "deleted the cell" } else { "edits" }),
             "shift-enter" => {
                 self.run_cell(i);
                 self.advance(i);
@@ -860,6 +867,22 @@ impl NotebookView {
         }
     }
 
+    /// Backspace in cell `i`: an empty cell with a cell above is deleted, and typing
+    /// goes on at the end of the cell above. False (the key edits as usual) otherwise.
+    fn backspace_empty(&self, i: usize) -> bool {
+        let empty = self.cells.borrow().get(i).is_some_and(|c| c.buffer.char_count() == 0);
+        if !empty || i == 0 {
+            return false;
+        }
+        self.remove(i);
+        let cells = self.cells.borrow();
+        let above = &cells[i - 1];
+        above.buffer.place_cursor(&above.buffer.end_iter());
+        drop(cells);
+        self.focus_cell(i - 1);
+        true
+    }
+
     /// The current cell's delete button.
     pub fn delete_current(&self) {
         self.delete(self.current.get());
@@ -872,6 +895,12 @@ impl NotebookView {
             cells[0].buffer.set_text("");
             return;
         }
+        self.remove(i);
+        self.focus_cell(i.min(self.cells.borrow().len() - 1));
+    }
+
+    /// Takes cell `i` out (there must be another).
+    fn remove(&self, i: usize) {
         let ui = self.cells.borrow_mut().remove(i);
         // Before the view goes: unparents its popovers (see `lsp::release_popovers`).
         crate::lsp::detach(&ui.buffer);
@@ -879,7 +908,6 @@ impl NotebookView {
         self.lsp_resync();
         self.list.remove(&ui.frame);
         self.mark_dirty();
-        self.focus_cell(i.min(self.cells.borrow().len() - 1));
     }
 
     pub fn run_all(&self) {

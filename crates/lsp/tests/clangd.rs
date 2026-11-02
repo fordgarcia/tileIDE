@@ -28,7 +28,7 @@ fn wait(rx: &mpsc::Receiver<Incoming>, what: &str, wanted: impl Fn(&Value) -> bo
 #[test]
 fn clangd_end_to_end() {
     let server = servers::by_name("c").unwrap();
-    let Some(cmd) = servers::command(server, None, |p| servers::locate(p, &[])) else {
+    let Some(cmd) = servers::command(server, None, |p| servers::locate(p, &[], &[])) else {
         eprintln!("clangd not installed: skipped");
         return;
     };

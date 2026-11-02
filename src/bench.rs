@@ -104,9 +104,14 @@ pub fn render(args: &[String]) -> Result<(), String> {
         width: w,
         height: h,
         theme: std::rc::Rc::new(theme),
-        geometry: tileide_core::token::Geometry::default(),
-        // `--plain-icons`: no backgrounds behind the rail icons.
-        modules: draw::Modules { icon_backgrounds: !args.iter().any(|a| a == "--plain-icons"), ..draw::Modules::default() },
+        // `--frame-border N`: Settings' outer border (accent).
+        geometry: tileide_core::token::Geometry { frame_border: number("--frame-border").unwrap_or(0.0), ..Default::default() },
+        // `--plain-icons`: no backgrounds behind the rail icons; `--no-pills`: no pills.
+        modules: draw::Modules {
+            icon_backgrounds: !args.iter().any(|a| a == "--plain-icons"),
+            pills: !args.iter().any(|a| a == "--no-pills"),
+            ..draw::Modules::default()
+        },
         themes_open: false,
         settings_open: false,
         // `--visualizer`: a sample waveform where the rail label goes.

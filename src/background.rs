@@ -199,6 +199,22 @@ impl Background {
         }
     }
 
+    /// Takes `old`'s decoded image when both show the same file, so changing a
+    /// slider re-bakes at once instead of decoding again (and going see-through
+    /// until the decode ends).
+    pub fn keep_image(&mut self, old: Option<Background>) {
+        if let Some(old) = old
+            && old.settings.source == self.settings.source
+        {
+            self.image = old.image;
+        }
+    }
+
+    /// An image source whose file isn't decoded yet.
+    pub fn needs_image(&self) -> bool {
+        self.image_path().is_some() && self.image.is_none()
+    }
+
     pub fn set_image(&mut self, decoded: Decoded) -> Result<(), String> {
         self.image = Some(decoded.into_surface()?);
         self.baked = None;
@@ -488,6 +504,24 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_slider_change_keeps_the_decoded_image() {
+        let image = |path: &str| Settings { source: Source::Image(path.into()), ..Settings::default() };
+        let decoded = || Decoded { width: 1, height: 1, pixels: vec![0; 4] };
+        let mut old = Background::new(image("/a.png"), Theme::builtin()).unwrap();
+        old.set_image(decoded()).unwrap();
+        let mut new = Background::new(Settings { tile_blur: 20.0, ..image("/a.png") }, Theme::builtin()).unwrap();
+        assert!(new.needs_image());
+        new.keep_image(Some(old));
+        assert!(!new.needs_image(), "same file: no second decode");
+
+        let mut other = Background::new(image("/a.png"), Theme::builtin()).unwrap();
+        other.set_image(decoded()).unwrap();
+        let mut changed = Background::new(image("/b.png"), Theme::builtin()).unwrap();
+        changed.keep_image(Some(other));
+        assert!(changed.needs_image(), "another file is decoded");
     }
 
     #[test]

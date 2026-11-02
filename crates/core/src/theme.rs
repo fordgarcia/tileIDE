@@ -36,6 +36,39 @@ pub struct Theme {
 }
 
 /// Theme file keys of `syntax = { … }`, in `Theme::code` order.
+/// A border's colour, from the theme (`appearance.tile_border_color`, `frame_border_color`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Edge {
+    /// A faint line in the text colour (glass themes: their own edge).
+    #[default]
+    Subtle,
+    Accent,
+    Text,
+    Muted,
+}
+
+impl Edge {
+    pub const KEYS: [&'static str; 4] = ["subtle", "accent", "text", "muted"];
+
+    pub fn key(self) -> &'static str {
+        Edge::KEYS[self as usize]
+    }
+
+    pub fn from_key(key: &str) -> Option<Edge> {
+        [Edge::Subtle, Edge::Accent, Edge::Text, Edge::Muted].into_iter().find(|e| e.key() == key)
+    }
+
+    /// The colour and opacity to draw with in `theme`.
+    pub fn paint(self, theme: &Theme) -> (Rgb, f64) {
+        match self {
+            Edge::Subtle => (theme.text, theme.glass.map_or(0.08, |g| g.edge_opacity)),
+            Edge::Accent => (theme.accent, 1.0),
+            Edge::Text => (theme.text, 0.9),
+            Edge::Muted => (theme.muted, 0.8),
+        }
+    }
+}
+
 pub const SYNTAX_KEYS: [&str; 8] = ["keyword", "type", "string", "constant", "function", "preprocessor", "builtin", "comment"];
 /// Theme file keys of `terminal = { … }`, in ANSI order.
 pub const ANSI_KEYS: [&str; 16] = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_black", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan", "bright_white"];

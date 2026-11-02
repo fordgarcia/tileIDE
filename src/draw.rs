@@ -85,11 +85,13 @@ pub struct Modules {
     /// The discs and squares behind the rail's icons (`sidebar.icon_backgrounds`); without
     /// them, an active icon is drawn in the accent colour instead.
     pub icon_backgrounds: bool,
+    /// The rounded pills the modules sit on (`sidebar.pills`).
+    pub pills: bool,
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Modules { launcher: true, workspaces: true, label: true, clock: true, themes: true, config: true, icon_backgrounds: true }
+        Modules { launcher: true, workspaces: true, label: true, clock: true, themes: true, config: true, icon_backgrounds: true, pills: true }
     }
 }
 
@@ -191,7 +193,7 @@ fn pills(s: &Scene) -> Vec<Rect> {
 }
 
 pub fn rail_hit(s: &Scene, x: f64, y: f64) -> Option<RailHit> {
-    if x > token::rail_width() {
+    if x > token::rail_width() || token::rice() != token::Rice::Default {
         return None;
     }
     rail_items(s).into_iter().find(|(_, cy, r)| (y - cy).abs() <= *r).map(|(hit, _, _)| hit)
@@ -199,17 +201,17 @@ pub fn rail_hit(s: &Scene, x: f64, y: f64) -> Option<RailHit> {
 
 /// The frame's rounded hole (the stage) the tiles sit in.
 pub fn stage_rect(s: &Scene) -> Rect {
-    let x = token::rail_width() + s.drawer;
-    Rect { x, y: FRAME_BORDER, w: s.width - x - FRAME_BORDER, h: s.height - 2.0 * FRAME_BORDER }
+    let (x, y) = (token::left_inset() + s.drawer, token::top_inset());
+    Rect { x, y, w: s.width - x - token::right_inset(), h: s.height - y - FRAME_BORDER }
 }
 
 /// Where tiles are laid out: the stage inset by `gaps_out`. In overlay mode it does not
 /// move with the drawer.
 pub fn tile_area(s: &Scene) -> Rect {
     let out = s.geometry.gaps_out;
-    let x = token::rail_width() + out + if s.push { s.drawer } else { 0.0 };
-    let y = FRAME_BORDER + out;
-    Rect { x, y, w: (s.width - x - FRAME_BORDER - out).max(0.0), h: (s.height - 2.0 * y).max(0.0) }
+    let x = token::left_inset() + out + if s.push { s.drawer } else { 0.0 };
+    let y = token::top_inset() + out;
+    Rect { x, y, w: (s.width - x - token::right_inset() - out).max(0.0), h: (s.height - y - FRAME_BORDER - out).max(0.0) }
 }
 
 pub fn draw(cr: &Context, s: &Scene) -> Result<(), Error> {
@@ -260,7 +262,28 @@ pub fn draw(cr: &Context, s: &Scene) -> Result<(), Error> {
     cr.set_fill_rule(FillRule::EvenOdd);
     cr.fill()?;
     cr.set_fill_rule(FillRule::Winding);
-    draw_rail_modules(cr, s)
+    draw_frame_border(cr, s)?;
+    // The Wikipedia rice has no rail: its bars are widgets over the frame.
+    if token::rice() == token::Rice::Default {
+        draw_rail_modules(cr, s)?;
+    }
+    Ok(())
+}
+
+/// `appearance.frame_border`: a line along the hole's edge, inside the frame.
+fn draw_frame_border(cr: &Context, s: &Scene) -> Result<(), Error> {
+    let width = s.geometry.frame_border;
+    let hole = stage_rect(s);
+    let radius = s.geometry.frame_radius();
+    if width <= 0.0 || hole.w <= 2.0 * radius || hole.h <= 2.0 * radius {
+        return Ok(());
+    }
+    // Centred on the hole's edge, half of it over the frame.
+    rounded_rect(cr, hole, radius);
+    let (colour, alpha) = s.geometry.frame_edge.paint(&s.theme);
+    set(cr, colour, alpha);
+    cr.set_line_width(width);
+    cr.stroke()
 }
 
 /// The frame is the screen rectangle minus one rounded hole. The rail is the frame's
@@ -276,19 +299,55 @@ fn frame_path(cr: &Context, s: &Scene) {
     }
 }
 
-/// What an empty workspace shows, as (what, keys) rows (VS Code's empty-editor style).
-const EMPTY_HINTS: &[(&str, &str)] = &[
-    ("Open a file", "Alt+E"),
-    ("New terminal", "Alt+Return"),
-    ("Open a folder", "Alt+D"),
-    ("Files", "Alt+B"),
-    ("Run the focused file", "Alt+R"),
-    ("Settings", "Alt+,"),
-    ("All keybinds", "Alt+K"),
-];
+/// The welcome cards on an empty workspace (`design/001/open-file-no-tile-welcome-screen.png`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Welcome {
+    OpenFile,
+    Terminal,
+    Folder,
+}
 
-/// An empty workspace: one tile filling the code region, with a faded logo and the
-/// main keys centred in it, so it reads like an editor waiting for a file.
+/// (action, label, keys, terminal-palette colour index: blue, red, magenta).
+const WELCOME_CARDS: [(Welcome, &str, &str, usize); 3] =
+    [(Welcome::OpenFile, "Open a file", "Alt+E", 4), (Welcome::Terminal, "New terminal", "Alt+Return", 1), (Welcome::Folder, "Open a folder", "Alt+D", 5)];
+const WELCOME_PAD: f64 = 48.0;
+const CARD_GAP: f64 = 16.0;
+const CARD_W: f64 = 176.0;
+/// Below the cards: the image, "Nothing open yet" and a wrapped line (max width).
+const NOTHING_IMAGE: f64 = 96.0;
+const NOTHING_TEXT_W: f64 = 360.0;
+
+/// Where each welcome card sits in the empty tile `area` (shrinking to fit a narrow
+/// one); empty when the tile is too small for them.
+fn welcome_cards(area: Rect) -> Vec<(Welcome, Rect)> {
+    let scale = token::ui_scale();
+    let w = ((area.w - 2.0 * WELCOME_PAD - 2.0 * CARD_GAP) / 3.0).min(CARD_W);
+    let top = area.y + WELCOME_PAD + 64.0 * scale;
+    if w < 72.0 || top + w * 0.7 + 40.0 * scale > area.y + area.h - 16.0 {
+        return Vec::new();
+    }
+    WELCOME_CARDS
+        .iter()
+        .enumerate()
+        .map(|(i, card)| (card.0, Rect { x: area.x + WELCOME_PAD + i as f64 * (w + CARD_GAP), y: top, w, h: w * 0.7 }))
+        .collect()
+}
+
+/// The welcome card under (x, y) on an empty workspace.
+pub fn welcome_hit(s: &Scene, x: f64, y: f64) -> Option<Welcome> {
+    if !s.empty || x < stage_rect(s).x {
+        return None;
+    }
+    welcome_cards(tile_area(s)).into_iter().find(|(_, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h).map(|(w, _)| w)
+}
+
+thread_local! {
+    /// `data/welcome.png`, decoded once.
+    static NOTHING_OPEN: Option<ImageSurface> = ImageSurface::create_from_png(&mut &include_bytes!("../data/welcome.png")[..]).ok();
+}
+
+/// An empty workspace: one tile filling the code region with a welcome: three cards to
+/// start from (open a file, a terminal, a folder) and "Nothing open yet" below.
 fn draw_empty_tile(cr: &Context, s: &Scene, area: Rect) -> Result<(), Error> {
     let (t, g) = (&*s.theme, s.geometry);
     if area.w < 2.0 * g.tile_radius || area.h < 2.0 * g.tile_radius {
@@ -297,40 +356,142 @@ fn draw_empty_tile(cr: &Context, s: &Scene, area: Rect) -> Result<(), Error> {
     rounded_rect(cr, area, g.tile_radius);
     // Like a tile (any frosted backdrop is already under it).
     set(cr, t.tile, s.tile_opacity);
-    cr.fill_preserve()?;
-    set(cr, t.text, 0.08);
-    cr.set_line_width(2.0);
-    cr.stroke()?;
+    if g.tile_border > 0.0 {
+        cr.fill_preserve()?;
+        let (edge, alpha) = g.tile_edge.paint(t);
+        set(cr, edge, alpha);
+        cr.set_line_width(g.tile_border);
+        cr.stroke()?;
+    } else {
+        cr.fill()?;
+    }
 
-    const LOGO_SIZE: f64 = 96.0;
-    const ROW: f64 = 30.0;
-    const COLUMN_GAP: f64 = 16.0;
+    let cards = welcome_cards(area);
+    let Some(&(_, first)) = cards.first() else { return Ok(()) };
     let scale = token::ui_scale();
-    let rows = if area.h > 420.0 { EMPTY_HINTS.len() } else { 4 };
-    let height = LOGO_SIZE + 36.0 + rows as f64 * ROW * scale;
-    if height > area.h - 24.0 {
+    set(cr, t.text, 1.0);
+    draw_text(cr, first.x, area.y + WELCOME_PAD - 6.0, "Welcome", UI_FONT, 34.0);
+    set(cr, t.muted, 1.0);
+    draw_text(cr, first.x, first.y - 26.0 * scale, "Start something", UI_FONT, 13.0);
+    let palette = t.terminal_palette();
+    for ((what, label, keys, hue), (_, r)) in WELCOME_CARDS.iter().zip(&cards) {
+        let colour = palette[*hue];
+        rounded_rect(cr, *r, 10.0);
+        set(cr, tileide_core::theme::over(colour, 0.45, t.tile), 1.0);
+        cr.fill()?;
+        let icon = tileide_core::theme::over(t.text, 0.55, colour);
+        welcome_icon(cr, *what, r.x + r.w / 2.0, r.y + r.h / 2.0, (r.h * 0.34).min(40.0), icon)?;
+        // The label, then its keys on a chip (below it when both don't fit the card's width).
+        let ly = r.y + r.h + 10.0;
+        set(cr, t.text, 0.95);
+        draw_text(cr, r.x, ly, label, UI_FONT, 14.0);
+        let (lw, lh) = text_size(cr, label, UI_FONT, 14.0);
+        let (kw, kh) = text_size(cr, keys, UI_FONT, 11.0);
+        let (cx, cy) = if lw + 8.0 + kw + 12.0 <= r.w { (r.x + lw + 8.0, ly + (lh - kh) / 2.0 - 2.0) } else { (r.x, ly + lh + 4.0) };
+        let chip = Rect { x: cx, y: cy, w: kw + 12.0, h: kh + 4.0 };
+        rounded_rect(cr, chip, chip.h / 2.0);
+        set(cr, t.accent, 0.16);
+        cr.fill()?;
+        set(cr, t.accent, 1.0);
+        draw_text(cr, chip.x + 6.0, chip.y + 2.0, keys, UI_FONT, 11.0);
+    }
+
+    // "Nothing open yet", centred in the space under the cards when it fits.
+    let below = first.y + first.h + 64.0 * scale;
+    let lines = "Open a file or a folder to begin, or press Alt+K to see every keybind.";
+    let line = wrapped(cr, lines, 13.0, NOTHING_TEXT_W.min(area.w - 2.0 * WELCOME_PAD));
+    let text_h = line.pixel_size().1 as f64;
+    let block = NOTHING_IMAGE + 20.0 + 24.0 * scale + 8.0 + text_h;
+    let room = area.y + area.h - below - 24.0;
+    if room < block {
         return Ok(());
     }
     let cx = area.x + area.w / 2.0;
-    let mut y = area.y + (area.h - height) / 2.0;
-    set(cr, t.text, 0.10);
-    crate::logo::fill(cr, cx, y + LOGO_SIZE / 2.0, LOGO_SIZE)?;
-    y += LOGO_SIZE + 36.0;
-    for (what, keys) in &EMPTY_HINTS[..rows] {
-        let (w, h) = text_size(cr, what, UI_FONT, 13.0);
-        set(cr, t.muted, 1.0);
-        draw_text(cr, cx - COLUMN_GAP / 2.0 - w, y + (ROW * scale - h) / 2.0, what, UI_FONT, 13.0);
-        // Keys on a soft chip, left-aligned in the right column.
-        let (kw, kh) = text_size(cr, keys, UI_FONT, 12.0);
-        let chip = Rect { x: cx + COLUMN_GAP / 2.0, y: y + (ROW * scale - kh) / 2.0 - 3.0, w: kw + 14.0, h: kh + 6.0 };
-        rounded_rect(cr, chip, 6.0);
-        set(cr, t.text, 0.07);
-        cr.fill()?;
-        set(cr, t.text, 0.85);
-        draw_text(cr, chip.x + 7.0, chip.y + 3.0, keys, UI_FONT, 12.0);
-        y += ROW * scale;
-    }
+    let mut y = below + (room - block) / 2.0;
+    NOTHING_OPEN.with(|image| -> Result<(), Error> {
+        let Some(image) = image else { return Ok(()) };
+        let k = NOTHING_IMAGE / image.height() as f64;
+        cr.save()?;
+        cr.translate(cx - image.width() as f64 * k / 2.0, y);
+        cr.scale(k, k);
+        cr.set_source_surface(image, 0.0, 0.0)?;
+        cr.source().set_filter(gtk4::cairo::Filter::Good);
+        cr.paint_with_alpha(0.9)?;
+        cr.restore()
+    })?;
+    y += NOTHING_IMAGE + 20.0;
+    let title = "Nothing open yet";
+    let (tw, _) = text_size(cr, title, UI_FONT, 17.0);
+    set(cr, t.text, 0.75);
+    draw_text(cr, cx - tw / 2.0, y, title, UI_FONT, 17.0);
+    y += 24.0 * scale + 8.0;
+    set(cr, t.muted, 1.0);
+    cr.move_to(cx - line.width() as f64 / pango::SCALE as f64 / 2.0, y);
+    pangocairo::functions::show_layout(cr, &line);
     Ok(())
+}
+
+/// `text` wrapped to `width` px, centred.
+fn wrapped(cr: &Context, text: &str, size_px: f64, width: f64) -> pango::Layout {
+    let layout = layout(cr, text, UI_FONT, size_px);
+    layout.set_width((width * pango::SCALE as f64) as i32);
+    layout.set_wrap(pango::WrapMode::WordChar);
+    layout.set_alignment(pango::Alignment::Center);
+    layout
+}
+
+/// The welcome cards' line icons: a page, a prompt, a folder; `size` is their height.
+fn welcome_icon(cr: &Context, what: Welcome, cx: f64, cy: f64, size: f64, colour: Rgb) -> Result<(), Error> {
+    let h = size;
+    cr.set_line_width((size / 16.0).max(1.5));
+    cr.set_line_join(gtk4::cairo::LineJoin::Round);
+    cr.set_line_cap(gtk4::cairo::LineCap::Round);
+    set(cr, colour, 1.0);
+    match what {
+        Welcome::OpenFile => {
+            let (w, fold) = (h * 0.76, h * 0.28);
+            let (x, y) = (cx - w / 2.0, cy - h / 2.0);
+            cr.move_to(x + 3.0, y);
+            cr.line_to(x + w - fold, y);
+            cr.line_to(x + w, y + fold);
+            cr.line_to(x + w, y + h - 3.0);
+            cr.arc(x + w - 3.0, y + h - 3.0, 3.0, 0.0, FRAC_PI_2);
+            cr.line_to(x + 3.0, y + h);
+            cr.arc(x + 3.0, y + h - 3.0, 3.0, FRAC_PI_2, PI);
+            cr.line_to(x, y + 3.0);
+            cr.arc(x + 3.0, y + 3.0, 3.0, PI, PI + FRAC_PI_2);
+            cr.move_to(x + w - fold, y);
+            cr.line_to(x + w - fold, y + fold);
+            cr.line_to(x + w, y + fold);
+        }
+        Welcome::Terminal => {
+            let w = h * 1.15;
+            let r = Rect { x: cx - w / 2.0, y: cy - h * 0.42, w, h: h * 0.84 };
+            rounded_rect(cr, r, h * 0.16);
+            let (x, y) = (r.x + w * 0.22, r.y + r.h * 0.36);
+            cr.move_to(x, y);
+            cr.line_to(x + w * 0.14, y + r.h * 0.14);
+            cr.line_to(x, y + r.h * 0.28);
+            cr.move_to(x + w * 0.24, y + r.h * 0.34);
+            cr.line_to(x + w * 0.5, y + r.h * 0.34);
+        }
+        Welcome::Folder => {
+            let w = h * 1.2;
+            let (x, y, fh) = (cx - w / 2.0, cy - h * 0.38, h * 0.76);
+            cr.move_to(x + 3.0, y);
+            cr.line_to(x + w * 0.36, y);
+            cr.line_to(x + w * 0.46, y + fh * 0.16);
+            cr.line_to(x + w - 3.0, y + fh * 0.16);
+            cr.arc(x + w - 3.0, y + fh * 0.16 + 3.0, 3.0, -FRAC_PI_2, 0.0);
+            cr.line_to(x + w, y + fh - 3.0);
+            cr.arc(x + w - 3.0, y + fh - 3.0, 3.0, 0.0, FRAC_PI_2);
+            cr.line_to(x + 3.0, y + fh);
+            cr.arc(x + 3.0, y + fh - 3.0, 3.0, FRAC_PI_2, PI);
+            cr.line_to(x, y + 3.0);
+            cr.arc(x + 3.0, y + 3.0, 3.0, PI, PI + FRAC_PI_2);
+        }
+    }
+    cr.stroke()
 }
 
 fn presence(s: &Scene, n: u8) -> f64 {
@@ -349,7 +510,7 @@ fn draw_rail_modules(cr: &Context, s: &Scene) -> Result<(), Error> {
 fn draw_rail_units(cr: &Context, s: &Scene) -> Result<(), Error> {
     let t = &*s.theme;
     let cx = RAIL_WIDTH / 2.0;
-    for pill in pills(s) {
+    for pill in pills(s).into_iter().filter(|_| s.modules.pills) {
         rounded_rect(cr, pill, PILL_END);
         set(cr, t.text, 0.06);
         cr.fill_preserve()?;

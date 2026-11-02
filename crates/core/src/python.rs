@@ -51,6 +51,19 @@ pub fn venvs(start: &Path, stop: Option<&Path>, virtual_env: Option<&Path>, home
     out
 }
 
+/// The project folder of `file` inside the workspace folder `stop`: the folder holding
+/// the virtualenv nearest to the file (`lab/` for `lab/.venv`). Language servers start
+/// there, so a project below the workspace folder gets its own packages and tools.
+pub fn project_root(file: &Path, stop: &Path) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    let stop = stop.canonicalize().unwrap_or_else(|_| stop.to_path_buf());
+    if !dir.starts_with(&stop) {
+        return None;
+    }
+    // …/<project>/.venv/bin/python
+    venvs(dir, Some(&stop), None, None).first()?.ancestors().nth(3).map(Path::to_path_buf)
+}
+
 /// `$VIRTUAL_ENV` needn't carry a usual name.
 fn venv_python_any(dir: &Path) -> Option<PathBuf> {
     Some(dir.join("bin/python")).filter(|p| p.is_file())
@@ -138,6 +151,20 @@ mod tests {
         // $VIRTUAL_ENV comes first.
         venv(&root.join("active"), true);
         assert_eq!(venvs(&sub, Some(&root), Some(&root.join("active")), None)[0], root.join("active/bin/python"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_project_below_the_workspace_folder_is_its_own_root() {
+        let root = std::env::temp_dir().join(format!("tileide-proj-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("lab/pandas")).unwrap();
+        // Paths reach `project_root` canonicalized (`/tmp` may be a link).
+        let root = root.canonicalize().unwrap();
+        venv(&root.join("lab/.venv"), true);
+        let notebook = root.join("lab/pandas/practice.ipynb");
+        assert_eq!(project_root(&notebook, &root), Some(root.join("lab")));
+        assert_eq!(project_root(&root.join("README.md"), &root), None, "no venv between the file and the workspace folder");
+        assert_eq!(project_root(Path::new("/elsewhere/a.py"), &root), None, "outside the workspace folder");
         let _ = std::fs::remove_dir_all(root);
     }
 

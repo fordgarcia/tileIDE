@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tileide_core::layout::LayoutKind;
 use tileide_core::motion::Curve;
+use tileide_core::theme::Edge;
+use tileide_core::token::Rice;
 use tileide_core::tiles::{Axis, Direction};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +21,7 @@ pub struct Config {
     pub background_set: bool,
     pub tiling: Tiling,
     pub alerts: Alerts,
+    pub editor: Editor,
     /// The user's binds, in order; they replace defaults with the same keys.
     pub binds: Vec<Bind>,
     pub workspaces: BTreeMap<u8, Workspace>,
@@ -37,6 +40,18 @@ pub struct Alerts {
     /// A tool, language server, debugger, Jupyter or Python module is missing. Off, the
     /// message still shows where the action ran (run card, debug tile, notebook cell).
     pub missing_tools: bool,
+    /// A new tile was refused: the workspace holds `tiling.max_tiles` already.
+    pub tile_limit: bool,
+}
+
+/// Typing aids in editors and notebook cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Editor {
+    /// Typing `(`, `[`, `{` or a quote adds its closing partner; typing that partner
+    /// steps over it.
+    pub auto_close: bool,
+    /// Highlights the bracket matching the one at the cursor.
+    pub match_brackets: bool,
 }
 
 /// Overrides for one built-in language server.
@@ -75,6 +90,14 @@ pub struct Appearance {
     /// the theme's look.
     pub tile_transparency: Option<f64>,
     pub tile_blur: Option<f64>,
+    /// Tile outline (px, 0 = none) and its colour; the focused tile's is the accent.
+    pub tile_border: f64,
+    pub tile_border_color: Edge,
+    /// The line around the frame's hole, where the tiles sit (px, 0 = none).
+    pub frame_border: f64,
+    pub frame_border_color: Edge,
+    /// The overall arrangement: the rail (default) or the Wikipedia layout.
+    pub rice: Rice,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +118,8 @@ pub struct Sidebar {
     pub icon_scale: f64,
     /// The discs and squares behind the rail's icons.
     pub icon_backgrounds: bool,
+    /// The two rounded pills the rail's buttons sit on.
+    pub pills: bool,
     /// The frame's (rail, border, drawer) see-through (percent) and backdrop blur (px);
     /// `None` = as designed.
     pub transparency: Option<f64>,
@@ -122,6 +147,10 @@ pub struct Tiling {
     pub gaps_out: u32,
     /// New columns' width as a fraction of the code region (columns layout).
     pub column_width: f64,
+    /// Most tiles one workspace may hold; new-tile commands beyond it show a notice.
+    pub max_tiles: u32,
+    /// Columns layout: px of the neighbouring columns kept in sight (0 = none).
+    pub peek: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -235,6 +264,11 @@ impl Default for Config {
                 code_size: 11.0,
                 tile_transparency: None,
                 tile_blur: None,
+                tile_border: tileide_core::token::TILE_BORDER,
+                tile_border_color: Edge::Subtle,
+                frame_border: 0.0,
+                frame_border_color: Edge::Accent,
+                rice: Rice::Default,
             },
             sidebar: Sidebar {
                 start_expanded: false,
@@ -249,13 +283,15 @@ impl Default for Config {
                 scale: 1.0,
                 icon_scale: 1.0,
                 icon_backgrounds: true,
+                pills: true,
                 transparency: None,
                 blur: None,
             },
             background: Background { mode: "see-through".into(), source: None, dim: 0, blur: 0, tile_opacity: 0.92, fit: "cover".into() },
             background_set: false,
-            tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5 },
-            alerts: Alerts { missing_tools: true },
+            tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5, max_tiles: tileide_core::token::MAX_TILES, peek: tileide_core::token::PEEK },
+            alerts: Alerts { missing_tools: true, tile_limit: true },
+            editor: Editor { auto_close: true, match_brackets: false },
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),

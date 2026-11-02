@@ -8,6 +8,8 @@ use std::rc::Rc;
 use mlua::{Lua, Result, Table, Value, Variadic};
 use tileide_core::layout::LayoutKind;
 use tileide_core::motion::{Curve, MAX_SPEED, MIN_SPEED};
+use tileide_core::theme::Edge;
+use tileide_core::token::{BORDER_MAX, Rice};
 use tileide_core::tiles::{Axis, Direction};
 
 use crate::fields::{Fields, error};
@@ -44,7 +46,11 @@ fn options(lua: &Lua, section: &str, value: Value) -> Result<Fields> {
 }
 
 fn layout_kind(f: &mut Fields, key: &str) -> Result<Option<LayoutKind>> {
-    Ok(f.choice(key, &["dwindle", "columns"])?.map(|v| if v == "columns" { LayoutKind::Columns } else { LayoutKind::Dwindle }))
+    Ok(f.choice(key, &["dwindle", "columns", "stack"])?.map(|v| match v.as_str() {
+        "columns" => LayoutKind::Columns,
+        "stack" => LayoutKind::Stack,
+        _ => LayoutKind::Dwindle,
+    }))
 }
 
 /// Builds the read-only `tileide` table: writes to it raise an error.
@@ -82,6 +88,11 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         if let Some(v) = f.number("code_size", crate::settings::CODE_SIZE.0, crate::settings::CODE_SIZE.1)? { a.code_size = v; set.push("code_size") }
         if let Some(v) = f.number("tile_transparency", 0.0, crate::settings::TRANSPARENCY_MAX)? { a.tile_transparency = Some(v); set.push("tile_transparency") }
         if let Some(v) = f.number("tile_blur", 0.0, crate::settings::BLUR_MAX)? { a.tile_blur = Some(v); set.push("tile_blur") }
+        if let Some(v) = f.number("tile_border", 0.0, BORDER_MAX)? { a.tile_border = v; set.push("tile_border") }
+        if let Some(v) = f.choice("tile_border_color", &Edge::KEYS)? { a.tile_border_color = Edge::from_key(&v).unwrap_or_default(); set.push("tile_border_color") }
+        if let Some(v) = f.number("frame_border", 0.0, BORDER_MAX)? { a.frame_border = v; set.push("frame_border") }
+        if let Some(v) = f.choice("frame_border_color", &Edge::KEYS)? { a.frame_border_color = Edge::from_key(&v).unwrap_or_default(); set.push("frame_border_color") }
+        if let Some(v) = f.choice("rice", &Rice::KEYS)? { a.rice = Rice::from_key(&v).unwrap_or_default(); set.push("rice") }
         f.accept(&["opacity", "blur_hint"]);
         b.config.explicit.extend(set.into_iter().map(|k| format!("appearance.{k}")));
         f.finish(&mut b.warnings);
@@ -105,6 +116,7 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
             ("show_config", &mut s.show_config),
             ("show_visualizer", &mut s.show_visualizer),
             ("icon_backgrounds", &mut s.icon_backgrounds),
+            ("pills", &mut s.pills),
         ] {
             if let Some(v) = f.boolean(key)? { *slot = v; set.push(key) }
         }
@@ -138,6 +150,8 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         if let Some(v) = f.uint("gaps_in", 100)? { t.gaps_in = v; set.push("gaps_in") }
         if let Some(v) = f.uint("gaps_out", 100)? { t.gaps_out = v; set.push("gaps_out") }
         if let Some(v) = f.number("column_width", 0.2, 1.0)? { t.column_width = v }
+        if let Some(v) = f.uint("max_tiles", 64)? { t.max_tiles = v.max(1); set.push("max_tiles") }
+        if let Some(v) = f.number("peek", 0.0, tileide_core::token::PEEK_MAX)? { t.peek = v; set.push("peek") }
         b.config.explicit.extend(set.into_iter().map(|k| format!("tiling.{k}")));
         f.finish(&mut b.warnings);
         Ok(())
@@ -151,6 +165,24 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
             b.config.alerts.missing_tools = v;
             b.config.explicit.insert("alerts.missing_tools".into());
         }
+        if let Some(v) = f.boolean("tile_limit")? {
+            b.config.alerts.tile_limit = v;
+            b.config.explicit.insert("alerts.tile_limit".into());
+        }
+        f.finish(&mut b.warnings);
+        Ok(())
+    })?)?;
+
+    let b = shared.clone();
+    api.set("editor", lua.create_function(move |lua, value: Value| {
+        let mut f = options(lua, "editor", value)?;
+        let mut b = b.borrow_mut();
+        let mut set = Vec::new();
+        let e = &mut b.config.editor;
+        for (key, slot) in [("auto_close", &mut e.auto_close), ("match_brackets", &mut e.match_brackets)] {
+            if let Some(v) = f.boolean(key)? { *slot = v; set.push(key) }
+        }
+        b.config.explicit.extend(set.into_iter().map(|k| format!("editor.{k}")));
         f.finish(&mut b.warnings);
         Ok(())
     })?)?;
@@ -288,7 +320,8 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
             None | Some("toggle") => Action::Layout(None),
             Some("dwindle") => Action::Layout(Some(LayoutKind::Dwindle)),
             Some("columns") => Action::Layout(Some(LayoutKind::Columns)),
-            Some(other) => return Err(with(&format!("expected toggle, dwindle or columns, got {other}"))),
+            Some("stack") => Action::Layout(Some(LayoutKind::Stack)),
+            Some(other) => return Err(with(&format!("expected toggle, dwindle, columns or stack, got {other}"))),
         },
         "split" => match arg {
             Some("vertical") => Action::Split(Axis::Column),

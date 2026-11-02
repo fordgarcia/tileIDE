@@ -47,6 +47,7 @@ pub fn css(t: &Theme) -> String {
 .settings .value {{ color: {muted}; font-size: 12px; font-feature-settings: \"tnum\"; }}
 .settings .empty {{ color: {muted}; padding: 24px 6px; }}
 .settings .footer {{ color: {muted}; font-size: 12px; padding: 6px 8px 0 8px; }}
+.settings .version {{ color: {muted}; font-size: 11px; padding: 6px 8px 0 8px; opacity: 0.8; }}
 .settings switch:checked {{ background-color: {accent}; }}
 .settings button.pill {{ min-height: 26px; padding: 0 12px; border-radius: 13px; border: 1px solid {edge}; background: transparent; box-shadow: none; color: {text}; font-size: 12px; }}
 .settings button.pill:hover {{ background-color: {hover}; }}
@@ -110,11 +111,25 @@ const SECTIONS: &[(&str, &[Spec])] = &[
         ],
     ),
     (
+        "Editor",
+        &[
+            ("editor.auto_close", "Close brackets and quotes", "Typing ( [ { \" ' adds the closing one; typing it again steps over", "auto pair autoclose brackets parentheses quotes complete"),
+            ("editor.match_brackets", "Highlight matching brackets", "The bracket that pairs with the one at the cursor", "bracket match highlight parentheses pair"),
+        ],
+    ),
+    (
         "Layout",
         &[
+            ("appearance.rice", "Rice", "Default: the rail, Files as a drawer · Wikipedia: a top bar, Files on the left, workspaces on the right, tiles stacked top to bottom", "layout style arrangement wikipedia rail top bar sidebar vertical stack"),
             ("appearance.window_radius", "Rounded corners", "Tile corner radius", "radius round corners window"),
+            ("appearance.tile_border", "Tile border", "0 hides it; the focused tile's is always the accent", "outline edge stroke line width tile"),
+            ("appearance.tile_border_color", "Tile border colour", "From the theme", "outline edge colour color tile"),
+            ("appearance.frame_border", "Outer border", "A line around the area the tiles sit in; 0 hides it", "outline edge stroke line frame window outer"),
+            ("appearance.frame_border_color", "Outer border colour", "From the theme", "outline edge colour color frame outer"),
             ("tiling.gaps_in", "Gaps between tiles", "", "gap spacing inner"),
             ("tiling.gaps_out", "Gaps at the edge", "Between the frame and the tiles", "gap spacing outer margin"),
+            ("tiling.max_tiles", "Most tiles per workspace", "New tiles beyond this are refused", "tile limit maximum count many crash"),
+            ("tiling.peek", "Next-tile peek", "Columns layout (Alt+V): how much of the tiles beside the focused one stays in sight; 0 hides it", "peek preview neighbour next previous column edge scroll niri hint"),
             ("link:themes", "Transparency, blur and wallpaper", "In Themes & background", "opacity transparent blur background wallpaper image gradient"),
         ],
     ),
@@ -132,6 +147,7 @@ const SECTIONS: &[(&str, &[Spec])] = &[
             ("sidebar.scale", "Sidebar size", "The rail's width and everything on it", "width scale rail bigger smaller wide"),
             ("sidebar.icon_scale", "Icon size", "Icons and workspace dots on the rail", "icons scale bigger smaller dots"),
             ("sidebar.icon_backgrounds", "Icon backgrounds", "The circles and squares behind the rail's icons", "icon background circle square button fill plain"),
+            ("sidebar.pills", "Pills", "The two rounded shapes the rail's buttons sit on", "pill capsule background group plain minimal"),
             ("sidebar.show_visualizer", "Audio visualizer", "A waveform while something plays (in the rail, or under the files)", "music sound audio waveform spectrum"),
             ("sidebar.start_expanded", "Start with the files open", "", "drawer expanded startup"),
             ("sidebar.show_launcher", "File-tree button", "At the top of the rail", "launcher opener tree files show hide"),
@@ -149,6 +165,11 @@ const SECTIONS: &[(&str, &[Spec])] = &[
             "Missing tools",
             "A popup when a language server, debugger, Jupyter or a Python module is missing. Off, the message still shows in the run card, debug tile or notebook cell",
             "alert notification popup banner missing dependency dependencies install module library package warning",
+        ), (
+            "alerts.tile_limit",
+            "Tile limit reached",
+            "A popup when a new tile is refused because the workspace holds Most tiles per workspace already",
+            "alert notification popup banner tile limit maximum max count full",
         )],
     ),
     (
@@ -209,8 +230,14 @@ fn format_value(key: &str, v: f64) -> String {
         "appearance.ui_scale" | "sidebar.scale" | "sidebar.icon_scale" => format!("{:.0}%", v * 100.0),
         "appearance.motion_speed" => format!("{v:.2}×"),
         "appearance.code_size" => format!("{v:.0} pt"),
+        "tiling.max_tiles" => format!("{v:.0}"),
         _ => format!("{v:.0} px"),
     }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 fn step(key: &str) -> f64 {
@@ -297,7 +324,14 @@ impl SettingsCard {
 
         let footer = label("Changes apply as you make them and are kept in state.lua; anything tileide.lua sets wins and is locked here. Esc closes.", "footer");
         footer.set_wrap(true);
-        card.append(&footer);
+        footer.set_hexpand(true);
+        // The running version, bottom right.
+        let version = label(concat!("TileIDE ", env!("CARGO_PKG_VERSION")), "version");
+        version.set_valign(gtk::Align::End);
+        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        bottom.append(&footer);
+        bottom.append(&version);
+        card.append(&bottom);
         root.append(&card);
         overlay.add_overlay(&root);
 
@@ -682,7 +716,7 @@ fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) ->
             Control::Scale(scale)
         }
         Some(Kind::Choice(keys)) => {
-            let labels: Vec<String> = keys.iter().map(|k| tileide_core::motion::Curve::from_key(k).map_or_else(|| (*k).to_string(), |c| c.label().to_string())).collect();
+            let labels: Vec<String> = keys.iter().map(|k| tileide_core::motion::Curve::from_key(k).map_or_else(|| capitalized(k), |c| c.label().to_string())).collect();
             let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let d = gtk::DropDown::from_strings(&refs);
             d.set_valign(gtk::Align::Center);
