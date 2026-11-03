@@ -118,6 +118,36 @@ pub fn load_theme(path: &Path) -> Result<(Theme, Vec<String>), String> {
     Ok((theme, warnings))
 }
 
+/// `theme` as a theme file that `load_theme` reads back unchanged (the theme editor's
+/// Save and Export). `header` is the comment line on top.
+pub fn theme_lua(theme: &Theme, header: &str) -> String {
+    let hex = vscode::hex;
+    let mut lua = format!("-- {header}\nreturn {{\n  name      = {},\n  mode      = \"{}\",\n", lua_string(&theme.name), if theme.dark { "dark" } else { "light" });
+    for (key, c) in [("surface", theme.surface), ("tile", theme.tile), ("text", theme.text), ("muted", theme.muted), ("accent", theme.accent), ("on_accent", theme.on_accent), ("error", theme.error), ("strip_mid", theme.strip[1])] {
+        lua += &format!("  {key:<9} = \"{}\",\n", hex(c));
+    }
+    if let Some(g) = &theme.glass {
+        lua += &format!(
+            "  glass = {{\n    opacity        = {},\n    bottom         = \"{}\",\n    bottom_opacity = {},\n    edge_opacity   = {},\n    focus_opacity  = {},\n    blur           = {},\n    saturate       = {},\n    min_tint       = {},\n  }},\n",
+            g.opacity,
+            hex(g.bottom),
+            g.bottom_opacity,
+            g.edge_opacity,
+            g.focus_opacity,
+            g.blur,
+            g.saturate,
+            g.min_tint
+        );
+    }
+    for (table, keys, colours) in [("syntax", &SYNTAX_KEYS[..], &theme.code[..]), ("terminal", &ANSI_KEYS[..], &theme.ansi[..])] {
+        let set: Vec<String> = keys.iter().zip(colours).filter_map(|(key, c)| c.map(|c| format!("    {key} = \"{}\",\n", hex(c)))).collect();
+        if !set.is_empty() {
+            lua += &format!("  {table} = {{\n{}  }},\n", set.concat());
+        }
+    }
+    lua + "}\n"
+}
+
 /// `glass = { … }` in a theme file; every key is optional (defaults: theme-design.md §4).
 fn read_glass(mut f: Fields, warnings: &mut Vec<String>) -> mlua::Result<Glass> {
     let d = Glass::default();

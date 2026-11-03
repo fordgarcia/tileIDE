@@ -584,6 +584,7 @@ pub fn flow_row(children: &[&gtk::Widget]) -> gtk::FlowBox {
 /// A labelled slider with its value; returns the scale and the row.
 fn slider(name: &str, min: f64, max: f64, step: f64, unit: &'static str) -> (gtk::Scale, gtk::Box) {
     let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
+    crate::settings_ui::ignore_wheel(&scale);
     scale.set_hexpand(true);
     scale.set_draw_value(false);
     let value = label("");

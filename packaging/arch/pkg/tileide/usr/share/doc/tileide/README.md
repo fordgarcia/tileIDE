@@ -85,7 +85,8 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 | `Alt+,` / `Alt+K` | settings / keybinds |
 | `Alt+=` / `Alt+-` | code font bigger / smaller |
 | `Alt+Shift+T` / `Alt+Shift+X` | settings: themes & background / extensions |
-| `Alt+I` / `F12` / `Ctrl+Space` | hover info / go to definition / complete (language servers; `Tab` takes the suggestion) |
+| `Tab` | in an editor or cell, after a name or a `.`: complete (one match is filled in, else a list; as in Jupyter); elsewhere it indents. With the list open, `Tab` takes the selected item |
+| `Alt+I` / `F12` / `Alt+Tab` or `Ctrl+Space` | hover info / go to definition / complete (Alt+Tab only where the desktop doesn't use it for window switching) |
 | `Ctrl+Shift+I` | format the file, or the notebook cell (Ruff for Python) |
 | `F2` / `Shift+F12` / `Ctrl+.` | rename everywhere / list references / quick fixes |
 | `Alt+Z` / `Alt+Escape` | word wrap / quit (asks if unsaved) |

@@ -97,7 +97,7 @@ fn colour(text: &str, under: Rgb) -> Option<Rgb> {
     Some(over(rgb(value), alpha, under))
 }
 
-fn hex((r, g, b): Rgb) -> String {
+pub(crate) fn hex((r, g, b): Rgb) -> String {
     let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02X}{:02X}{:02X}", byte(r), byte(g), byte(b))
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Settings (v0.4 phase 1): a large rounded card over a lightly dimmed window, in the
 //! quick-open style. A search field on top filters every setting; the sections sit on
-//! the left; changes apply live and are saved in `state.lua`. A key that `tileide.lua`
+//! the left, each showing only its own settings (search looks through all of them);
+//! changes apply live and are saved in `state.lua`. A key that `tileide.lua`
 //! sets is shown locked (the config wins, Q15). Themes + background and Extensions are
 //! pages of their own (the drawer's former sections).
 
@@ -19,6 +20,7 @@ use tileide_core::theme::{self, Theme};
 pub enum Page {
     General,
     Themes,
+    ThemeEditor,
     Extensions,
     Toolchains,
 }
@@ -73,6 +75,7 @@ pub struct Callbacks {
     /// "Unlock" on a row `tileide.lua` sets: comment that line out there.
     pub unlock: Rc<dyn Fn(&'static str)>,
     pub show_keybinds: Rc<dyn Fn()>,
+    pub export_setup: Rc<dyn Fn()>,
     /// A page became visible (the Themes page refreshes itself from the app).
     pub page_shown: Rc<dyn Fn(Page)>,
     pub on_close: Rc<dyn Fn()>,
@@ -180,6 +183,13 @@ const SECTIONS: &[(&str, &[Spec])] = &[
         ],
     ),
     (
+        "Share",
+        &[
+            ("link:theme_editor", "Theme editor", "Make a theme from the one in use: change its colours live, save or export it", "create new theme colours colors custom editor make export"),
+            ("link:export_setup", "Export setup", "tileide.lua, your Settings choices, themes, rices and background images in one .tar.gz", "export backup share rice bundle archive dotfiles setup copy machine"),
+        ],
+    ),
+    (
         "More",
         &[
             ("link:themes", "Themes & background", "Colours, wallpaper, VS Code themes", "theme colours colors background wallpaper import vscode"),
@@ -194,6 +204,7 @@ const SECTIONS: &[(&str, &[Spec])] = &[
 fn nav_entries() -> Vec<(&'static str, Option<usize>, Page)> {
     let mut entries: Vec<(&str, Option<usize>, Page)> = SECTIONS.iter().enumerate().filter(|(_, s)| s.0 != "More").map(|(i, s)| (s.0, Some(i), Page::General)).collect();
     entries.push(("Themes & background", None, Page::Themes));
+    entries.push(("Theme editor", None, Page::ThemeEditor));
     entries.push(("Extensions", None, Page::Extensions));
     entries.push(("Toolchains", None, Page::Toolchains));
     entries
@@ -215,6 +226,8 @@ pub struct SettingsCard {
     /// Set while the app selects a nav row itself.
     navigating: Cell<bool>,
     page: Cell<Page>,
+    /// The General section shown when nothing is searched.
+    section: Cell<usize>,
     me: RefCell<std::rc::Weak<SettingsCard>>,
 }
 
@@ -249,7 +262,7 @@ fn step(key: &str) -> f64 {
 }
 
 impl SettingsCard {
-    pub fn new(overlay: &gtk::Overlay, themes: &impl IsA<gtk::Widget>, extensions: &impl IsA<gtk::Widget>, callbacks: Callbacks) -> Rc<SettingsCard> {
+    pub fn new(overlay: &gtk::Overlay, themes: &impl IsA<gtk::Widget>, editor: &impl IsA<gtk::Widget>, extensions: &impl IsA<gtk::Widget>, callbacks: Callbacks) -> Rc<SettingsCard> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("settings");
         root.set_visible(false);
@@ -312,6 +325,7 @@ impl SettingsCard {
         stack.set_hexpand(true);
         stack.add_named(&scroll, Some("general"));
         stack.add_named(themes, Some("themes"));
+        stack.add_named(editor, Some("editor"));
         stack.add_named(extensions, Some("extensions"));
         let toolchains = gtk::Box::new(gtk::Orientation::Vertical, 0);
         toolchains.add_css_class("page");
@@ -350,6 +364,7 @@ impl SettingsCard {
             updating: Cell::new(false),
             navigating: Cell::new(false),
             page: Cell::new(Page::General),
+            section: Cell::new(0),
             me: RefCell::new(std::rc::Weak::new()),
         });
         *view.me.borrow_mut() = Rc::downgrade(&view);
@@ -416,6 +431,8 @@ impl SettingsCard {
                 let Some(v) = weak.upgrade() else { return };
                 match link.as_str() {
                     "link:themes" => v.show_page(Page::Themes),
+                    "link:theme_editor" => v.show_page(Page::ThemeEditor),
+                    "link:export_setup" => (v.callbacks.export_setup)(),
                     "link:extensions" => v.show_page(Page::Extensions),
                     "link:toolchains" => v.show_page(Page::Toolchains),
                     "link:keybinds" => {
@@ -443,14 +460,18 @@ impl SettingsCard {
                 return;
             }
             let Some(&(_, section, page)) = nav_entries().get(row.index() as usize) else { return };
+            if let Some(section) = section {
+                v.section.set(section);
+            }
             if !v.search.text().is_empty() {
                 v.navigating.set(true);
                 v.search.set_text("");
                 v.navigating.set(false);
             }
             v.set_page(page);
-            if let Some(section) = section {
-                v.scroll_to(section);
+            if page == Page::General {
+                v.filter();
+                v.scroll.vadjustment().set_value(0.0);
             }
         });
 
@@ -514,14 +535,24 @@ impl SettingsCard {
     }
 
     fn show_page(&self, page: Page) {
-        let index = nav_entries().iter().position(|e| e.2 == page && (page != Page::General || e.1 == Some(0)));
+        if page == Page::General {
+            self.section.set(0);
+        }
+        self.select_nav(page);
+        self.set_page(page);
+        if page == Page::General {
+            self.filter();
+            self.scroll.vadjustment().set_value(0.0);
+        }
+    }
+
+    /// Selects `page`'s nav row (the current section's for General) without acting on it.
+    fn select_nav(&self, page: Page) {
+        let section = self.section.get();
+        let index = nav_entries().iter().position(|e| e.2 == page && (page != Page::General || e.1 == Some(section)));
         self.navigating.set(true);
         self.nav.select_row(index.and_then(|i| self.nav.row_at_index(i as i32)).as_ref());
         self.navigating.set(false);
-        self.set_page(page);
-        if page == Page::General {
-            self.scroll.vadjustment().set_value(0.0);
-        }
     }
 
     fn set_page(&self, page: Page) {
@@ -529,6 +560,7 @@ impl SettingsCard {
         self.stack.set_visible_child_name(match page {
             Page::General => "general",
             Page::Themes => "themes",
+            Page::ThemeEditor => "editor",
             Page::Extensions => "extensions",
             Page::Toolchains => "toolchains",
         });
@@ -536,19 +568,6 @@ impl SettingsCard {
             self.detect_toolchains();
         }
         (self.callbacks.page_shown)(page);
-    }
-
-    fn scroll_to(&self, section: usize) {
-        let Some(heading) = self.headings.get(section) else { return };
-        let Some(page) = self.scroll.child() else { return };
-        let heading = heading.clone();
-        let adjustment = self.scroll.vadjustment();
-        // After the page has been laid out.
-        glib::idle_add_local_once(move || {
-            if let Some(p) = heading.compute_point(&page, &gtk::graphene::Point::new(0.0, 0.0)) {
-                adjustment.set_value((p.y() as f64 - 8.0).max(0.0));
-            }
-        });
     }
 
     /// Fills the Toolchains page (detected off the main thread; each opening re-checks).
@@ -601,13 +620,14 @@ impl SettingsCard {
         });
     }
 
-    /// Hides rows that don't match every typed word; searching shows the General page.
+    /// Without a search, shows only the current section; with one, the rows of every
+    /// section that match every typed word (on the General page).
     fn filter(&self) {
         let query = self.search.text().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut shown_per_section = vec![0; SECTIONS.len()];
         for item in &self.items {
-            let shown = words.iter().all(|w| item.text.contains(w));
+            let shown = if words.is_empty() { item.section == self.section.get() } else { words.iter().all(|w| item.text.contains(w)) };
             item.widget.set_visible(shown);
             if shown {
                 shown_per_section[item.section] += 1;
@@ -623,7 +643,33 @@ impl SettingsCard {
             self.navigating.set(false);
             self.set_page(Page::General);
             self.scroll.vadjustment().set_value(0.0);
+        } else if words.is_empty() && self.page.get() == Page::General && self.nav.selected_row().is_none() {
+            // The search was cleared: back on the section it left.
+            self.select_nav(Page::General);
         }
+    }
+
+    /// Development (`--test-actions settings-nav:<row>`, `settings-nav:-1 <words>`, `settings-nav:-2`): selects nav row `row` and
+    /// returns the page, the visible rows and how many sliders still take the wheel.
+    /// Row -1 types `search` into the search field instead; -2 only reports.
+    pub fn test_nav(&self, row: i32, search: &str) -> String {
+        if row == -1 {
+            self.search.set_text(search);
+        } else if row >= 0 {
+            self.nav.select_row(self.nav.row_at_index(row).as_ref());
+        }
+        let shown: Vec<&str> = self.items.iter().filter(|i| i.widget.is_visible()).map(|i| i.key.unwrap_or("link")).collect();
+        let wheel = |s: &gtk::Scale| {
+            let c = s.observe_controllers();
+            (0..c.n_items()).filter(|i| c.item(*i).and_downcast::<gtk::EventControllerScroll>().is_some()).count()
+        };
+        let sliders = self.items.iter().filter_map(|i| match &i.control {
+            Some(Control::Scale(s)) => Some(wheel(s)),
+            _ => None,
+        });
+        let fresh = wheel(&gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.1));
+        let row = self.nav.selected_row().map(|r| r.index());
+        format!("page {:?} section {} nav {row:?} shown {shown:?} sliders-with-wheel {} (a plain GtkScale has {fresh})", self.page.get(), self.section.get(), sliders.sum::<usize>())
     }
 
     /// Shows `config`'s values; keys `tileide.lua` sets are locked.
@@ -661,6 +707,16 @@ impl SettingsCard {
     }
 }
 
+/// Removes GtkRange's wheel handler, so the wheel over a slider scrolls the page
+/// instead of changing the value; dragging, clicks and keys still work.
+pub fn ignore_wheel(scale: &gtk::Scale) {
+    let controllers = scale.observe_controllers();
+    let wheel: Vec<gtk::EventController> = (0..controllers.n_items()).filter_map(|i| controllers.item(i).and_downcast::<gtk::EventControllerScroll>()).map(|c| c.upcast()).collect();
+    for c in wheel {
+        scale.remove_controller(&c);
+    }
+}
+
 fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) -> Item {
     let widget = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     widget.add_css_class("item");
@@ -686,7 +742,11 @@ fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) ->
     widget.append(&text);
 
     if key.starts_with("link:") {
-        let open = gtk::Button::with_label(if key == "link:keybinds" { "Show" } else { "Open" });
+        let open = gtk::Button::with_label(match key {
+            "link:keybinds" => "Show",
+            "link:export_setup" => "Export…",
+            _ => "Open",
+        });
         open.add_css_class("pill");
         open.set_valign(gtk::Align::Center);
         open.set_widget_name(key);
@@ -703,6 +763,7 @@ fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) ->
         }
         Some(Kind::Number(min, max)) => {
             let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step(key));
+            ignore_wheel(&scale);
             scale.set_draw_value(false);
             scale.set_size_request(180, -1);
             scale.set_valign(gtk::Align::Center);

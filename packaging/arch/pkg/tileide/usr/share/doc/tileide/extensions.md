@@ -8,7 +8,7 @@ stdin/stdout. It can be written in any language. TileIDE does not run VS Code ex
 `~/.local/share/tileide/extensions/<id>/` (`$XDG_DATA_HOME`), one folder per extension,
 each with an `extension.json`. Install one from the drawer's **Extensions** section
 (Settings → Extensions, `Alt+Shift+X`): **From folder…** copies a folder, **Clone** runs `git clone --depth 1`.
-Nothing runs while installing. There is no registry yet (planned with mods, v0.5).
+Nothing runs while installing. There is no registry yet (planned with mods, v0.7).
 
 ## `extension.json`
 ```json

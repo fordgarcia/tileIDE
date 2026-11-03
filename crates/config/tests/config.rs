@@ -171,6 +171,21 @@ fn glass_table_defaults_and_warnings() {
 }
 
 #[test]
+fn written_themes_read_back_unchanged() {
+    let dir = config_dir("theme-write", &[]);
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["black-glass", "dusk", "miasma", "pale-ember"] {
+        let (mut theme, _) = load_theme(&sample_dir().join(format!("themes/{name}.lua"))).unwrap();
+        theme.name = format!("{} \"copy\"", theme.name);
+        let path = dir.join(format!("{name}.lua"));
+        fs::write(&path, tileide_config::theme_lua(&theme, "Made in the theme editor.")).unwrap();
+        let (back, warnings) = load_theme(&path).unwrap();
+        assert!(warnings.is_empty(), "{name}: {warnings:?}");
+        assert_eq!(back, theme, "{name}");
+    }
+}
+
+#[test]
 fn user_themes_shadow_packaged_ones() {
     let user = config_dir("themes-user", &[("miasma.lua", "")]);
     let found = find_themes(&[user.clone(), sample_dir().join("themes")]);

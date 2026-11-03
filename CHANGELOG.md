@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0-alpha.5 (2026-11-03): theme editor, setup export
+
+### Added
+- **Settings → Theme editor**: starts from the theme in use; change its name, mode and eight colours (frame, tiles, text, muted text, accent, text on accent, errors, tray middle tone) and the whole app shows them live while the page is open. **Save and use** writes `themes/<name>.lua` in your config folder and switches to it (it never replaces a theme file you wrote yourself: it saves as `<name>-2.lua` instead); **Export…** writes the theme file anywhere; **Start over** goes back to the theme in use. Glass, syntax and terminal colours come along from the theme you started from. Leaving the page or closing Settings shows the theme in use again; the draft waits for you.
+- **Settings → Share → Export setup**: one `.tar.gz` with `tileide.lua`, your Settings choices (`state.lua`), your themes and rices, the background images you use and a README listing your extensions. Unpacking it in `~/.config` restores the setup (back up first).
+
+## 0.5.0-alpha.4 (2026-11-03): Settings pages
+
+### Changed
+- **Settings shows one section at a time.** Picking Appearance, Editor, Layout, Motion, Sidebar, Alerts or Keyboard on the left shows only that section's settings, instead of scrolling one long page. Search still looks through every section; clearing it goes back to the section you were on.
+- **The mouse wheel no longer changes sliders** in Settings or Themes & background: scrolling over a slider scrolls the page. Drag, click or use the arrow keys to change a value.
+
 ## 0.5.0-alpha.3 (2026-11-02): the Wikipedia rice
 
 ### Added

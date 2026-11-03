@@ -34,6 +34,8 @@ mod quick_open;
 mod run_card;
 mod settings;
 mod settings_ui;
+mod setup_export;
+mod theme_editor;
 mod themes_panel;
 mod tile_view;
 mod toolchains;
@@ -141,11 +143,16 @@ struct App {
     raw_config: RefCell<Config>,
     save_timer: RefCell<Option<glib::SourceId>>,
     themes_panel: Rc<themes_panel::ThemesPanel>,
+    theme_editor: Rc<theme_editor::ThemeEditor>,
     extensions_panel: Rc<extensions_panel::ExtensionsPanel>,
     /// The workspace the Themes section was last filled for.
     panel_for: Cell<Option<Option<u8>>>,
     /// A Themes section row shown over the applied theme while hovered or selected.
     preview_theme: RefCell<Option<String>>,
+    /// The theme editor's draft, shown over every other theme while its page is open.
+    draft_theme: RefCell<Option<Rc<Theme>>>,
+    /// Bumped on every draft change, so `refresh_theme` sees a new name each time.
+    draft_count: Cell<u32>,
     /// A background picked while the config pins one: lasts until restart.
     session_background: RefCell<Option<tileide_config::model::Background>>,
     /// The rail's workspace dots, fading in and out as workspaces come and go.
@@ -465,10 +472,30 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 }),
             },
         );
-        let (m11, m12, m13, m14, m16) = (me.clone(), me.clone(), me.clone(), me.clone(), me.clone());
+        let (e1, e2, e3, e4) = (me.clone(), me.clone(), me.clone(), me.clone());
+        let theme_editor = theme_editor::ThemeEditor::new(theme_editor::Callbacks {
+            current: Rc::new(move || e1.upgrade().map_or_else(Theme::builtin, |app| app.theme_in_use())),
+            preview: Rc::new(move |draft| {
+                if let Some(app) = e2.upgrade() {
+                    app.preview_draft(draft);
+                }
+            }),
+            save: Rc::new(move |theme| {
+                if let Some(app) = e3.upgrade() {
+                    app.save_draft_theme(&theme);
+                }
+            }),
+            export: Rc::new(move |theme| {
+                if let Some(app) = e4.upgrade() {
+                    app.export_theme(theme);
+                }
+            }),
+        });
+        let (m11, m12, m13, m14, m16, m17, m18) = (me.clone(), me.clone(), me.clone(), me.clone(), me.clone(), me.clone(), me.clone());
         let settings_card = settings_ui::SettingsCard::new(
             &overlay,
             themes_panel.widget(),
+            theme_editor.widget(),
             extensions_panel.widget(),
             settings_ui::Callbacks {
                 change: Rc::new(move |key, value| {
@@ -493,11 +520,19 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                         app.open_keybinds();
                     }
                 }),
+                export_setup: Rc::new(move || {
+                    if let Some(app) = m17.upgrade() {
+                        app.export_setup();
+                    }
+                }),
                 page_shown: Rc::new(move |page| {
                     let me = m14.clone();
                     // After the open/selection call returns (the panels read the app).
                     glib::idle_add_local_once(move || {
                         let Some(app) = me.upgrade() else { return };
+                        if page != settings_ui::Page::ThemeEditor {
+                            app.theme_editor.hidden();
+                        }
                         match page {
                             settings_ui::Page::Themes => {
                                 app.refresh_themes_panel();
@@ -507,12 +542,21 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                                 app.extensions_panel.refresh();
                                 app.extensions_panel.focus();
                             }
+                            settings_ui::Page::ThemeEditor => app.theme_editor.shown(),
                             settings_ui::Page::General | settings_ui::Page::Toolchains => {}
                         }
                         app.area.queue_draw();
                     });
                 }),
-                on_close: on_close.clone(),
+                on_close: {
+                    let on_close = on_close.clone();
+                    Rc::new(move || {
+                        if let Some(app) = m18.upgrade() {
+                            app.theme_editor.hidden();
+                        }
+                        on_close();
+                    })
+                },
             },
         );
         let keybinds_card = keybinds_card::KeybindsCard::new(&overlay, on_close.clone());
@@ -571,9 +615,12 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             raw_config: RefCell::new(Config::default()),
             save_timer: RefCell::new(None),
             themes_panel,
+            theme_editor,
             extensions_panel,
             panel_for: Cell::new(None),
             preview_theme: RefCell::new(None),
+            draft_theme: RefCell::new(None),
+            draft_count: Cell::new(0),
             session_background: RefCell::new(None),
             dots: RefCell::new(Presence::default()),
             reload_timer: RefCell::new(None),
@@ -752,6 +799,14 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     app.unlock_setting(key);
                 }
             }
+            (Some(app), _) if name == "editor" => println!("editor: {} · app accent {:?}", app.theme_editor.test(arg.as_deref().unwrap_or("")), app.theme.borrow().accent),
+            (Some(app), _) if name == "export-setup" => app.export_setup_to(Path::new(arg.as_deref().unwrap_or("tileide-setup.tar.gz"))),
+            (Some(app), _) if name == "settings-nav" => {
+                println!("settings-nav: {}", {
+                    let (row, words) = arg.as_deref().unwrap_or("0").split_once(' ').unwrap_or((arg.as_deref().unwrap_or("0"), ""));
+                    app.settings_card.test_nav(row.parse().unwrap_or(0), words)
+                });
+            }
             // `screenshot:<file.png>`: the window as rendered (headless checks).
             _ if name == "screenshot" => {
                 if let Err(e) = screenshot(window.upcast_ref(), arg.as_deref().unwrap_or("tileide.png")) {
@@ -775,6 +830,9 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     }
     window.present();
 }
+
+/// The first line of theme files the editor writes; Save replaces only those.
+const THEME_EDITOR_HEADER: &str = "-- Made in TileIDE's theme editor.";
 
 fn folder_name(path: &Path) -> String {
     path.file_name().map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned())
@@ -983,16 +1041,26 @@ impl App {
 
     /// The theme for the active workspace; `Some` when it changed.
     fn refresh_theme(&self, workspace: Option<&str>, number: Option<u8>) -> Option<Rc<Theme>> {
+        let draft = self.draft_theme.borrow().clone();
         let preview = self.preview_theme.borrow().clone();
-        let name = self.theme_for(preview.as_deref(), workspace, number);
+        let name = match &draft {
+            // Not a file stem: no theme file can have it.
+            Some(_) => format!("\u{1}draft {}", self.draft_count.get()),
+            None => self.theme_for(preview.as_deref(), workspace, number),
+        };
         if *self.theme_name.borrow() == name {
             return None;
         }
-        let (theme, problem) = self.paths.theme(&name);
-        if let Some(problem) = problem {
-            self.problems.borrow_mut().push(problem);
-        }
-        let theme = Rc::new(theme);
+        let theme = match draft {
+            Some(draft) => draft,
+            None => {
+                let (theme, problem) = self.paths.theme(&name);
+                if let Some(problem) = problem {
+                    self.problems.borrow_mut().push(problem);
+                }
+                Rc::new(theme)
+            }
+        };
         // Before the new theme is stored: the still must show the old colours. Painting it
         // draws the canvas now, which needs the workspaces and config; inside a workspace
         // switch they are borrowed, and the switch's own fade covers the change.
@@ -1352,6 +1420,106 @@ impl App {
         }
         *self.preview_theme.borrow_mut() = key.map(String::from);
         self.refresh();
+    }
+
+    /// The theme the active workspace uses, without a preview or the editor's draft.
+    fn theme_in_use(&self) -> Theme {
+        let (number, workspace_theme) = {
+            let w = self.workspaces.borrow();
+            let number = match w.active() {
+                Active::Number(n) => Some(n),
+                Active::Config => None,
+            };
+            (number, w.overrides().0)
+        };
+        self.paths.theme(&self.theme_for(None, workspace_theme.as_deref(), number)).0
+    }
+
+    /// The theme editor's draft shown live; `None` goes back to the theme in use.
+    fn preview_draft(&self, draft: Option<Theme>) {
+        if draft.is_none() && self.draft_theme.borrow().is_none() {
+            return;
+        }
+        self.draft_count.set(self.draft_count.get().wrapping_add(1));
+        *self.draft_theme.borrow_mut() = draft.map(Rc::new);
+        self.refresh();
+    }
+
+    /// Theme editor → Save: writes `themes/<slug>.lua` (never over a file the editor
+    /// didn't write) and picks it for all workspaces.
+    fn save_draft_theme(&self, theme: &Theme) {
+        let dir = self.paths.dir.join("themes");
+        let stem = tileide_config::vscode::slug(&theme.name);
+        let ours = |p: &Path| std::fs::read_to_string(p).is_ok_and(|t| t.starts_with(THEME_EDITOR_HEADER));
+        let mut target = dir.join(format!("{stem}.lua"));
+        let mut n = 2;
+        while target.exists() && !ours(&target) {
+            target = dir.join(format!("{stem}-{n}.lua"));
+            n += 1;
+        }
+        let written = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&target, tileide_config::theme_lua(theme, &THEME_EDITOR_HEADER[3..])));
+        let file = target.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+        if let Err(e) = written {
+            self.theme_editor.set_status(&format!("Cannot save {}: {e}", target.display()));
+            return;
+        }
+        *self.draft_theme.borrow_mut() = None;
+        self.apply_theme(file.trim_end_matches(".lua"), themes_panel::Scope::All);
+        self.theme_editor.saved(theme.clone(), &format!("Saved as themes/{file} and in use. Pick it any time in Themes & background."));
+    }
+
+    /// Theme editor → Export…: the theme file wherever the user picks.
+    fn export_theme(&self, theme: Theme) {
+        let name = format!("{}.lua", tileide_config::vscode::slug(&theme.name));
+        let me = self.me.clone();
+        gtk::FileDialog::builder().title("Export the theme").initial_name(name).build().save(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+            let (Some(app), Some(path)) = (me.upgrade(), result.ok().and_then(|f| f.path())) else { return };
+            let message = match std::fs::write(&path, tileide_config::theme_lua(&theme, &THEME_EDITOR_HEADER[3..])) {
+                Ok(()) => format!("Exported to {}. To use it elsewhere, put it in ~/.config/tileide/themes/.", path.display()),
+                Err(e) => format!("Cannot export to {}: {e}", path.display()),
+            };
+            app.theme_editor.set_status(&message);
+        });
+    }
+
+    /// Settings → Share → Export setup.
+    fn export_setup(&self) {
+        let me = self.me.clone();
+        let name = format!("tileide-setup-{}.tar.gz", glib::DateTime::now_local().ok().and_then(|d| d.format("%Y-%m-%d").ok()).map_or_else(String::new, |d| d.to_string()));
+        gtk::FileDialog::builder().title("Export your setup").initial_name(name).build().save(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+            if let (Some(app), Some(path)) = (me.upgrade(), result.ok().and_then(|f| f.path())) {
+                app.export_setup_to(&path);
+            }
+        });
+    }
+
+    fn export_setup_to(&self, out: &Path) {
+        let mut images: Vec<PathBuf> = Vec::new();
+        {
+            let config = self.raw_config.borrow();
+            let state = self.state.borrow();
+            let picked = state.background.iter().chain(state.workspaces.values().filter_map(|w| w.background.as_ref()));
+            for bg in std::iter::once(&config.background).chain(picked).filter(|b| b.mode == "image") {
+                images.extend(bg.source.as_deref().map(workspaces::expand_home));
+            }
+            images.extend(config.workspaces.values().filter_map(|w| w.background.as_deref()).map(workspaces::expand_home));
+        }
+        images.dedup();
+        let mut extensions: Vec<String> = std::fs::read_dir(extensions::default_root()).map(|d| d.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        extensions.sort();
+        let note = match setup_export::export(&self.paths.dir, &images, &extensions, out) {
+            Ok(done) => {
+                let mut note = format!("Exported your setup ({} files) to {}.", done.files, out.display());
+                if !done.missing.is_empty() {
+                    note += &format!(" Not found, so left out: {}.", done.missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+                }
+                note
+            }
+            Err(e) => format!("Cannot export the setup: {e}"),
+        };
+        println!("export-setup: {note}");
+        *self.problems.borrow_mut() = vec![note];
+        self.show_problems();
     }
 
     /// A Themes section pick. For all workspaces it behaves like the tray's.
