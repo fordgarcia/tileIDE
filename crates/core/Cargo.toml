@@ -1,0 +1,10 @@
+[package]
+name = "tileide-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TileIDE's display-independent model: tile tree, drawer state, layout tokens, theme"
+publish = false
+
+[dependencies]

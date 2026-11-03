@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Measurement helpers: drawer frame statistics, RSS, and the offscreen `render` command.
+
+use std::time::Duration;
+
+use gtk::prelude::*;
+use gtk4 as gtk;
+use gtk4::cairo;
+
+use crate::draw;
+
+/// Frame-to-frame intervals and draw cost while the drawer animates.
+#[derive(Default)]
+pub struct FrameStats {
+    pub last_frame_us: Option<i64>,
+    pub intervals_us: Vec<i64>,
+    pub draw_times: Vec<Duration>,
+}
+
+/// Bar heights for the offscreen `--visualizer` preview (mirrored like the real one).
+const SAMPLE_WAVE: [f64; 24] = [0.15, 0.22, 0.3, 0.26, 0.38, 0.5, 0.44, 0.62, 0.7, 0.85, 0.78, 0.95, 0.95, 0.78, 0.85, 0.7, 0.62, 0.44, 0.5, 0.38, 0.26, 0.3, 0.22, 0.15];
+
+pub fn print_stats(window: &gtk::ApplicationWindow, s: &FrameStats) {
+    let refresh_mhz = window
+        .surface()
+        .and_then(|surface| WidgetExt::display(window).monitor_at_surface(&surface))
+        .map(|m| m.refresh_rate())
+        .filter(|r| *r > 0)
+        .unwrap_or(60_000);
+    let budget_us = 1_000_000_000 / refresh_mhz as i64;
+    let mut intervals = s.intervals_us.clone();
+    intervals.sort_unstable();
+    let mut draws = s.draw_times.clone();
+    draws.sort_unstable();
+    if intervals.is_empty() || draws.is_empty() {
+        println!("no animation frames recorded");
+        return;
+    }
+    let ms = |us: i64| us as f64 / 1000.0;
+    let dropped = intervals.iter().filter(|&&i| i as f64 > budget_us as f64 * 1.5).count();
+    println!(
+        "drawer animation @ {:.0} Hz (frame budget {:.2} ms): {} frames, interval median {:.2} ms, p95 {:.2} ms, max {:.2} ms, dropped (>1.5x budget) {} ({:.1}%)",
+        refresh_mhz as f64 / 1000.0,
+        ms(budget_us),
+        intervals.len(),
+        ms(intervals[intervals.len() / 2]),
+        ms(intervals[intervals.len() * 95 / 100]),
+        ms(*intervals.last().unwrap()),
+        dropped,
+        dropped as f64 * 100.0 / intervals.len() as f64,
+    );
+    println!(
+        "draw callback (CPU): median {:.2} ms, max {:.2} ms",
+        draws[draws.len() / 2].as_secs_f64() * 1000.0,
+        draws.last().unwrap().as_secs_f64() * 1000.0
+    );
+}
+
+pub fn rss() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    Some(line.trim_start_matches("VmRSS:").trim().to_string())
+}
+
+/// Offscreen frame at 2x scale over a light checkerboard, so translucency and curves are visible.
+pub fn render(args: &[String]) -> Result<(), String> {
+    let usage = "usage: tileide render <out.png> <drawer 0..1> [--overlay] [--theme FILE.lua] [background flags]";
+    let out = args.first().ok_or(usage)?;
+    let open: f64 = args.get(1).and_then(|p| p.parse().ok()).ok_or(usage)?;
+    let (w, h, scale) = (1280.0, 720.0, 2.0);
+    // `--rail-scale N` / `--icon-scale N`: Settings' sidebar and icon sizes.
+    let number = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
+    tileide_core::token::set_rail(number("--rail-scale").unwrap_or(1.0), number("--icon-scale").unwrap_or(1.0));
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, (w * scale) as i32, (h * scale) as i32).map_err(|e| e.to_string())?;
+    let cr = cairo::Context::new(&surface).map_err(|e| e.to_string())?;
+    cr.scale(scale, scale);
+    let mut settings = crate::background::Settings::from_args(args)?;
+    let theme = match args.iter().position(|a| a == "--theme") {
+        Some(i) => tileide_config::load_theme(std::path::Path::new(args.get(i + 1).ok_or(usage)?))?.0,
+        None => tileide_core::theme::Theme::builtin(),
+    };
+    // `--sidebar-transparency %`, `--sidebar-blur px`, `--tile-transparency %`, `--tile-blur px`.
+    let choice = tileide_core::theme::SurfaceChoice {
+        sidebar_transparency: number("--sidebar-transparency"),
+        sidebar_blur: number("--sidebar-blur"),
+        tile_transparency: number("--tile-transparency"),
+        tile_blur: number("--tile-blur"),
+    };
+    let surfaces = theme.surfaces(choice, settings.tile_opacity, settings.source != crate::background::Source::SeeThrough);
+    settings.tile_opacity = surfaces.tiles.opacity;
+    settings.tile_blur = surfaces.tiles.blur;
+    settings.frame_blur = surfaces.sidebar.blur;
+    let tile_opacity = surfaces.tiles.opacity;
+    let mut backdrop = crate::background::Background::new(settings, theme.clone());
+    if let Some(b) = backdrop.as_mut()
+        && let Some(path) = b.image_path()
+    {
+        b.set_image(crate::background::decode(&path)?)?;
+    }
+    let background = backdrop.as_mut().and_then(|b| b.surface(w as i32, h as i32, scale).cloned());
+    let frosted = backdrop.as_ref().and_then(|b| b.frosted().cloned());
+    let frosted_frame = backdrop.as_ref().and_then(|b| b.frosted_frame().cloned());
+    let scene = draw::Scene {
+        width: w,
+        height: h,
+        theme: std::rc::Rc::new(theme),
+        // `--frame-border N`: Settings' outer border (accent).
+        geometry: tileide_core::token::Geometry { frame_border: number("--frame-border").unwrap_or(0.0), ..Default::default() },
+        // `--plain-icons`: no backgrounds behind the rail icons; `--no-pills`: no pills.
+        modules: draw::Modules {
+            icon_backgrounds: !args.iter().any(|a| a == "--plain-icons"),
+            pills: !args.iter().any(|a| a == "--no-pills"),
+            ..draw::Modules::default()
+        },
+        themes_open: false,
+        settings_open: false,
+        // `--visualizer`: a sample waveform where the rail label goes.
+        visualizer: args.iter().any(|a| a == "--visualizer").then_some((SAMPLE_WAVE.as_slice(), 1.0)),
+        solid: false,
+        drawer: tileide_core::token::DRAWER_WIDTH * open.clamp(0.0, 1.0),
+        push: !args.iter().any(|a| a == "--overlay"),
+        workspaces: &[(1, 1.0), (2, 1.0), (3, 1.0)],
+        active: Some(2),
+        clock: ("21", "45"),
+        // `--empty`: an empty workspace instead of the three placeholder tiles.
+        empty: args.iter().any(|a| a == "--empty"),
+        placeholder_tiles: !args.iter().any(|a| a == "--empty"),
+        background: background.as_ref(),
+        frosted: frosted.as_ref(),
+        frosted_frame: frosted_frame.as_ref(),
+        frame_opacity: surfaces.sidebar.opacity,
+        tile_rects: &[],
+        tile_opacity,
+    };
+    cr.push_group();
+    draw::draw(&cr, &scene).map_err(|e| e.to_string())?;
+    let frame = cr.pop_group().map_err(|e| e.to_string())?;
+    for y in 0..(h / 20.0) as i32 {
+        for x in 0..(w / 20.0) as i32 {
+            let shade = if (x + y) % 2 == 0 { 0.85 } else { 0.95 };
+            cr.set_source_rgb(shade, shade, shade);
+            cr.rectangle(x as f64 * 20.0, y as f64 * 20.0, 20.0, 20.0);
+            cr.fill().map_err(|e| e.to_string())?;
+        }
+    }
+    cr.set_source(&frame).map_err(|e| e.to_string())?;
+    cr.paint().map_err(|e| e.to_string())?;
+    drop(cr);
+    let mut file = std::fs::File::create(out).map_err(|e| format!("{out}: {e}"))?;
+    surface.write_to_png(&mut file).map_err(|e| e.to_string())
+}

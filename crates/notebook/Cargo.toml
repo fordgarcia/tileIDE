@@ -1,0 +1,14 @@
+[package]
+name = "tileide-notebook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TileIDE's Jupyter notebooks: nbformat 4 model and a kernel bridge (no GTK)"
+publish = false
+
+[dependencies]
+tileide-core = { path = "../core" }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+libc = "0.2"

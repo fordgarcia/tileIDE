@@ -1,0 +1,11 @@
+[package]
+name = "tileide-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TileIDE's language server client: framing, server table, protocol messages (no GTK)"
+publish = false
+
+[dependencies]
+serde_json = "1"
