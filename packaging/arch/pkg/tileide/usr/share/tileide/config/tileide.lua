@@ -74,7 +74,7 @@ tileide.tiling {
 -- tileide.alerts { missing_tools = true, tile_limit = true }
 
 -- Typing aids in editors and notebook cells.
--- tileide.editor { auto_close = true, match_brackets = false, format_on_save = false }
+-- tileide.editor { auto_close = true, match_brackets = false, format_on_save = false, inlay_hints = false }
 
 -- keybinds: tileide.bind(mods, key, action, arg). These replace the built-in key with
 -- the same mods; everything else keeps its default (see the README).

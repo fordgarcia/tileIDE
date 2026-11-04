@@ -772,6 +772,12 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     println!("test action: keys → {}|{}", buffer.text(&line, &at, false), buffer.text(&at, &end, false));
                 }
             }
+            // `completions`: the open list's first 12 labels, best first.
+            (Some(app), _) if name == "completions" => {
+                if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
+                    println!("completions: {}", lsp::test_completions(&editor).into_iter().take(12).collect::<Vec<_>>().join(" "));
+                }
+            }
             // `accept`: Enter on the open completion list, then the editor's text.
             (Some(app), _) if name == "accept" => {
                 if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
@@ -827,6 +833,12 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             // `tiles`: the workspace's tile rects, printed.
             (Some(app), _) if name == "tiles" => println!("tiles: {}", app.workspaces.borrow().current().borrow().describe()),
             // `diagnostics`: the focused editor's or cell's diagnostics, printed.
+            (Some(app), _) if name == "hints" => {
+                if let Some(buffer) = app.workspaces.borrow().current().borrow().focused_code().and_then(|e| e.buffer().downcast::<sourceview5::Buffer>().ok()) {
+                    println!("hints: {}", lsp::hint_lines(&buffer).join(" | "));
+                }
+            }
+            _ if name == "debug-state" => println!("debug-state: {}", debug::describe()),
             (Some(app), _) if name == "diagnostics" => {
                 if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
                     let buffer = editor.buffer().downcast::<sourceview5::Buffer>().ok();
@@ -851,6 +863,12 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 if let Some(t) = app.tests.borrow().as_ref() {
                     println!("tests-state: {}", t.describe());
                 }
+            }
+            // `pick:<letters>[|N]`: typed into the open filtered list (the outline), its
+            // rows printed, then row N of them picked.
+            _ if name == "pick" => {
+                let (query, n) = arg.as_deref().unwrap_or("").split_once('|').map_or((arg.as_deref().unwrap_or(""), None), |(q, n)| (q, n.parse().ok()));
+                println!("pick: {}", pick_card::test(query, n).join(" | "));
             }
             // `pythons[:N]`: the Python picker's rows for the focused file, then row N picked.
             (Some(app), _) if name == "pythons" => {
@@ -1003,6 +1021,7 @@ impl App {
         editing::configure(config.editor.auto_close, config.editor.match_brackets);
         tile_view::set_limit_alert(config.alerts.tile_limit);
         tile_view::set_format_on_save(config.editor.format_on_save);
+        lsp::set_inlay_hints(config.editor.inlay_hints);
         tileide_core::motion::set_profile(a.motion, a.motion_speed);
         token::set_ui_font(&a.ui_font, a.ui_scale);
         token::set_rail(config.sidebar.scale, config.sidebar.icon_scale);
@@ -1961,6 +1980,11 @@ impl App {
                     lsp::code_actions_at_cursor(&editor);
                 }
             }
+            Action::Outline => {
+                if let Some(editor) = view.borrow().focused_code() {
+                    lsp::outline_at_cursor(&editor);
+                }
+            }
             Action::ExtensionsSection => self.toggle_extensions_section(),
             Action::Extension(command) => self.run_extension_command(command),
             Action::Settings => self.toggle_settings(settings_ui::Page::General),
@@ -1974,6 +1998,12 @@ impl App {
             Action::FontSize(by) => self.step_font_size(*by),
             Action::Run => self.run_focused(),
             Action::Debug => {
+                // In a notebook: debug the current cell (or continue a paused one).
+                let notebook = view.borrow().focused_notebook();
+                if let Some(notebook) = notebook.filter(|_| !debug::is_paused()) {
+                    notebook.debug_cell();
+                    return;
+                }
                 let file = view.borrow().focused_file();
                 if !debug::is_paused() && file.is_some() && view.borrow().focused_dirty() {
                     view.borrow_mut().save_focused(self.window.upcast_ref());
@@ -1986,6 +2016,11 @@ impl App {
             }
             Action::DebugStop => debug::stop(),
             Action::Breakpoint => {
+                let cell = view.borrow().focused_notebook().and_then(|n| n.breakpoint_target());
+                if let Some((editor, key)) = cell {
+                    debug::toggle_breakpoint(&editor, &key);
+                    return;
+                }
                 let (editor, file) = (view.borrow().focused_editor(), view.borrow().focused_file());
                 if let (Some(editor), Some(file)) = (editor, file) {
                     debug::toggle_breakpoint(&editor, &file);
@@ -2580,7 +2615,7 @@ fn connect_keys(state: &Rc<App>) {
             return glib::Propagation::Proceed;
         }
         // Editor actions leave their keys to a focused terminal (Ctrl+Space, F12).
-        if matches!(action, Action::Hover | Action::Definition | Action::Complete | Action::Format | Action::Rename | Action::References | Action::CodeAction) && s.workspaces.borrow().current().borrow().focused_code().is_none() {
+        if matches!(action, Action::Hover | Action::Definition | Action::Complete | Action::Format | Action::Rename | Action::References | Action::CodeAction | Action::Outline) && s.workspaces.borrow().current().borrow().focused_code().is_none() {
             return glib::Propagation::Proceed;
         }
         s.run(&action);

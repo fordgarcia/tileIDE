@@ -52,6 +52,8 @@ pub struct Capabilities {
     pub rename: bool,
     pub references: bool,
     pub code_actions: bool,
+    pub symbols: bool,
+    pub inlay_hints: bool,
 }
 
 impl Capabilities {
@@ -72,6 +74,8 @@ impl Capabilities {
             rename: offered(&caps["renameProvider"]),
             references: offered(&caps["referencesProvider"]),
             code_actions: offered(&caps["codeActionProvider"]),
+            symbols: offered(&caps["documentSymbolProvider"]),
+            inlay_hints: offered(&caps["inlayHintProvider"]),
         }
     }
 }
@@ -103,6 +107,8 @@ pub fn initialize_params(root: &Path) -> Value {
                 "rangeFormatting": {},
                 "rename": {"prepareSupport": false},
                 "references": {},
+                "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                "inlayHint": {},
                 "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"]}}, "isPreferredSupport": true},
                 "publishDiagnostics": {"relatedInformation": false, "tagSupport": {"valueSet": [1, 2]}}
             }
@@ -397,6 +403,92 @@ pub fn workspace_edit(edit: &Value) -> Vec<(PathBuf, Vec<(Range, String)>)> {
     out
 }
 
+/// `textDocument/documentSymbol` / `textDocument/inlayHint` params.
+pub fn document(path: &Path) -> Value {
+    json!({"textDocument": {"uri": path_to_uri(path)}})
+}
+
+pub fn inlay_hint(path: &Path, range: Range) -> Value {
+    json!({"textDocument": {"uri": path_to_uri(path)}, "range": {"start": position_json(range.start), "end": position_json(range.end)}})
+}
+
+/// A name in a file's outline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: &'static str,
+    /// 0 at the top level, 1 inside a class, …
+    pub depth: usize,
+    pub start: Position,
+}
+
+/// `DocumentSymbol[]` (nested) or `SymbolInformation[]` (flat) → the outline in file
+/// order. A function's own locals are left out (nested functions and classes stay).
+pub fn symbols(result: &Value) -> Vec<Symbol> {
+    fn walk(items: &Value, depth: usize, in_function: bool, out: &mut Vec<Symbol>) {
+        for item in items.as_array().into_iter().flatten() {
+            let kind = item["kind"].as_u64().unwrap_or(0);
+            let function = matches!(kind, 6 | 9 | 12);
+            let start = position(&item["selectionRange"]["start"]).or_else(|| position(&item["range"]["start"])).or_else(|| position(&item["location"]["range"]["start"]));
+            let (Some(name), Some(start)) = (item["name"].as_str(), start) else { continue };
+            if in_function && !(function || kind == 5) {
+                continue;
+            }
+            out.push(Symbol { name: name.to_string(), kind: symbol_kind(kind), depth, start });
+            walk(&item["children"], depth + 1, function, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(result, 0, false, &mut out);
+    out.sort_by_key(|s| s.start);
+    out
+}
+
+fn symbol_kind(kind: u64) -> &'static str {
+    match kind {
+        2..=4 => "module",
+        5 => "class",
+        6 | 9 => "method",
+        7 => "property",
+        8 => "field",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        22 => "member",
+        23 => "struct",
+        _ => "",
+    }
+}
+
+/// An inlay hint: a type (`: int`) or a parameter name (`x=`) shown at `at`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlayHint {
+    pub at: Position,
+    pub label: String,
+    pub parameter: bool,
+}
+
+pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
+    let mut hints: Vec<InlayHint> = result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| {
+            let label = match &h["label"] {
+                Value::String(s) => s.clone(),
+                Value::Array(parts) => parts.iter().filter_map(|p| p["value"].as_str()).collect(),
+                _ => return None,
+            };
+            Some(InlayHint { at: position(&h["position"])?, label: label.trim().to_string(), parameter: h["kind"].as_u64() == Some(2) })
+        })
+        .filter(|h| !h.label.is_empty())
+        .collect();
+    hints.sort_by_key(|h| h.at);
+    hints
+}
+
 /// `Location[]` / `LocationLink[]` (references) → every one, in order.
 pub fn locations(result: &Value) -> Vec<Location> {
     result.as_array().into_iter().flatten().filter_map(definition).collect()
@@ -540,12 +632,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outline_from_nested_or_flat_symbols() {
+        let at = |l: u32, c: u32| json!({"start": {"line": l, "character": c}, "end": {"line": l, "character": c + 1}});
+        let nested = json!([
+            {"name": "f", "kind": 12, "range": at(4, 0), "selectionRange": at(4, 4), "children": [
+                {"name": "local", "kind": 13, "range": at(5, 4), "selectionRange": at(5, 4)},
+                {"name": "inner", "kind": 12, "range": at(6, 4), "selectionRange": at(6, 8)}
+            ]},
+            {"name": "A", "kind": 5, "range": at(0, 0), "selectionRange": at(0, 6), "children": [
+                {"name": "m", "kind": 6, "range": at(1, 4), "selectionRange": at(1, 8)}
+            ]}
+        ]);
+        let names: Vec<(String, &str, usize)> = symbols(&nested).into_iter().map(|s| (s.name, s.kind, s.depth)).collect();
+        assert_eq!(names, vec![("A".into(), "class", 0), ("m".into(), "method", 1), ("f".into(), "function", 0), ("inner".into(), "function", 1)]);
+        let flat = json!([{"name": "x", "kind": 13, "location": {"uri": "file:///a.py", "range": at(2, 0)}}]);
+        assert_eq!(symbols(&flat), vec![Symbol { name: "x".into(), kind: "variable", depth: 0, start: Position { line: 2, column: 0 } }]);
+    }
+
+    #[test]
+    fn inlay_hint_labels() {
+        let hints = inlay_hints(&json!([
+            {"position": {"line": 1, "character": 9}, "label": "a=", "kind": 2},
+            {"position": {"line": 0, "character": 1}, "label": [{"value": ": "}, {"value": "int"}], "kind": 1, "paddingLeft": false}
+        ]));
+        assert_eq!(hints, vec![InlayHint { at: Position { line: 0, column: 1 }, label: ": int".into(), parameter: false }, InlayHint { at: Position { line: 1, column: 9 }, label: "a=".into(), parameter: true }]);
+    }
+
+    #[test]
     fn capabilities_read_what_matters() {
         let caps = Capabilities::parse(&json!({"capabilities": {
             "positionEncoding": "utf-8", "hoverProvider": true, "definitionProvider": {},
             "completionProvider": {"triggerCharacters": [".", "::", ">"]}
         }}));
-        assert_eq!(caps, Capabilities { encoding: Encoding::Utf8, hover: true, completion: true, completion_resolve: false, definition: true, triggers: vec!['.', ':', '>'], signature_triggers: vec![], signature: false, formatting: false, range_formatting: false, rename: false, references: false, code_actions: false });
+        assert_eq!(caps, Capabilities { encoding: Encoding::Utf8, hover: true, completion: true, completion_resolve: false, definition: true, triggers: vec!['.', ':', '>'], signature_triggers: vec![], signature: false, formatting: false, range_formatting: false, rename: false, references: false, code_actions: false, symbols: false, inlay_hints: false });
         let py = Capabilities::parse(&json!({"capabilities": {"signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [")"]}, "documentFormattingProvider": true}}));
         assert!(py.signature && py.formatting);
         assert_eq!(py.signature_triggers, vec!['(', ',', ')']);

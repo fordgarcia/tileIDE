@@ -228,12 +228,12 @@ impl Default for Notebook {
 /// can't be empty), and a `%%` cell magic blanks the whole cell. The line count never
 /// changes, so positions map back.
 pub fn python_view(source: &str) -> String {
-    let cell_magic = source.lines().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim_start().starts_with("%%"));
+    let cell_magic = has_cell_magic(source);
     source
         .split('\n')
         .map(|line| {
             let trimmed = line.trim_start();
-            let ipython = trimmed.starts_with('%') || trimmed.starts_with('!') || (trimmed.ends_with('?') && !trimmed.starts_with('#'));
+            let ipython = is_ipython(trimmed);
             if cell_magic || trimmed.is_empty() || (ipython && trimmed.len() == line.len()) {
                 String::new()
             } else if ipython {
@@ -244,6 +244,66 @@ pub fn python_view(source: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A `%%` cell magic on the first non-blank line: the whole cell isn't Python.
+pub fn has_cell_magic(source: &str) -> bool {
+    source.lines().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim_start().starts_with("%%"))
+}
+
+/// A line (without its indentation) that is IPython syntax, not Python.
+fn is_ipython(trimmed: &str) -> bool {
+    trimmed.starts_with('%') || trimmed.starts_with('!') || (trimmed.ends_with('?') && !trimmed.starts_with('#'))
+}
+
+/// A code cell a Python formatter can take: each IPython line becomes a placeholder
+/// expression on its own line, at the same indentation (valid in a block too). Also
+/// gives the lines it took out, for `unmask_ipython`. `None` for a `%%` cell.
+pub fn mask_ipython(source: &str) -> Option<(String, Vec<String>)> {
+    if has_cell_magic(source) {
+        return None;
+    }
+    let mut taken = Vec::new();
+    let masked = source
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if !is_ipython(trimmed) {
+                return line.to_string();
+            }
+            let indent = &line[..line.len() - trimmed.len()];
+            taken.push(trimmed.to_string());
+            format!("{indent}{}", placeholder(taken.len() - 1))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((masked, taken))
+}
+
+/// The formatted text with the IPython lines back, each at its placeholder's new
+/// indentation. `None` if the formatter moved, merged or dropped a placeholder.
+pub fn unmask_ipython(formatted: &str, taken: &[String]) -> Option<String> {
+    let mut seen = 0;
+    let lines: Vec<String> = formatted
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match taken.get(seen) {
+                Some(original) if trimmed == placeholder(seen) => {
+                    seen += 1;
+                    format!("{}{original}", &line[..line.len() - trimmed.len()])
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect();
+    (seen == taken.len() && !lines.iter().any(|l| l.contains(PLACEHOLDER))).then(|| lines.join("\n"))
+}
+
+const PLACEHOLDER: &str = "__tileide_ipython_";
+
+fn placeholder(i: usize) -> String {
+    format!("str(\"{PLACEHOLDER}{i}\")")
 }
 
 /// Adds a kernel output to a cell's outputs: consecutive stream text of the same
@@ -442,6 +502,21 @@ mod tests {
         assert_eq!(py.split('\n').count(), src.split('\n').count());
         assert_eq!(python_view("\n%%bash\nls -l"), "\n\n");
         assert_eq!(python_view(""), "");
+    }
+
+    #[test]
+    fn ipython_lines_survive_formatting() {
+        let src = "%matplotlib inline\nimport os\nfor x in y:\n  !echo {x}\n  print( x )\ndf?";
+        let (masked, taken) = mask_ipython(src).unwrap();
+        assert_eq!(taken, vec!["%matplotlib inline", "!echo {x}", "df?"]);
+        assert_eq!(masked.split('\n').count(), src.split('\n').count());
+        // What a formatter does: indents by 4, fixes spacing, adds the final newline.
+        let formatted = masked.replace("  ", "    ").replace("print( x )", "print(x)") + "\n";
+        assert_eq!(unmask_ipython(&formatted, &taken).unwrap(), "%matplotlib inline\nimport os\nfor x in y:\n    !echo {x}\n    print(x)\ndf?\n");
+        // A placeholder the formatter lost or merged: refuse.
+        assert_eq!(unmask_ipython("import os\n", &taken), None);
+        assert_eq!(unmask_ipython(&format!("x = {}", placeholder(0)), &taken[..1]), None);
+        assert_eq!(mask_ipython("%%bash\nls"), None);
     }
 
     const SAMPLE: &str = r##"{

@@ -78,7 +78,8 @@ completing = {}
 evaluating = {}
 
 # Run silently before each eval: puts TileIDE's helpers in builtins, so the user's
-# namespace gains no names. `_tileide_variables(globals())` lists the variables as JSON.
+# namespace gains no names. `_tileide_variables(globals())` lists the variables as JSON;
+# `_tileide_debug([code, …])` readies cell debugging (debug port, each cell's file).
 HELPERS = r"""
 def _tileide_variables(ns):
     import json, reprlib, types
@@ -110,6 +111,27 @@ def _tileide_variables(ns):
             text = '<no repr>'
         out.append([name, type(value).__name__, size, ' '.join(text.split()), table])
     return json.dumps(out)
+
+def _tileide_debug(codes):
+    # Debugging cells: debugpy listens in the kernel (once), and each cell's code goes
+    # to the file ipykernel compiles it as, so breakpoints set on that file hit when the
+    # cell runs (JupyterLab's dumpCell does the same).
+    import builtins, json, os, debugpy
+    from ipykernel.compiler import get_file_name
+    port = getattr(builtins, '_tileide_debug_port', None)
+    if port is None:
+        # Not following subprocesses: each `!` line would wait 5 s on the debugger.
+        debugpy.configure(subProcess=False)
+        port = debugpy.listen(('127.0.0.1', 0))[1]
+        builtins._tileide_debug_port = port
+    paths = []
+    for code in codes:
+        path = get_file_name(code)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(code)
+        paths.append(path)
+    return json.dumps([port, paths])
 """
 SETUP = "exec(%r, __import__('builtins').__dict__)" % HELPERS
 

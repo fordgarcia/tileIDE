@@ -36,6 +36,8 @@ use crate::completion::Popup;
 const CHANGE_DELAY: Duration = Duration::from_millis(150);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const HOVER_MAX_CHARS: usize = 1500;
+/// After a change reaches the servers: time for them to analyse it before hints are asked.
+const HINTS_DELAY: Duration = Duration::from_millis(600);
 /// Tag and mark category per severity (hints share the info look).
 /// Faded text for unused code.
 const UNUSED: &str = "lsp-unused";
@@ -81,7 +83,7 @@ struct Gathered {
 /// Rules that don't fit notebook cells: a bare expression ends a cell to show its
 /// value, imports go in any cell (and aren't sorted across cells), `;` hides an
 /// output, top-level `await` works.
-const NOTEBOOK_QUIET: &[&str] = &["reportUnusedExpression", "reportUnusedCoroutine", "E402", "I001", "E703", "B018", "F704", "PLE1142"];
+const NOTEBOOK_QUIET: &[&str] = &["reportUnusedExpression", "reportUnusedCallResult", "reportUnusedCoroutine", "E402", "I001", "E703", "B018", "F704", "PLE1142"];
 
 struct Doc {
     buffer: glib::WeakRef<sourceview5::Buffer>,
@@ -108,6 +110,12 @@ struct Doc {
     handlers: Vec<glib::SignalHandlerId>,
     view_handlers: Vec<(glib::WeakRef<gtk::Widget>, glib::SignalHandlerId)>,
     controllers: Vec<gtk::EventController>,
+    /// Inlay hints, one annotation per line (`editor.inlay_hints`).
+    hints: sourceview5::AnnotationProvider,
+    hints_timer: Option<glib::SourceId>,
+    /// Hints were shown since they were turned on; their lines and texts (test actions).
+    hinted: bool,
+    hint_texts: Vec<(u32, String)>,
 }
 
 #[derive(Default)]
@@ -124,6 +132,7 @@ struct Hub {
 
 thread_local! {
     static HUB: RefCell<Hub> = RefCell::new(Hub::default());
+    static INLAY_HINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Applies `tileide.lsp` settings; returns warnings for unknown server names.
@@ -291,6 +300,8 @@ fn attach_doc(buffer: &sourceview5::Buffer, view: &sourceview5::View, path: Path
         }
     });
     view.add_controller(focus.clone());
+    let hints = sourceview5::AnnotationProvider::new();
+    view.annotations().add_provider(&hints);
 
     let first = HUB.with_borrow_mut(|hub| {
         let first = !hub.docs.iter().any(|d| d.servers[0] == servers[0] && d.path == path);
@@ -313,6 +324,10 @@ fn attach_doc(buffer: &sourceview5::Buffer, view: &sourceview5::View, path: Path
             handlers,
             view_handlers,
             controllers: vec![click.upcast(), tab.upcast(), keys.upcast(), focus.upcast()],
+            hints,
+            hints_timer: None,
+            hinted: false,
+            hint_texts: Vec::new(),
         });
         first
     });
@@ -350,8 +365,11 @@ pub fn detach(buffer: &sourceview5::Buffer) {
     }) else {
         return;
     };
-    if let Some(timer) = doc.timer {
+    for timer in [doc.timer, doc.hints_timer].into_iter().flatten() {
         timer.remove();
+    }
+    if let Some(view) = doc.view.upgrade() {
+        view.annotations().remove_provider(&doc.hints);
     }
     for handler in doc.handlers {
         buffer.disconnect(handler);
@@ -774,6 +792,10 @@ fn exited(id: usize) {
     });
     for buffer in buffers {
         render_diagnostics(&buffer);
+        // Diagnostics mean the server has analysed the file: the first hints can come.
+        if with_doc(&buffer, |d| !d.hinted).unwrap_or(false) {
+            schedule_hints(&buffer, Duration::ZERO);
+        }
     }
 }
 
@@ -798,6 +820,12 @@ fn server_encoding(server: usize) -> Encoding {
 }
 
 /// Development (`--test-actions accept`): Enter on the open completion list.
+/// Test actions: the open completion list's labels, best first.
+pub fn test_completions(view: &sourceview5::View) -> Vec<String> {
+    let buffer: sourceview5::Buffer = view.buffer().downcast().expect("source buffer");
+    with_doc(&buffer, |d| d.popup.shown_labels()).unwrap_or_default()
+}
+
 pub fn test_accept(view: &sourceview5::View) {
     let buffer: sourceview5::Buffer = view.buffer().downcast().expect("source buffer");
     if let Some(popup) = with_doc(&buffer, |d| d.popup.clone()).filter(|p| p.is_visible()) {
@@ -971,6 +999,7 @@ fn sync_text(buffer: &sourceview5::Buffer) {
             send(s, protocol::did_change(&path, version, &text));
         }
     });
+    schedule_hints(buffer, HINTS_DELAY);
 }
 
 /// The text the servers see for `buffer`: the buffer, or for a notebook cell every code
@@ -1504,17 +1533,62 @@ pub fn references_at_cursor(view: &sourceview5::View) {
     }
 }
 
+/// `Ctrl+Shift+O`: the file's outline (in a notebook, every cell's), filtered by
+/// typing; picking a name goes there.
+pub fn outline_at_cursor(view: &sourceview5::View) {
+    let buffer: sourceview5::Buffer = view.buffer().downcast().expect("source buffer");
+    let Some((goto, encoding, path)) = with_doc(&buffer, |d| (d.goto.clone(), server_encoding(d.servers[0]), d.path.clone())) else {
+        show_info(view, "No language server for this file.");
+        return;
+    };
+    let v = view.downgrade();
+    let sent = request_with(&buffer, &buffer.start_iter(), "textDocument/documentSymbol", |s| s.caps.as_ref().is_some_and(|c| c.symbols), |p, _| protocol::document(p), move |m| {
+        let Some(view) = v.upgrade() else { return };
+        let found = protocol::symbols(&m["result"]);
+        if found.is_empty() {
+            show_info(&view, "No names in this file.");
+            return;
+        }
+        let rows: Vec<String> = found
+            .iter()
+            .map(|s| {
+                let place = match cell_at(&path, s.start.line) {
+                    Some((n, offset)) => format!("cell {n}:{}", s.start.line - offset + 1),
+                    None => format!("{}", s.start.line + 1),
+                };
+                format!("{}{}  {} · {place}", "    ".repeat(s.depth), s.name, s.kind)
+            })
+            .collect();
+        let keys = found.iter().map(|s| s.name.clone()).collect();
+        let path = path.clone();
+        crate::pick_card::show_filtered(&view, "Go to name", &rows, keys, move |i| {
+            let at = found[i].start;
+            if !reveal_in_cells(&path, at, encoding) {
+                goto(path.clone(), at, encoding);
+            }
+        });
+    });
+    if !sent {
+        show_info(view, "This file's language server has no outline.");
+    }
+}
+
+/// The notebook cell (number from 1, first line in the virtual file) holding `line`.
+fn cell_at(path: &Path, line: u32) -> Option<(usize, u32)> {
+    let (cells, buffer, offset) = HUB.with_borrow(|hub| {
+        hub.docs.iter().filter(|d| d.cells.is_some() && d.path == path).find(|d| (d.offset..d.offset + d.lines).contains(&line)).and_then(|d| Some((d.cells.as_ref()?.clone(), d.buffer.upgrade()?, d.offset)))
+    })?;
+    Some(((cells.list)().iter().position(|b| *b == buffer).map_or(0, |i| i + 1), offset))
+}
+
 /// "app.py:12  x = area(3)", or "cell 3:2  …" inside the notebook itself.
 fn describe_location(l: &protocol::Location, doc_path: &Path, root: &Path) -> String {
     let line_of = |buffer: &sourceview5::Buffer, line: u32| line_text(buffer.upcast_ref(), line as i32).trim().to_string();
-    if l.path == doc_path {
-        let cell = HUB.with_borrow(|hub| {
-            hub.docs.iter().filter(|d| d.cells.is_some() && d.path == doc_path).find(|d| (d.offset..d.offset + d.lines).contains(&l.start.line)).and_then(|d| Some((d.cells.as_ref()?.clone(), d.buffer.upgrade()?, d.offset)))
-        });
-        if let Some((cells, buffer, offset)) = cell {
-            let n = (cells.list)().iter().position(|b| *b == buffer).map_or(0, |i| i + 1);
-            return format!("cell {n}:{}  {}", l.start.line - offset + 1, line_of(&buffer, l.start.line - offset));
-        }
+    if l.path == doc_path
+        && let Some((n, offset)) = cell_at(doc_path, l.start.line)
+        && let Some(buffer) = HUB.with_borrow(|hub| hub.docs.iter().find(|d| d.cells.is_some() && d.path == doc_path && d.offset == offset).and_then(|d| d.buffer.upgrade()))
+    {
+        return format!("cell {n}:{}  {}", l.start.line - offset + 1, line_of(&buffer, l.start.line - offset));
     }
     let name = l.path.strip_prefix(root).unwrap_or(&l.path).display().to_string();
     let open = HUB.with_borrow(|hub| hub.docs.iter().find(|d| d.path == l.path && d.cells.is_none()).and_then(|d| d.buffer.upgrade()));
@@ -1647,6 +1721,173 @@ fn apply_workspace_edit(edit: &Value, encoding: Encoding) -> usize {
     changed
 }
 
+// ---- inlay hints ----
+
+/// `editor.inlay_hints`: on asks every open file's server, off clears them.
+pub fn set_inlay_hints(on: bool) {
+    if INLAY_HINTS.replace(on) == on {
+        return;
+    }
+    let buffers: Vec<sourceview5::Buffer> = HUB.with_borrow(|hub| hub.docs.iter().filter_map(|d| d.buffer.upgrade()).collect());
+    for buffer in buffers {
+        if on {
+            schedule_hints(&buffer, Duration::ZERO);
+        } else {
+            HUB.with_borrow_mut(|hub| {
+                if let Some(d) = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(&buffer)) {
+                    d.hints.remove_all();
+                    d.hinted = false;
+                    d.hint_texts.clear();
+                }
+            });
+        }
+    }
+}
+
+/// Asks for hints after `delay`, again from the start if asked meanwhile; for a
+/// notebook cell, every cell (one change can retype names in all of them).
+fn schedule_hints(buffer: &sourceview5::Buffer, delay: Duration) {
+    if !INLAY_HINTS.get() {
+        return;
+    }
+    let buffers: Vec<sourceview5::Buffer> = HUB.with_borrow(|hub| {
+        let Some(d) = hub.docs.iter().find(|d| d.buffer.upgrade().as_ref() == Some(buffer)) else { return Vec::new() };
+        match &d.cells {
+            Some(cells) => hub.docs.iter().filter(|o| o.cells.as_ref().is_some_and(|c| Rc::ptr_eq(c, cells))).filter_map(|o| o.buffer.upgrade()).collect(),
+            None => vec![buffer.clone()],
+        }
+    });
+    for buffer in buffers {
+        let b = buffer.downgrade();
+        let timer = glib::timeout_add_local_once(delay, move || {
+            if let Some(buffer) = b.upgrade() {
+                HUB.with_borrow_mut(|hub| {
+                    if let Some(d) = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(&buffer)) {
+                        d.hints_timer = None;
+                    }
+                });
+                request_hints(&buffer);
+            }
+        });
+        HUB.with_borrow_mut(|hub| {
+            if let Some(d) = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(&buffer)) {
+                if let Some(old) = d.hints_timer.replace(timer) {
+                    old.remove();
+                }
+            }
+        });
+    }
+}
+
+/// `textDocument/inlayHint` over the buffer's lines (a cell's part of the notebook).
+fn request_hints(buffer: &sourceview5::Buffer) {
+    let b = buffer.downgrade();
+    HUB.with_borrow_mut(|hub| {
+        let Some(d) = hub.docs.iter().find(|d| d.buffer.upgrade().as_ref() == Some(buffer)) else { return };
+        let (path, offset, lines) = (d.path.clone(), d.offset, buffer.line_count() as u32);
+        // Any server on the file that offers them (the main one first).
+        let Some(id) = d.servers.iter().copied().find(|&id| hub.servers[id].as_ref().and_then(|s| s.caps.as_ref()).is_some_and(|c| c.inlay_hints)) else { return };
+        let Some(s) = hub.servers[id].as_mut() else { return };
+        let encoding = s.caps.as_ref().map_or(Encoding::Utf16, |c| c.encoding);
+        let range = protocol::Range { start: Position { line: offset, column: 0 }, end: Position { line: offset + lines, column: 0 } };
+        let Ok(rid) = s.conn.request("textDocument/inlayHint", protocol::inlay_hint(&path, range)) else { return };
+        s.pending.insert(
+            rid,
+            Box::new(move |m: &Value| {
+                let Some(buffer) = b.upgrade() else { return };
+                let hints = protocol::inlay_hints(&m["result"]).into_iter().filter(|h| h.at.line >= offset && h.at.line < offset + lines).map(|mut h| {
+                    h.at.line -= offset;
+                    h
+                });
+                show_hints(&buffer, hints.collect(), encoding);
+            }),
+        );
+    });
+}
+
+fn show_hints(buffer: &sourceview5::Buffer, hints: Vec<protocol::InlayHint>, encoding: Encoding) {
+    let Some(provider) = HUB.with_borrow_mut(|hub| {
+        let d = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(buffer))?;
+        d.hinted = true;
+        Some(d.hints.clone())
+    }) else {
+        return;
+    };
+    provider.remove_all();
+    if !INLAY_HINTS.get() {
+        return;
+    }
+    let mut by_line: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for h in &hints {
+        let at = iter_at(buffer.upcast_ref(), h.at, encoding);
+        by_line.entry(h.at.line).or_default().push(hint_text(&line_text(buffer.upcast_ref(), at.line()), at.line_offset() as usize, h));
+    }
+    let shown: Vec<(u32, String)> = by_line.into_iter().map(|(line, texts)| (line, texts.join("  "))).collect();
+    for (line, text) in &shown {
+        provider.add_annotation(&sourceview5::Annotation::new(Some(text), None::<gtk::gio::Icon>, *line as i32, sourceview5::AnnotationStyle::None));
+    }
+    HUB.with_borrow_mut(|hub| {
+        if let Some(d) = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(buffer)) {
+            d.hint_texts = shown;
+        }
+    });
+}
+
+/// Test actions: the hints shown in `buffer`, as "line: text" (lines from 1).
+pub fn hint_lines(buffer: &sourceview5::Buffer) -> Vec<String> {
+    with_doc(buffer, |d| d.hint_texts.iter().map(|(l, t)| format!("{}: {t}", l + 1)).collect()).unwrap_or_default()
+}
+
+/// A hint as it reads at the end of its line: `x: int` (the name before it), `-> str`,
+/// `a=10` (the argument after a parameter name, cut short).
+fn hint_text(line: &str, at: usize, hint: &protocol::InlayHint) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let at = at.min(chars.len());
+    if hint.parameter {
+        let name = hint.label.trim_end_matches([':', '=']).trim();
+        let mut depth = 0i32;
+        let arg: String = chars[at..]
+            .iter()
+            .take_while(|&&c| {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' if depth == 0 => return false,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => return false,
+                    _ => {}
+                }
+                true
+            })
+            .collect();
+        let arg = arg.trim();
+        let arg = if arg.chars().count() > 16 { format!("{}…", arg.chars().take(15).collect::<String>()) } else { arg.to_string() };
+        return format!("{name}={arg}");
+    }
+    if hint.label.starts_with(':') {
+        let start = chars[..at].iter().rposition(|&c| !is_word_char(c)).map_or(0, |i| i + 1);
+        let word: String = chars[start..at].iter().collect();
+        return format!("{word}{}", hint.label);
+    }
+    hint.label.clone()
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn hint(label: &str, parameter: bool) -> protocol::InlayHint {
+        protocol::InlayHint { at: Position { line: 0, column: 0 }, label: label.into(), parameter }
+    }
+
+    #[test]
+    fn hints_read_with_their_name_or_argument() {
+        assert_eq!(hint_text("total = add(1, 2)", 5, &hint(": int", false)), "total: int");
+        assert_eq!(hint_text("total = add(1, f(2, 3))", 15, &hint("b=", true)), "b=f(2, 3)");
+        assert_eq!(hint_text("add(\"a very long string here\")", 4, &hint("text:", true)), "text=\"a very long st…");
+        assert_eq!(hint_text("def f(x)", 8, &hint("-> int", false)), "-> int");
+    }
+}
+
 // ---- formatting ----
 
 /// `Ctrl+Shift+I`: formats the file with the first server offering it (for Python,
@@ -1735,9 +1976,13 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
     let outcome = HUB.with_borrow_mut(|hub| {
         let d = hub.docs.iter().find(|d| d.buffer.upgrade().as_ref() == Some(&buffer)).ok_or("No language server for this file.")?;
         let (path, offset, cell) = (d.path.clone(), d.offset, d.cells.is_some());
-        // In a cell, IPython lines are blank to the servers: formatting could drop them.
+        // In a cell, IPython lines are blank to the servers: range formatting would drop
+        // them, so Ruff formats the cell on its own with them masked.
         if cell && tileide_notebook::python_view(&source).lines().zip(source.lines()).any(|(py, src)| py != src && !src.trim().is_empty()) {
-            return Err("Cells with % or ! lines aren't formatted (the formatter would lose them).");
+            let ruff = d.servers.iter().find_map(|&id| hub.servers[id].as_ref().filter(|s| s.spec.name == "ruff")).ok_or("Cells with % or ! lines need Ruff to format (pacman -S ruff).")?;
+            let (masked, taken) = tileide_notebook::mask_ipython(&source).ok_or("A %% cell isn't Python: not formatted.")?;
+            let (program, root) = (ruff.program.clone(), ruff.root.clone());
+            return Ok(Some((program, root, masked, taken)));
         }
         let wanted = |c: &Capabilities| if cell { c.range_formatting } else { c.formatting };
         let id = d.servers.iter().copied().find(|&id| hub.servers[id].as_ref().and_then(|s| s.caps.as_ref()).is_some_and(wanted)).ok_or("No formatter for this file. For Python: install Ruff (pacman -S ruff).")?;
@@ -1782,8 +2027,11 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
                 done();
             }),
         );
-        Ok(())
+        Ok(None)
     });
+    if let Ok(Some((program, root, masked, taken))) = outcome {
+        return format_masked(view, &program, &root, masked, taken, then_now);
+    }
     if let Err(message) = outcome {
         // Saving shouldn't nag about a file no formatter knows.
         if !quiet {
@@ -1793,6 +2041,65 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
             then();
         }
     }
+}
+
+/// A cell with IPython lines: `ruff format` on the masked cell (from the project's
+/// folder, so its settings apply), then the lines back and the cell replaced.
+fn format_masked(view: &sourceview5::View, program: &str, root: &Path, masked: String, taken: Vec<String>, then: Option<Then>) {
+    let (program, root) = (program.to_string(), root.to_path_buf());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ruff_format(&program, &root, &masked));
+    });
+    let v = view.downgrade();
+    glib::timeout_add_local(Duration::from_millis(20), move || {
+        let formatted = match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Ok(formatted) => formatted,
+            Err(_) => Err("Ruff didn't answer.".to_string()),
+        };
+        if let Some(view) = v.upgrade() {
+            let buffer = view.buffer();
+            let source = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+            let restored = formatted.and_then(|f| tileide_notebook::unmask_ipython(&f, &taken).ok_or_else(|| "Ruff moved a % or ! line: not formatted.".to_string()));
+            match restored {
+                Ok(mut text) => {
+                    if !source.ends_with('\n') && text.ends_with('\n') {
+                        text.pop();
+                    }
+                    if text != source {
+                        let end = position_of(&buffer, &buffer.end_iter(), Encoding::Utf32);
+                        apply_edits(view.buffer().downcast_ref().expect("source buffer"), vec![(protocol::Range { start: Position { line: 0, column: 0 }, end }, text)], Encoding::Utf32);
+                    }
+                }
+                Err(message) if then.is_none() => show_info(&view, &escape(&message)),
+                Err(_) => {}
+            }
+        }
+        if let Some(then) = &then {
+            then();
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn ruff_format(program: &str, root: &Path, source: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(program)
+        .args(["format", "--stdin-filename", "cell.py", "-"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Can't run Ruff: {e}"))?;
+    child.stdin.take().map(|mut i| i.write_all(source.as_bytes()));
+    let out = child.wait_with_output().map_err(|e| format!("Ruff: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Can't format: {}", err.lines().find(|l| !l.trim().is_empty()).unwrap_or("Ruff failed")));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "Ruff gave back invalid text.".to_string())
 }
 
 /// Applies edits as one undo step, last first so earlier positions stay valid; the

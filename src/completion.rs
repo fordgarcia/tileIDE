@@ -184,6 +184,15 @@ impl Popup {
         popup
     }
 
+    /// Test actions: the labels shown, best first (empty when closed).
+    pub fn shown_labels(&self) -> Vec<String> {
+        if !self.is_visible() {
+            return Vec::new();
+        }
+        let state = self.state.borrow();
+        state.shown.iter().map(|&i| state.items[i].label.clone()).collect()
+    }
+
     pub fn is_visible(&self) -> bool {
         self.popover.is_visible()
     }

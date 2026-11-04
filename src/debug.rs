@@ -5,6 +5,8 @@
 //! tile next to the code shows where the program is (call stack), its variables
 //! (click to expand) and its output; the paused line is highlighted in the editor.
 //! Adapter messages reach the main loop through `MainContext::invoke`, like the LSP hub.
+//! A notebook cell is debugged in its running kernel (`debug_cells`): debugpy listens
+//! there, and each cell's breakpoints go to the file the kernel compiles it as.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -66,6 +68,19 @@ struct Running {
     pending: HashMap<i64, Reply>,
     thread: Option<i64>,
     generation: u64,
+    /// Attached to a notebook kernel's debugpy at this address.
+    kernel: Option<String>,
+    /// Runs once `configurationDone` is answered (the cell to debug).
+    on_configured: Option<Box<dyn FnOnce()>>,
+}
+
+/// A notebook cell, under the file its kernel runs it as.
+struct CellFile {
+    /// The cell's breakpoint key (`cell_key`).
+    key: PathBuf,
+    label: String,
+    view: glib::WeakRef<sourceview5::View>,
+    buffer: glib::WeakRef<sourceview5::Buffer>,
 }
 
 #[derive(Default)]
@@ -81,6 +96,8 @@ struct Hub {
     /// The buffer whose line is highlighted as paused.
     paused: Option<sourceview5::Buffer>,
     accent: Option<gdk::RGBA>,
+    /// By the kernel's file for the cell.
+    cells: HashMap<PathBuf, CellFile>,
 }
 
 thread_local! {
@@ -167,7 +184,90 @@ pub fn toggle_breakpoint(view: &sourceview5::View, path: &Path) {
 
 fn send_breakpoints(path: &Path) {
     let lines: Vec<Value> = breakpoints().get(path).into_iter().flatten().map(|l| json!({ "line": l })).collect();
-    request("setBreakpoints", json!({ "source": { "path": path }, "breakpoints": lines }), |_| {});
+    // A cell's breakpoints go to its kernel file (none known: it isn't being debugged).
+    let target = if is_cell_key(path) { HUB.with_borrow(|h| h.cells.iter().find(|(_, c)| c.key == path).map(|(file, _)| file.clone())) } else { Some(path.to_path_buf()) };
+    if let Some(target) = target {
+        request("setBreakpoints", json!({ "source": { "path": target }, "breakpoints": lines }), |_| {});
+    }
+}
+
+/// What a notebook cell's breakpoints are kept under (F9 in a cell).
+pub fn cell_key(notebook: &Path, cell: u64) -> PathBuf {
+    let mut key = canonical(notebook).into_os_string();
+    key.push(format!("#cell-{cell}"));
+    PathBuf::from(key)
+}
+
+fn is_cell_key(path: &Path) -> bool {
+    path.to_string_lossy().contains(".ipynb#cell-")
+}
+
+/// One cell for `debug_cells`.
+pub struct Cell {
+    /// The file the kernel runs this cell's current code as.
+    pub file: PathBuf,
+    pub key: PathBuf,
+    pub label: String,
+    pub view: sourceview5::View,
+    pub buffer: sourceview5::Buffer,
+}
+
+/// Debugs in a notebook's kernel, whose debugpy listens at `address`: attaches (once
+/// per kernel), sets the cells' breakpoints, then `run`s the cell.
+pub fn debug_cells(address: &str, title: &str, cells: Vec<Cell>, run: Box<dyn FnOnce()>) {
+    HUB.with_borrow_mut(|h| {
+        // A cell's file changes with its code: the old one is forgotten.
+        h.cells.retain(|_, c| !cells.iter().any(|n| n.key == c.key));
+        for c in &cells {
+            h.cells.insert(c.file.clone(), CellFile { key: c.key.clone(), label: c.label.clone(), view: c.view.downgrade(), buffer: c.buffer.downgrade() });
+        }
+    });
+    let attached = HUB.with_borrow(|h| h.running.as_ref().map(|r| r.kernel.as_deref() == Some(address)));
+    if attached == Some(true) {
+        for c in &cells {
+            send_breakpoints(&c.key);
+        }
+        // Answered after the breakpoints (requests are handled in order).
+        request("threads", json!({}), move |_| run());
+        return;
+    }
+    if attached == Some(false) {
+        stop();
+    }
+    let shown = panel();
+    if let Some(h) = hooks() {
+        (h.show_panel)(shown.root.upcast_ref());
+    }
+    shown.clear();
+    shown.title.set_text(&format!("Debug · {title}"));
+    let generation = HUB.with_borrow_mut(|h| {
+        h.generation += 1;
+        h.generation
+    });
+    let deliver = move |m: Incoming| {
+        glib::MainContext::default().invoke(move || receive(generation, m));
+    };
+    let session = match Session::connect(address, deliver) {
+        Ok(s) => s,
+        Err(e) => {
+            shown.set_state("Can't debug", Some("failed"));
+            shown.append(&format!("{e}\n"));
+            return;
+        }
+    };
+    HUB.with_borrow_mut(|h| h.running = Some(Running { session, pending: HashMap::new(), thread: None, generation, kernel: Some(address.to_string()), on_configured: Some(run) }));
+    shown.set_state("Attaching to the kernel…", None);
+    request("initialize", tileide_dap::initialize_args(), move |reply| {
+        if reply["success"] == false {
+            fail(&format!("the debugger refused to start: {}", reply["message"].as_str().unwrap_or("?")));
+            return;
+        }
+        request("attach", json!({ "justMyCode": true }), |reply| {
+            if reply["success"] == false {
+                fail(&format!("attach failed: {}", reply["message"].as_str().unwrap_or("?")));
+            }
+        });
+    });
 }
 
 /// Sends a request to the running adapter; `reply` gets the response.
@@ -298,7 +398,7 @@ fn launch(plan: Plan) {
             return;
         }
     };
-    HUB.with_borrow_mut(|h| h.running = Some(Running { session, pending: HashMap::new(), thread: None, generation }));
+    HUB.with_borrow_mut(|h| h.running = Some(Running { session, pending: HashMap::new(), thread: None, generation, kernel: None, on_configured: None }));
     panel().set_state(&format!("Starting {}…", plan.adapter), None);
     let launch_args = plan.launch.clone();
     request("initialize", tileide_dap::initialize_args(), move |reply| {
@@ -322,11 +422,28 @@ fn fail(message: &str) {
     stop();
 }
 
-/// `Shift+F5`: ends the program and the debugger.
+/// `Shift+F5`: ends the program and the debugger (a kernel just runs on).
 pub fn stop() {
     clear_paused();
     if let Some(r) = HUB.with_borrow_mut(|h| h.running.take()) {
+        let state = if r.kernel.is_some() { "Detached" } else { "Stopped" };
         r.session.stop();
+        // Its later events are ignored (no session): the panel says it here.
+        let p = panel();
+        p.frames.remove_all();
+        p.vars.remove_all();
+        p.frame_rows.borrow_mut().clear();
+        p.var_rows.borrow_mut().clear();
+        if ["Running", "Paused", "Starting", "Attaching"].iter().any(|s| p.state.text().starts_with(s)) {
+            p.set_state(state, None);
+        }
+    }
+}
+
+/// A notebook cell finished: an attached kernel session waits for the next one.
+pub fn kernel_idle() {
+    if HUB.with_borrow(|h| h.running.as_ref().is_some_and(|r| r.kernel.is_some() && r.thread.is_none())) {
+        panel().set_state("Attached · F5 in a cell debugs it", None);
     }
 }
 
@@ -382,7 +499,11 @@ fn receive(generation: u64, incoming: Incoming) {
                 send_breakpoints(path);
             }
             request("setExceptionBreakpoints", json!({ "filters": [] }), |_| {});
-            request("configurationDone", json!({}), |_| {});
+            request("configurationDone", json!({}), |_| {
+                if let Some(run) = HUB.with_borrow_mut(|h| h.running.as_mut().and_then(|r| r.on_configured.take())) {
+                    run();
+                }
+            });
             panel().set_state("Running", None);
         }
         Some("output") if body["category"] != "telemetry" => panel().append(body["output"].as_str().unwrap_or("")),
@@ -426,7 +547,11 @@ fn select_frame(index: usize) {
     if let Some(row) = p.frames.row_at_index(index as i32) {
         p.frames.select_row(Some(&row));
     }
-    if let (Some(path), Some(h)) = (path, hooks())
+    let cell = path.as_ref().and_then(|p| HUB.with_borrow(|h| h.cells.get(p).and_then(|c| Some((c.view.upgrade()?, c.buffer.upgrade()?)))));
+    if let Some((view, buffer)) = cell {
+        view.grab_focus();
+        mark_paused(&view, &buffer, line);
+    } else if let (Some(path), Some(h)) = (path, hooks())
         && let Some((view, buffer)) = (h.show_line)(&path, line)
     {
         mark_paused(&view, &buffer, line);
@@ -469,9 +594,14 @@ fn expand(index: usize) {
         return;
     }
     p.var_rows.borrow_mut()[index].2 = true;
+    let kernel = HUB.with_borrow(|h| h.running.as_ref().is_some_and(|r| r.kernel.is_some()));
     request("variables", json!({ "variablesReference": reference }), move |reply| {
         let p = panel();
-        let vars = reply["body"]["variables"].as_array().cloned().unwrap_or_default();
+        let mut vars = reply["body"]["variables"].as_array().cloned().unwrap_or_default();
+        // A cell's top level is the kernel's namespace: IPython's own names are noise.
+        if kernel && depth == 0 {
+            vars.retain(|v| v["name"].as_str().is_some_and(|n| !n.starts_with('_') && !["In", "Out", "exit", "quit", "get_ipython"].contains(&n)));
+        }
         for (n, v) in vars.iter().enumerate() {
             let child = v["variablesReference"].as_i64().unwrap_or(0);
             let row = p.var_row(v["name"].as_str().unwrap_or("?"), v["value"].as_str().unwrap_or(""), child > 0, depth + 1, false);
@@ -507,6 +637,37 @@ fn clear_paused() {
     if let Some(buffer) = HUB.with_borrow_mut(|h| h.paused.take()) {
         buffer.remove_tag_by_name(PAUSED_TAG, &buffer.start_iter(), &buffer.end_iter());
     }
+}
+
+/// Test actions: the panel's state, frames and variable rows.
+pub fn describe() -> String {
+    let p = panel();
+    let rows = |list: &gtk::ListBox| {
+        let mut out = Vec::new();
+        let mut row = list.first_child();
+        while let Some(r) = row {
+            let mut texts = Vec::new();
+            let mut child = r.first_child();
+            // A row is a label, or a box of labels (variables).
+            while let Some(c) = child {
+                if let Some(l) = c.downcast_ref::<gtk::Label>() {
+                    texts.push(l.text().to_string());
+                }
+                let mut inner = c.first_child();
+                while let Some(i) = inner {
+                    if let Some(l) = i.downcast_ref::<gtk::Label>() {
+                        texts.push(l.text().trim().to_string());
+                    }
+                    inner = i.next_sibling();
+                }
+                child = c.next_sibling();
+            }
+            out.push(texts.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" "));
+            row = r.next_sibling();
+        }
+        out.join(" | ")
+    };
+    format!("{} · {} · frames: {} · vars: {}", p.title.text(), p.state.text(), rows(&p.frames), rows(&p.vars))
 }
 
 fn icon(name: &str, tip: &str, action: fn()) -> gtk::Button {
@@ -638,7 +799,8 @@ impl Panel {
         for f in frames {
             let path = f["source"]["path"].as_str().map(PathBuf::from);
             let line = f["line"].as_u64().unwrap_or(0) as u32;
-            let file = path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned());
+            let cell = path.as_ref().and_then(|p| HUB.with_borrow(|h| h.cells.get(p).map(|c| c.label.clone())));
+            let file = cell.or_else(|| path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "?".into());
             let label = gtk::Label::new(Some(&format!("{}  ·  {file}:{line}", f["name"].as_str().unwrap_or("?"))));
             label.set_xalign(0.0);
             label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);

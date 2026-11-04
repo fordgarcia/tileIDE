@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0 (2026-11-04): Python & Notebook, theme editor, Wikipedia rice
+
+The alphas below in one release:
+- **Typing aids and looks:** brackets and quotes close themselves; tile and outer borders; a new welcome; next-tile peek in columns; no tile size limit; a plainer rail (Pills off).
+- **The Wikipedia rice** (Settings → Layout → Rice): top bar, Files on the left, workspaces on the right, tiles stacked with headers; new `stack` layout.
+- **Settings** one section per page, sliders ignore the mouse wheel; **Theme editor** with live preview; **Export setup** as one `.tar.gz`.
+- **Completion like Jupyter:** better order, documentation beside the list, auto-import on accept.
+- **Notebooks:** JupyterLab command mode (`Esc`, `A`/`B`, `DD`, `M`/`Y`, …), run above/below, run times, SVG/JPEG images, readable LaTeX, in-place progress bars, folded long output, clickable tracebacks, a **variable view** with DataFrames as tables, and **debugging a cell** (`F5`).
+- **Python projects:** pick the Python per project (`Alt+P`), notebook kernels, create a `.venv` and install; **pytest runner** (`Alt+Shift+R`, `F8`); format on save; Settings → Toolchains → This project.
+- **Go to a name** (`Ctrl+Shift+O`), **inlay hints** (basedpyright and others), formatting cells with `%`/`!` lines.
+- Requires GtkSourceView 5.18 or newer.
+
+## 0.5.0-alpha.12 (2026-11-04): exit-criteria pass
+
+### Fixed
+- With basedpyright, a cell ending in a call (`mean_by_city(df)`, shown as the cell's output) no longer gets "Result of call expression … is not used".
+
+## 0.5.0-alpha.11 (2026-11-04): debug a cell, outline, inlay hints
+
+### Added
+- **Debug a notebook cell** with `F5` (or ⋮ → **Debug this cell**): the debugger attaches to the notebook's running kernel (starting it first if needed) and runs the cell. `F9` sets breakpoints in any cell, so a function defined in one cell stops where it's called from another. The debug tile shows the stack by cell (`double · cell 2:2`), the cell's variables (without IPython's own `In`, `Out`, `_…`) and steps with `F10`/`F11`/`Shift+F11`. Later runs stop at breakpoints too while it's attached; `Shift+F5` detaches and the kernel runs on with its variables. Needs debugpy in the kernel's Python (it comes with ipykernel 6+).
+- **Go to a name** with `Ctrl+Shift+O`: the file's classes, functions, methods and top-level variables in a list (a function's own locals left out); typing filters by name, Enter goes there. In a notebook it lists every cell's names (`double · cell 2:1`). Action `outline`.
+- **Inlay hints** (Settings → Editor, `tileide.editor { inlay_hints = true }`, off by default): inferred types and parameter names at the end of each line (`total: int  a=1  b=2`), refreshed as you type. From servers that offer them: basedpyright, clangd, rust-analyzer, TypeScript. pyright doesn't; install basedpyright (`pip install basedpyright`) for Python, and TileIDE picks it first.
+
+### Changed
+- **Cells with `%` or `!` lines are formatted** (`Ctrl+Shift+I`) instead of being left alone: Ruff formats the Python around them and the IPython lines stay, re-indented with their block. `%%` cells are still left alone.
+- Requires GtkSourceView 5.18 or newer (inlay hints use its line annotations).
+
 ## 0.5.0-alpha.10 (2026-11-03): Python projects
 
 ### Added

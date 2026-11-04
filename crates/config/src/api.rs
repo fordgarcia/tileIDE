@@ -179,7 +179,7 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         let mut b = b.borrow_mut();
         let mut set = Vec::new();
         let e = &mut b.config.editor;
-        for (key, slot) in [("auto_close", &mut e.auto_close), ("match_brackets", &mut e.match_brackets), ("format_on_save", &mut e.format_on_save)] {
+        for (key, slot) in [("auto_close", &mut e.auto_close), ("match_brackets", &mut e.match_brackets), ("format_on_save", &mut e.format_on_save), ("inlay_hints", &mut e.inlay_hints)] {
             if let Some(v) = f.boolean(key)? { *slot = v; set.push(key) }
         }
         b.config.explicit.extend(set.into_iter().map(|k| format!("editor.{k}")));
@@ -350,6 +350,7 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
         "rename" => Action::Rename,
         "references" => Action::References,
         "code_action" => Action::CodeAction,
+        "outline" => Action::Outline,
         "extensions_section" => Action::ExtensionsSection,
         "settings" => Action::Settings,
         "keybinds" => Action::Keybinds,

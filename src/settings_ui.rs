@@ -123,6 +123,7 @@ const SECTIONS: &[(&str, &[Spec])] = &[
             ("editor.auto_close", "Close brackets and quotes", "Typing ( [ { \" ' adds the closing one; typing it again steps over", "auto pair autoclose brackets parentheses quotes complete"),
             ("editor.match_brackets", "Highlight matching brackets", "The bracket that pairs with the one at the cursor", "bracket match highlight parentheses pair"),
             ("editor.format_on_save", "Format on save", "Saving sorts the imports and formats the file first (Python: Ruff)", "format save ruff black organize sort imports isort tidy"),
+            ("editor.inlay_hints", "Inlay hints", "Inferred types and parameter names at the end of the line (basedpyright, clangd, rust-analyzer; pyright has none)", "inlay hints types inferred parameter names annotations"),
         ],
     ),
     (

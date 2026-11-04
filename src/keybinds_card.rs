@@ -51,6 +51,7 @@ pub fn describe(action: &Action) -> String {
         Action::Rename => "rename symbol".into(),
         Action::References => "find references".into(),
         Action::CodeAction => "quick fixes".into(),
+        Action::Outline => "go to a name in the file".into(),
         Action::ExtensionsSection => "extensions".into(),
         Action::Extension(id) => format!("extension: {id}"),
         Action::Settings => "settings".into(),

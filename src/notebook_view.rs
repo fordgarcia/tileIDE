@@ -148,6 +148,8 @@ pub struct NotebookView {
     waiting: RefCell<Vec<u64>>,
     ready: StdCell<bool>,
     starting: StdCell<bool>,
+    /// F5 before the kernel was up: the cell to debug once it is.
+    debug_waiting: StdCell<Option<usize>>,
     /// The Python running the kernel (for install hints).
     python: RefCell<Option<PathBuf>>,
     next_key: StdCell<u64>,
@@ -220,6 +222,7 @@ impl NotebookView {
             ("Clear this cell's output", NotebookView::clear_selected),
             ("Clear all outputs", NotebookView::clear_all),
             ("Show variables", NotebookView::show_variables),
+            ("Debug this cell (F5)", NotebookView::debug_cell),
         ];
         let more_buttons: Vec<(gtk::Button, Action)> = more_items
             .into_iter()
@@ -287,6 +290,7 @@ impl NotebookView {
             waiting: RefCell::new(Vec::new()),
             ready: StdCell::new(false),
             starting: StdCell::new(false),
+            debug_waiting: StdCell::new(None),
             python: RefCell::new(None),
             next_key: StdCell::new(1),
             folder,
@@ -484,6 +488,77 @@ impl NotebookView {
             Some(Err(e)) => then(self, Err(e)),
             None => then(self, Err("The kernel isn't running: run a cell first.".into())),
         }
+    }
+
+    /// `F5` / the toolbar menu: runs the current cell under the debugger, which attaches
+    /// to the kernel first (debugpy there). Breakpoints in any cell apply.
+    pub fn debug_cell(&self) {
+        let i = self.current.get();
+        if self.cells.borrow().get(i).is_none_or(|c| c.cell.kind != CellKind::Code) {
+            self.set_chip("Debug: pick a code cell", Some("failed"));
+            return;
+        }
+        if self.notebook.borrow().language() != "python3" {
+            self.set_chip("Debugging needs a Python kernel", Some("failed"));
+            return;
+        }
+        if !self.ready.get() {
+            self.debug_waiting.set(Some(i));
+            self.start_kernel();
+            return;
+        }
+        // The code exactly as `run_cell` sends it: the kernel names its file by it.
+        let cells: Vec<(usize, u64, sourceview5::View, sourceview5::Buffer, String)> = self
+            .cells
+            .borrow()
+            .iter()
+            .filter(|c| c.cell.kind == CellKind::Code)
+            .enumerate()
+            .map(|(n, c)| (n + 1, c.key, c.view.clone(), c.buffer.clone(), c.buffer.text(&c.buffer.start_iter(), &c.buffer.end_iter(), false).to_string()))
+            .collect();
+        let codes: Vec<&str> = cells.iter().map(|c| c.4.as_str()).collect();
+        // A JSON list of strings is a Python literal too.
+        let expr = format!("_tileide_debug({})", serde_json::json!(codes));
+        let me = self.me.borrow().clone();
+        let run_key = self.cells.borrow()[i].key;
+        self.eval(&expr, move |v, result| {
+            let parsed = result.and_then(|text| {
+                let (port, files): (u16, Vec<PathBuf>) = serde_json::from_str(&text).map_err(|_| format!("unexpected answer: {text}"))?;
+                Ok((port, files))
+            });
+            let (port, files) = match parsed {
+                Ok(found) => found,
+                Err(e) => {
+                    let python = v.python.borrow().as_ref().map_or_else(|| "python".into(), |p| p.display().to_string());
+                    let message = if e.contains("debugpy") { format!("Debugging a cell needs debugpy in the kernel's Python: {python} -m pip install debugpy") } else { format!("Can't debug: {e}") };
+                    crate::alerts::missing(message);
+                    v.set_chip("Debug: can't start", Some("failed"));
+                    return;
+                }
+            };
+            let name = v.path.file_name().map_or_else(|| "notebook".into(), |n| n.to_string_lossy().into_owned());
+            let label = cells.iter().find(|c| c.1 == run_key).map_or_else(String::new, |c| format!("cell {}", c.0));
+            let list = cells
+                .into_iter()
+                .zip(files)
+                .map(|((n, key, view, buffer, _), file)| crate::debug::Cell { file, key: crate::debug::cell_key(&v.path, key), label: format!("cell {n}"), view, buffer })
+                .collect();
+            crate::debug::debug_cells(&format!("127.0.0.1:{port}"), &format!("{name} · {label}"), list, Box::new(move || {
+                let Some(v) = me.upgrade() else { return };
+                let found = v.cells.borrow().iter().position(|c| c.key == run_key);
+                if let Some(i) = found {
+                    v.run_cell(i);
+                }
+            }));
+        });
+    }
+
+    /// `F9` in a cell: its editor and the key its breakpoints are kept under.
+    pub fn breakpoint_target(&self) -> Option<(sourceview5::View, PathBuf)> {
+        let (view, buffer, key) = self.cells.borrow().get(self.current.get()).filter(|c| c.cell.kind == CellKind::Code).map(|c| (c.view.clone(), c.buffer.clone(), c.key))?;
+        let key = crate::debug::cell_key(&self.path, key);
+        crate::debug::attach(&buffer, &view, &key);
+        Some((view, key))
     }
 
     /// The toolbar menu's "Show variables": the variable view in a tile beside this one.
@@ -1738,6 +1813,10 @@ impl NotebookView {
                     _ => display,
                 };
                 self.set_chip(&format!("{name} · idle"), None);
+                if let Some(i) = self.debug_waiting.take() {
+                    self.current.set(i);
+                    self.debug_cell();
+                }
                 let waiting: Vec<u64> = self.waiting.borrow_mut().drain(..).collect();
                 for key in waiting {
                     let code = self.cells.borrow().iter().find(|c| c.key == key).map(|c| c.buffer.text(&c.buffer.start_iter(), &c.buffer.end_iter(), false).to_string());
@@ -1775,6 +1854,7 @@ impl NotebookView {
                 }
             }
             Event::Done { cell } => {
+                crate::debug::kernel_idle();
                 if let Some(ui) = self.cells.borrow_mut().iter_mut().find(|c| c.key == cell) {
                     ui.took = ui.started.take().map(|s| s.elapsed());
                 }

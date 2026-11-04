@@ -54,6 +54,9 @@ pub struct Editor {
     pub match_brackets: bool,
     /// Saving organizes imports and formats the file first (when its language server can).
     pub format_on_save: bool,
+    /// Inferred types and parameter names at the end of each line (servers that offer
+    /// them: basedpyright, clangd, rust-analyzer, TypeScript).
+    pub inlay_hints: bool,
 }
 
 /// Overrides for one built-in language server.
@@ -217,6 +220,8 @@ pub enum Action {
     References,
     /// Language server: quick fixes for the cursor's line.
     CodeAction,
+    /// Language server: the file's names (the notebook's, across cells), to go to one.
+    Outline,
     /// The drawer's Extensions section (installed extensions, weight meter).
     ExtensionsSection,
     /// Runs an extension command by id (e.g. "word-count.count").
@@ -299,7 +304,7 @@ impl Default for Config {
             background_set: false,
             tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5, max_tiles: tileide_core::token::MAX_TILES, peek: tileide_core::token::PEEK },
             alerts: Alerts { missing_tools: true, tile_limit: true },
-            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false },
+            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false, inlay_hints: false },
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),
@@ -384,6 +389,7 @@ pub fn default_binds(m: &str) -> Vec<Bind> {
         bind(&[], "F2", Action::Rename),
         bind(&["SHIFT"], "F12", Action::References),
         bind(&["CTRL"], "period", Action::CodeAction),
+        bind(&["CTRL", "SHIFT"], "O", Action::Outline),
         bind(&[m], "Escape", Action::Quit),
         bind(&["CTRL"], "S", Action::Save),
     ]);

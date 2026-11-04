@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Debugging (v0.4 phase 4) without a display: which debug adapter serves a file
-//! (`plan`), and a DAP session over stdio with the LSP framing (`Session`). Built on
+//! (`plan`), and a DAP session over stdio, or TCP to a debugger already listening (a
+//! notebook's kernel), with the LSP framing (`Session`). Built on
 //! the spike 7 client (gdb's own DAP, 10/10 runs). TileIDE installs nothing: a missing
 //! adapter says what to install.
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -170,12 +172,20 @@ pub enum Incoming {
 }
 
 pub struct Session {
-    child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// The adapter TileIDE started, or the socket to one it attached to.
+    end: End,
+    stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     seq: i64,
 }
 
-fn write(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<(), String> {
+enum End {
+    Child(Arc<Mutex<Child>>),
+    Socket(TcpStream),
+}
+
+type Input = Mutex<Box<dyn Write + Send>>;
+
+fn write(stdin: &Input, message: &Value) -> Result<(), String> {
     let mut stdin = stdin.lock().map_err(|_| "adapter stdin poisoned".to_string())?;
     stdin.write_all(&encode(message)).and_then(|()| stdin.flush()).map_err(|e| format!("write failed: {e}"))
 }
@@ -196,8 +206,25 @@ impl Session {
             });
         }
         let mut child = command.spawn().map_err(|e| format!("cannot start {program}: {e}"))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no stdin")?));
-        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().ok_or("no stdin")?);
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let stdin = Self::read(stdin, stdout, deliver);
+        Ok(Session { end: End::Child(Arc::new(Mutex::new(child))), stdin, seq: 0 })
+    }
+
+    /// Connects to an adapter listening on `address` (debugpy in a Jupyter kernel).
+    /// `stop` then detaches and leaves the debuggee running.
+    pub fn connect(address: &str, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Session, String> {
+        let socket = TcpStream::connect(address).map_err(|e| format!("cannot reach the debugger at {address}: {e}"))?;
+        let clone = |s: &TcpStream| s.try_clone().map_err(|e| e.to_string());
+        let stdin = Self::read(Box::new(clone(&socket)?), clone(&socket)?, deliver);
+        Ok(Session { end: End::Socket(socket), stdin, seq: 0 })
+    }
+
+    /// Reads messages from `output` on a thread; gives back the input end.
+    fn read(input: Box<dyn Write + Send>, output: impl Read + Send + 'static, deliver: impl Fn(Incoming) + Send + 'static) -> Arc<Input> {
+        let stdin = Arc::new(Mutex::new(input));
+        let mut stdout = BufReader::new(output);
         let replies = stdin.clone();
         std::thread::spawn(move || {
             while let Ok(Some(message)) = read_message(&mut stdout) {
@@ -210,7 +237,7 @@ impl Session {
             }
             deliver(Incoming::Exited);
         });
-        Ok(Session { child: Arc::new(Mutex::new(child)), stdin, seq: 0 })
+        stdin
     }
 
     /// Sends a request; returns its `seq` (the response arrives through `deliver`).
@@ -220,10 +247,25 @@ impl Session {
         Ok(self.seq)
     }
 
-    /// `disconnect` (ending the debuggee), then a kill if the adapter lingers.
+    /// `disconnect` (ending the debuggee), then a kill if the adapter lingers. Over a
+    /// socket: detaches, and the debuggee runs on.
     pub fn stop(mut self) {
+        let child = match &self.end {
+            End::Child(child) => child.clone(),
+            End::Socket(socket) => {
+                let socket = socket.try_clone();
+                let _ = self.request("disconnect", json!({ "terminateDebuggee": false }));
+                // After the adapter has read it.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    if let Ok(s) = socket {
+                        let _ = s.shutdown(Shutdown::Both);
+                    }
+                });
+                return;
+            }
+        };
         let _ = self.request("disconnect", json!({ "terminateDebuggee": true }));
-        let child = self.child.clone();
         std::thread::spawn(move || {
             for _ in 0..40 {
                 if child.lock().map(|mut c| c.try_wait().ok().flatten().is_some()).unwrap_or(true) {

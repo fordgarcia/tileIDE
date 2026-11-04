@@ -36,6 +36,7 @@ you can code with it.
 
 ![TileIDE](docs/1.png)
 ![TileIDE](docs/2.png)
+![TileIDE](docs/6.png)
 ![TileIDE](docs/3.png)
 ![TileIDE](docs/4.png)
 ![TileIDE](docs/5.png)
@@ -97,13 +98,14 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 | Notebook command mode (`Esc`) | `↑`/`↓` or `K`/`J` move, `Shift+↑/↓` select several, `Enter` edit, `A`/`B` add above/below, `DD` delete, `Z` undo delete, `M`/`Y` text/code, `C`/`X`/`V` copy/cut/paste (`Shift+V` above), `Shift+Enter`/`Ctrl+Enter` run, `II` interrupt. The toolbar's ⋮ menu: run above/below, clear outputs, **Show variables** (a tile; a DataFrame's name opens it as a table). In outputs, traceback lines (`Cell In[3], line 5`, `File …:12`) are links, and output over 60 lines is folded |
 | `Alt+P` | the Python for this project, or the notebook's kernel (also: click the kernel chip); also creates a `.venv` and installs `requirements.txt` in a terminal tile (uv, else pip) |
 | `Alt+Shift+R` / `F8` | run tests with pytest (the test at the cursor, the test file, or all) in a Tests tile / go to the next failure |
-| `F9` / `F5` | breakpoint / debug (start or continue); `F10` over, `F11` into, `Shift+F11` out, `Shift+F5` stop |
+| `F9` / `F5` | breakpoint / debug (start or continue); `F10` over, `F11` into, `Shift+F11` out, `Shift+F5` stop. In a notebook, `F5` debugs the current cell in its kernel (breakpoints in any cell apply; `Shift+F5` detaches, the kernel keeps running) |
 | `Alt+,` / `Alt+K` | settings / keybinds |
 | `Alt+=` / `Alt+-` | code font bigger / smaller |
 | `Alt+Shift+T` / `Alt+Shift+X` | settings: themes & background / extensions |
 | `Tab` | in an editor or cell, after a name or a `.`: complete (one match is filled in, else a list; as in Jupyter); elsewhere it indents. With the list open, `Tab` takes the selected item |
 | `Alt+I` / `F12` / `Alt+Tab` or `Ctrl+Space` | hover info / go to definition / complete (Alt+Tab only where the desktop doesn't use it for window switching) |
-| `Ctrl+Shift+I` | format the file, or the notebook cell (Ruff for Python) |
+| `Ctrl+Shift+I` | format the file, or the notebook cell (Ruff for Python; `%` and `!` lines are kept) |
+| `Ctrl+Shift+O` | go to a name in the file (in a notebook, across all cells); type to filter |
 | `F2` / `Shift+F12` / `Ctrl+.` | rename everywhere / list references / quick fixes |
 | `Alt+Z` / `Alt+Escape` | word wrap / quit (asks if unsaved) |
 
@@ -117,10 +119,11 @@ Changes apply as you make them and are kept in `state.lua`; anything `tileide.lu
 - **Theme editor**: start from the theme in use, change its colours and watch the app follow, then **Save and use** (into `themes/`) or **Export…**.
 - **Share → Export setup**: your config, Settings choices, themes, rices and background images in one `.tar.gz`. Unpacking it in `~/.config` on another machine restores the setup (back up first).
 - **Editor → Format on save** (off by default): sorts imports and formats the file before writing it (Ruff for Python).
+- **Editor → Inlay hints** (off by default): inferred types and parameter names at the end of each line, from servers that offer them (basedpyright, clangd, rust-analyzer, TypeScript; pyright doesn't).
 - **Extensions** and **Toolchains**: what's installed, what it costs, and which compilers, interpreters and debuggers were found. Toolchains starts with **This project**: its Python and the Ruff, pyright and pytest settings from `pyproject.toml`, `ruff.toml` or `pyrightconfig.json` (read-only).
 
 ## Config
-Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`/`stack`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `format`, `rename`, `references`, `code_action`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`, `interpreter`, `test`, `next_failure`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
+Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`/`stack`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `format`, `rename`, `references`, `code_action`, `outline`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`, `interpreter`, `test`, `next_failure`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
 
 Extensions are programs in any language that run in their own process and start only when needed; the Extensions section shows what each one costs. See [docs/extensions.md](docs/extensions.md) and [docs/compatibility.md](docs/compatibility.md).
 
