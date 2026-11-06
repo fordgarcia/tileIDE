@@ -68,6 +68,7 @@ pub fn describe(action: &Action) -> String {
         Action::Toolchains => "toolchains (settings)".into(),
         Action::Interpreter => "Python / kernel".into(),
         Action::Test => "run tests (at the cursor, file, all)".into(),
+        Action::Launch => "launch config for run / debug".into(),
         Action::NextFailure => "next failed test".into(),
         Action::Unavailable(name) => format!("{name} (not yet available)"),
     }

@@ -41,7 +41,7 @@ fn clangd_end_to_end() {
         let _ = tx.send(m);
     })
     .unwrap();
-    let id = c.request("initialize", protocol::initialize_params(&fixture)).unwrap();
+    let id = c.request("initialize", protocol::initialize_params(&fixture, serde_json::Value::Null)).unwrap();
     let init = wait(&rx, "initialize", |m| m["id"] == id);
     let caps = Capabilities::parse(&init["result"]);
     assert!(caps.hover && caps.completion && caps.definition, "{caps:?}");

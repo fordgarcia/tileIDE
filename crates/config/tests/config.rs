@@ -421,6 +421,11 @@ fn runners_and_settings_keys_load() {
     assert!(loaded.config.explicit.contains("appearance.code_size") && loaded.config.explicit.contains("appearance.motion"));
     assert!(!loaded.config.explicit.contains("tiling.gaps_in"));
     assert!(loaded.config.binds.iter().any(|b| b.action == Action::Run));
+    let launch = config_dir("launch", &[("tileide.lua", "tileide.launch { name = 'dev', program = 'main.py', args = { '-v' }, env = { PORT = '8080' }, cwd = 'out' }")]);
+    let launches = load(&launch.join("tileide.lua"), Limits::default()).unwrap().config.launches;
+    assert_eq!((launches[0].name.as_str(), launches[0].args.as_slice(), launches[0].env.get("PORT").map(String::as_str)), ("dev", &["-v".to_string()][..], Some("8080")));
+    let twice = config_dir("launch-twice", &[("tileide.lua", "tileide.launch { name = 'a', program = 'x' }\ntileide.launch { name = 'a', program = 'y' }")]);
+    assert!(load(&twice.join("tileide.lua"), Limits::default()).unwrap_err().contains("defined twice"));
     let bad = config_dir("runner-bad", &[("tileide.lua", "tileide.runner('py', 'x')")]);
     assert!(load(&bad.join("tileide.lua"), Limits::default()).unwrap_err().contains("must look like"));
 }

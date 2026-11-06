@@ -56,15 +56,55 @@ pub const SERVERS: &[Server] = &[
     },
 ];
 
+const JS_TS: &[(&str, &str)] = &[("js", "javascript"), ("mjs", "javascript"), ("cjs", "javascript"), ("jsx", "javascriptreact"), ("ts", "typescript"), ("mts", "typescript"), ("cts", "typescript"), ("tsx", "typescriptreact")];
+
 /// Servers that run beside a language's main one and only add diagnostics (and
 /// formatting): linters. Optional: a missing one is mentioned once, nothing breaks.
-pub const LINTERS: &[Server] = &[Server {
-    name: "ruff",
-    label: "Ruff (Python linter)",
-    languages: &[("py", "python"), ("pyi", "python")],
-    candidates: &[&["ruff", "server"]],
-    install: "pacman -S ruff, or pip install ruff in the project's virtualenv",
-}];
+/// JS/TS gets Biome, or ESLint in a project configured for it (`linters_for`).
+pub const LINTERS: &[Server] = &[
+    Server {
+        name: "ruff",
+        label: "Ruff (Python linter)",
+        languages: &[("py", "python"), ("pyi", "python")],
+        candidates: &[&["ruff", "server"]],
+        install: "pacman -S ruff, or pip install ruff in the project's virtualenv",
+    },
+    Server { name: "biome", label: "Biome (JS/TS linter)", languages: JS_TS, candidates: &[&["biome", "lsp-proxy"]], install: "npm i -g @biomejs/biome" },
+    Server {
+        name: "eslint",
+        label: "ESLint",
+        languages: JS_TS,
+        candidates: &[&["vscode-eslint-language-server", "--stdio"]],
+        install: "npm i -g vscode-langservers-extracted (and eslint in the project)",
+    },
+];
+
+/// Formatters run as a command (the text on stdin, formatted on stdout). When one is
+/// installed it formats instead of the language server.
+pub struct Formatter {
+    pub label: &'static str,
+    pub extensions: &'static [&'static str],
+    pub command: &'static [&'static str],
+}
+
+pub const FORMATTERS: &[Formatter] = &[Formatter { label: "google-java-format", extensions: &["java"], command: &["google-java-format", "-"] }];
+
+/// The command-line formatter for a file, by extension (installed or not).
+pub fn formatter_for(path: &Path) -> Option<&'static Formatter> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    FORMATTERS.iter().find(|f| f.extensions.contains(&ext.as_str()))
+}
+
+/// Whether `root` (or a folder above it) configures ESLint.
+pub fn uses_eslint(root: &Path) -> bool {
+    const FILES: &[&str] = &[
+        "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts",
+        ".eslintrc", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.json", ".eslintrc.yml", ".eslintrc.yaml",
+    ];
+    root.ancestors().any(|d| {
+        FILES.iter().any(|f| d.join(f).is_file()) || std::fs::read_to_string(d.join("package.json")).is_ok_and(|p| p.contains("\"eslintConfig\""))
+    })
+}
 
 /// Other names `tileide.lsp` accepts.
 const ALIASES: &[(&str, &str)] = &[("cpp", "c"), ("c++", "c"), ("clangd", "c"), ("javascript", "typescript"), ("js", "typescript"), ("ts", "typescript"), ("py", "python")];
@@ -74,10 +114,19 @@ pub fn by_name(name: &str) -> Option<&'static Server> {
     SERVERS.iter().chain(LINTERS).find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
-/// The linters for a file, by extension.
-pub fn linters_for(path: &Path) -> Vec<&'static Server> {
+/// The linters for a file in the project at `root`, by extension.
+pub fn linters_for(path: &Path, root: &Path) -> Vec<&'static Server> {
     let Some(ext) = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase) else { return Vec::new() };
-    LINTERS.iter().filter(|s| s.languages.iter().any(|(e, _)| *e == ext)).collect()
+    let mut eslint = None;
+    LINTERS
+        .iter()
+        .filter(|s| s.languages.iter().any(|(e, _)| *e == ext))
+        .filter(|s| match s.name {
+            "eslint" => *eslint.get_or_insert_with(|| uses_eslint(root)),
+            "biome" => !*eslint.get_or_insert_with(|| uses_eslint(root)),
+            _ => true,
+        })
+        .collect()
 }
 
 /// The server and language id for a file, by extension.
@@ -105,6 +154,33 @@ pub fn command(server: &Server, override_cmd: Option<&[String]>, find: impl Fn(&
 pub fn locate(program: &str, first: &[std::path::PathBuf], extra: &[std::path::PathBuf]) -> Option<String> {
     let in_dirs = |dirs: &[std::path::PathBuf]| dirs.iter().map(|dir| dir.join(program)).find(|p| executable(p)).map(|p| p.to_string_lossy().into_owned());
     in_dirs(first).or_else(|| on_path(program).then(|| program.to_string())).or_else(|| in_dirs(extra))
+}
+
+/// The TypeScript a project uses and how to serve it.
+#[derive(Debug, PartialEq)]
+pub enum TypeScript {
+    /// TypeScript 6 and older: typescript-language-server over `tsserver.js`, given
+    /// when it's a global one (the server finds a project's own, never a global one).
+    Classic(Option<std::path::PathBuf>),
+    /// TypeScript 7 (native): no `tsserver.js`; its own `tsc --lsp --stdio` serves.
+    Native(std::path::PathBuf),
+}
+
+/// The project's own TypeScript (`node_modules` here or above), else the one behind a
+/// `tsc` in one of `dirs` (npm links `bin/tsc` to `<typescript>/bin/tsc`).
+pub fn typescript(root: &Path, dirs: &[std::path::PathBuf]) -> Option<TypeScript> {
+    let own = root.ancestors().map(|d| d.join("node_modules/typescript")).find(|p| p.is_dir());
+    let global = || dirs.iter().filter_map(|d| std::fs::canonicalize(d.join("tsc")).ok()).find_map(|tsc| Some(tsc.parent()?.parent()?.to_path_buf()));
+    let (package, is_own) = match own {
+        Some(p) => (p, true),
+        None => (global()?, false),
+    };
+    let tsserver = package.join("lib/tsserver.js");
+    if tsserver.is_file() {
+        return Some(TypeScript::Classic((!is_own).then_some(tsserver)));
+    }
+    let tsc = package.join("bin/tsc");
+    tsc.is_file().then_some(TypeScript::Native(tsc))
 }
 
 /// Folders where user-installed servers usually live, best first: `~/.local/bin`,
@@ -156,6 +232,45 @@ mod tests {
     }
 
     #[test]
+    fn typescript_versions_pick_their_server() {
+        let dir = std::env::temp_dir().join(format!("tileide-ts-{}", std::process::id()));
+        let (project, global) = (dir.join("proj"), dir.join("global/lib/node_modules/typescript"));
+        let bin = dir.join("global/bin");
+        for d in [&project, &global.join("bin"), &global.join("lib"), &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(global.join("bin/tsc"), "").unwrap();
+        std::os::unix::fs::symlink(global.join("bin/tsc"), bin.join("tsc")).unwrap();
+        let tsc = std::fs::canonicalize(global.join("bin/tsc")).unwrap();
+        // A global TypeScript 7: only bin/tsc.
+        assert_eq!(typescript(&project, std::slice::from_ref(&bin)), Some(TypeScript::Native(tsc)));
+        // A global TypeScript 6: its tsserver.js is passed on.
+        std::fs::write(global.join("lib/tsserver.js"), "").unwrap();
+        let tsserver = std::fs::canonicalize(global.join("lib/tsserver.js")).unwrap();
+        assert_eq!(typescript(&project, std::slice::from_ref(&bin)), Some(TypeScript::Classic(Some(tsserver))));
+        // The project's own wins, and the server finds it by itself.
+        std::fs::create_dir_all(project.join("node_modules/typescript/lib")).unwrap();
+        std::fs::write(project.join("node_modules/typescript/lib/tsserver.js"), "").unwrap();
+        assert_eq!(typescript(&project, std::slice::from_ref(&bin)), Some(TypeScript::Classic(None)));
+        assert_eq!(typescript(&dir.join("elsewhere"), &[]), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn js_projects_get_biome_or_their_eslint() {
+        let dir = std::env::temp_dir().join(format!("tileide-lint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = |root: &Path| linters_for(Path::new("a.ts"), root).iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(names(&dir), ["biome"]);
+        std::fs::write(dir.join("eslint.config.js"), "").unwrap();
+        assert_eq!(names(&dir), ["eslint"]);
+        assert_eq!(linters_for(Path::new("a.py"), &dir).iter().map(|s| s.name).collect::<Vec<_>>(), ["ruff"]);
+        assert_eq!(formatter_for(Path::new("A.java")).map(|f| f.label), Some("google-java-format"));
+        assert!(formatter_for(Path::new("a.ts")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn names_and_aliases_resolve() {
         assert_eq!(by_name("cpp").map(|s| s.name), Some("c"));
         assert_eq!(by_name("Python").map(|s| s.name), Some("python"));
@@ -190,8 +305,8 @@ mod tests {
 
     #[test]
     fn python_files_get_the_linter() {
-        assert_eq!(linters_for(Path::new("a.py")).iter().map(|s| s.name).collect::<Vec<_>>(), vec!["ruff"]);
-        assert!(linters_for(Path::new("a.rs")).is_empty());
+        assert_eq!(linters_for(Path::new("a.py"), Path::new("/")).iter().map(|s| s.name).collect::<Vec<_>>(), vec!["ruff"]);
+        assert!(linters_for(Path::new("a.rs"), Path::new("/")).is_empty());
         assert_eq!(by_name("ruff").map(|s| s.name), Some("ruff"));
         assert_eq!(for_file(Path::new("a.py")).map(|(s, _)| s.name), Some("python"), "the linter never replaces the main server");
     }

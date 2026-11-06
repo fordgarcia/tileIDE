@@ -128,6 +128,42 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
     }
 }
 
+/// `plan` for a launch config: its program (a source file as `plan` reads it, a Cargo
+/// project folder, or an executable built elsewhere, debugged with gdb as it is) with
+/// the config's arguments, environment and working folder in the `launch` request.
+pub fn plan_launch(launch: &tileide_core::launch::Resolved, out_dir: &Path, host: &Host) -> Result<Plan, String> {
+    let program = &launch.program;
+    let mut plan = if program.is_dir() {
+        let root = tileide_core::run::cargo_root(program, Some(program)).ok_or_else(|| format!("{}: {} is a folder without a Cargo.toml", launch.name, program.display()))?;
+        plan(&root.join("src").join("main.rs"), out_dir, host)?
+    } else if !program.exists() {
+        return Err(format!("{}: {} doesn't exist", launch.name, program.display()));
+    } else {
+        match plan(program, out_dir, host) {
+            Err(_) if tileide_core::launch::is_executable(program) && (host.found)("gdb") => {
+                let cwd = program.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+                Plan {
+                    adapter: "gdb".into(),
+                    cmd: vec!["gdb".into(), "-q".into(), "-nx".into(), "-i".into(), "dap".into()],
+                    build: Vec::new(),
+                    launch: json!({ "program": program.to_string_lossy(), "cwd": cwd.to_string_lossy(), "stopAtBeginningOfMainSubprogram": false }),
+                    cwd,
+                }
+            }
+            other => other?,
+        }
+    };
+    // gdb (≥ 15), debugpy and the jdb bridge all read `args`, `env` (an object) and `cwd`.
+    plan.launch["args"] = json!(launch.args);
+    if !launch.env.is_empty() {
+        plan.launch["env"] = Value::Object(launch.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
+    }
+    if let Some(cwd) = &launch.cwd {
+        plan.launch["cwd"] = json!(cwd.to_string_lossy());
+    }
+    Ok(plan)
+}
+
 /// The Cargo package and binary that `file` belongs to under `root`, and where the
 /// debug build puts it (`cargo metadata`).
 fn cargo_binary(root: &Path, file: &Path) -> Result<(String, String, PathBuf), String> {
@@ -315,6 +351,44 @@ mod tests {
         assert_eq!(java.cmd, ["/usr/bin/tileide", "dap-jdb"]);
         assert_eq!((java.launch["mainClass"].as_str(), java.launch["classPath"].as_str()), (Some("Main"), Some("/o/Main-classes")));
         assert!(plan(Path::new("/w/Main.java"), Path::new("/o"), &host(&|p| p != "jdb", &any)).unwrap_err().contains("jdk-openjdk"));
+    }
+
+    #[test]
+    fn a_launch_config_reaches_the_program_through_gdb() {
+        let on = tileide_core::run::on_path;
+        if !on("gdb") || !on("cc") {
+            eprintln!("gdb or cc missing: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("tileide-dap-launch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let src = dir.join("t.c");
+        // Writes its argument and $K into out.txt, in its working folder.
+        std::fs::write(&src, "#include <stdio.h>\n#include <stdlib.h>\nint main(int c, char **v) {\n  FILE *f = fopen(\"out.txt\", \"w\");\n  fprintf(f, \"%s|%s\", c > 1 ? v[1] : \"\", getenv(\"K\"));\n  return fclose(f);\n}\n").unwrap();
+        let launch = tileide_core::launch::Resolved { name: "t".into(), program: src.clone(), args: vec!["a b".into()], env: vec![("K".into(), "v".into())], cwd: Some(dir.join("run")) };
+        let p = plan_launch(&launch, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None }).unwrap();
+        assert!(Command::new(&p.build[0][0]).args(&p.build[0][1..]).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = Session::start(&p.cmd, &p.cwd, move |m| {
+            let _ = tx.send(m);
+        })
+        .unwrap();
+        let next = |pred: &dyn Fn(&Value) -> bool| loop {
+            match rx.recv_timeout(Duration::from_secs(20)).expect("adapter message") {
+                Incoming::Message(m) if pred(&m) => return m,
+                Incoming::Message(_) => {}
+                Incoming::Exited => panic!("adapter exited"),
+            }
+        };
+        let init = s.request("initialize", initialize_args()).unwrap();
+        next(&|m| m["request_seq"] == init);
+        s.request("launch", p.launch.clone()).unwrap();
+        next(&|m| m["event"] == "initialized");
+        s.request("configurationDone", json!({})).unwrap();
+        next(&|m| m["event"] == "exited" || m["event"] == "terminated");
+        s.stop();
+        assert_eq!(std::fs::read_to_string(dir.join("run/out.txt")).unwrap(), "a b|v");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

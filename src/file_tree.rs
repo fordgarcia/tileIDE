@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The drawer's Files section: a folder tree with a VS Code-style toolbar
 //! (new file, new folder, refresh, collapse all). Clicking a file opens it in a tile.
+//! The list follows changes on disk in the folders it shows.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use gtk::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use tileide_core::theme::{self, Theme};
 use tileide_core::token;
@@ -48,6 +50,10 @@ pub fn css(t: &Theme) -> String {
     )
 }
 
+/// Changes on disk are shown once they've been quiet this long (a `git checkout` or a
+/// build makes many at once).
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Copy)]
 enum NewKind {
     File,
@@ -68,6 +74,9 @@ pub struct FileTree {
     container: gtk::Box,
     title: gtk::Label,
     on_open: Rc<dyn Fn(&Path)>,
+    /// One per shown folder (the root and each open folder), so the list follows the disk.
+    monitors: HashMap<PathBuf, gio::FileMonitor>,
+    refresh_timer: Option<glib::SourceId>,
     me: Weak<RefCell<FileTree>>,
 }
 
@@ -98,6 +107,8 @@ impl FileTree {
             container: container.clone(),
             title,
             on_open,
+            monitors: HashMap::new(),
+            refresh_timer: None,
             me: Weak::new(),
         }));
         tree.borrow_mut().me = Rc::downgrade(&tree);
@@ -118,6 +129,26 @@ impl FileTree {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.container
+    }
+
+    /// Test action `files:<verb>`: `rows` prints the shown paths, `refresh` is the header
+    /// button, `toggle:<n>` opens or closes the folder in row `n`.
+    pub fn test_action(&mut self, verb: &str) {
+        match verb.split_once(':') {
+            Some(("toggle", n)) => {
+                if let Some(path) = n.parse::<usize>().ok().and_then(|i| self.rows.get(i).cloned()) {
+                    if !self.expanded.remove(&path) {
+                        self.expanded.insert(path);
+                    }
+                    self.rebuild();
+                }
+            }
+            _ if verb == "refresh" => self.rebuild(),
+            _ => {
+                let rows: Vec<String> = self.rows.iter().map(|p| p.strip_prefix(&self.root).unwrap_or(p).display().to_string()).collect();
+                println!("files: {}", rows.join(" | "));
+            }
+        }
     }
 
     /// Shows another folder (workspace switch). Each root keeps the folders that were
@@ -172,6 +203,59 @@ impl FileTree {
         if let Some(i) = self.selected.as_ref().and_then(|s| self.rows.iter().position(|p| p == s)) {
             self.list.select_row(self.list.row_at_index(i as i32).as_ref());
         }
+        self.watch_shown();
+    }
+
+    /// Watches the root and every open folder, and only those.
+    fn watch_shown(&mut self) {
+        let mut shown: HashSet<PathBuf> = self.rows.iter().filter(|p| self.expanded.contains(*p)).cloned().collect();
+        if !self.root.as_os_str().is_empty() {
+            shown.insert(self.root.clone());
+        }
+        self.monitors.retain(|dir, _| shown.contains(dir));
+        for dir in shown {
+            if self.monitors.contains_key(&dir) {
+                continue;
+            }
+            let monitor = match gio::File::for_path(&dir).monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, None::<&gio::Cancellable>) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("files: cannot watch {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            let weak = self.me.clone();
+            monitor.connect_changed(move |_, file, other, event| {
+                use gio::FileMonitorEvent as E;
+                // Content changes don't change the list.
+                if !matches!(event, E::Created | E::Deleted | E::MovedIn | E::MovedOut | E::Renamed) {
+                    return;
+                }
+                let only_git = [Some(file), other].into_iter().flatten().all(|f| f.basename().is_some_and(|n| n == Path::new(".git")));
+                if let (false, Some(tree)) = (only_git, weak.upgrade()) {
+                    tree.borrow_mut().refresh_soon();
+                }
+            });
+            self.monitors.insert(dir, monitor);
+        }
+    }
+
+    fn refresh_soon(&mut self) {
+        if let Some(timer) = self.refresh_timer.take() {
+            timer.remove();
+        }
+        let weak = self.me.clone();
+        self.refresh_timer = Some(glib::timeout_add_local_once(REFRESH_DEBOUNCE, move || {
+            let Some(tree) = weak.upgrade() else { return };
+            let mut tree = tree.borrow_mut();
+            tree.refresh_timer = None;
+            // Rebuilding would drop a name being typed (its row has an empty path); try later.
+            if tree.rows.iter().any(|p| p.as_os_str().is_empty()) {
+                tree.refresh_soon();
+            } else {
+                tree.rebuild();
+            }
+        }));
     }
 
     fn add_children(&mut self, dir: &Path, depth: usize) {

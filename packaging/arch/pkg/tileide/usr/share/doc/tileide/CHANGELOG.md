@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.6.0-alpha.4 (2026-11-06): launch configs
+
+### Added
+- **Launch configs** shared by Run and Debug: `tileide.launch { name, program, args, env, cwd }` in `tileide.lua`, and a project's `.vscode/launch.json` (`launch` configurations: `name`, `program`, `args`, `env`/`environment`, `cwd`; attach and `module` configs are listed as skipped). **`Alt+L`** picks the one `Alt+R` and `F5` use in this workspace, or back to the focused file. VS Code's `${…}` variables are filled in; relative paths start at the workspace folder.
+- `program` can be a source file (built and run, or debugged, as `Alt+R`/`F5` would), a Cargo project folder (`cargo run -- args`), or an executable built elsewhere (run directly, debugged with gdb).
+- New bind action `launch`.
+
+## 0.6.0-alpha.3 (2026-11-06): smooth blur
+
+### Fixed
+- **Blur no longer looks pixelated.** The background, sidebar and tile blur was a shrink-and-stretch that showed blocks; it is now a Gaussian blur as browsers draw CSS `blur()` (the look of Zen Browser's frosted panels): the image is halved until the blur is small, blurred there with the CSS spec's three-box Gaussian, then scaled back up smoothly.
+
+### Changed
+- A blur value now means what it means in CSS (the Gaussian's standard deviation in px), so the same setting looks softer than before; lower it if it's too strong.
+
+## 0.6.0-alpha.2 (2026-11-04): linters and formatters per language
+
+### Added
+- **JavaScript/TypeScript linting**: Biome (`npm i -g @biomejs/biome`) lints and formats JS/TS; a project with an ESLint config (`eslint.config.*`, `.eslintrc*`, or `eslintConfig` in `package.json`) gets ESLint instead (`npm i -g vscode-langservers-extracted`, plus `eslint` in the project), with its quick fixes on `Ctrl+.`. Biome follows the project's `biome.json` (its default indent is tabs).
+- **Rust**: when Clippy is installed, rust-analyzer checks with it on save, so Clippy's lints show beside the compiler's.
+- **Java**: `Ctrl+Shift+I` formats with google-java-format when it's installed; otherwise jdtls formats as before.
+- C/C++ lint comes from clangd running clang-tidy with the project's `.clang-tidy`; formatting follows `.clang-format`.
+
+### Changed
+- A linter that formats (Ruff, Biome) now formats instead of the main language server.
+
+## 0.6.0-alpha.1 (2026-11-04): language checks, live file tree
+
+### Added
+- **The file tree follows the disk**: files and folders created, deleted or renamed outside TileIDE show up on their own (the root and every open folder are watched; bursts are batched). Refresh is still there.
+- **TypeScript 7** (the native compiler, `npm i -g typescript`) serves TypeScript and JavaScript itself (`tsc --lsp`); typescript-language-server is still used with TypeScript 6 and older.
+
+### Fixed
+- **TypeScript/JavaScript**: with TypeScript installed globally rather than in the project, typescript-language-server refused to start ("Could not find a valid TypeScript installation"); TileIDE now points it at the global one.
+- **Tab and auto-indent insert spaces** (4 per level). They inserted a tab character in every file; files already indented with tabs, and Makefiles, keep tabs. Java formatting (`Ctrl+Shift+I`) follows this too.
+- **Inlay hints** came only after the first edit; they now show when the file opens. With rust-analyzer they never showed (the request covered a line past the end of the file, and a project still loading answered "content modified").
+- Inlay hints read `width=2.0` for Java parameter names and C's `.width=` designators (they showed the name alone).
+- **Java**: signature help (parameter info after `(`) and parameter hints for every argument are now on for jdtls; hovers no longer show `<!-- -->`.
+- A crash when a completion list closed while its documentation was still on its way (seen with TypeScript and Tab).
+
+## 0.5.1 (2026-11-04): fixes
+
+### Fixed
+- **Crash on closing Settings while a theme was previewed**: picking themes with the arrow keys in Settings → Themes & background, then closing Settings (or anything else that moves focus to a tile) without applying, closed TileIDE.
+
 ## 0.5.0 (2026-11-04): Python & Notebook, theme editor, Wikipedia rice
 
 The alphas below in one release:

@@ -378,6 +378,8 @@ impl Popup {
         }
         st.items.clear();
         st.shown.clear();
+        // A resolve still on its way belongs to the list just dropped.
+        st.generation += 1;
     }
 
     /// Tab completion: one match left is filled in at once (as Jupyter does). Returns

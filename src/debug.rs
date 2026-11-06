@@ -308,8 +308,9 @@ enum Failure {
 }
 
 /// `F5`: continues a paused program, else builds and debugs `file` (in the workspace
-/// `folder`, where its Cargo project and virtualenv are looked for).
-pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>) {
+/// `folder`, where its Cargo project and virtualenv are looked for), or the picked
+/// launch config's program (`picked`, Alt+L; or why it can't be used).
+pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked: Option<Result<tileide_core::launch::Resolved, String>>) {
     if is_paused() {
         step("continue");
         return;
@@ -322,12 +323,21 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>) {
         (h.show_panel)(shown.root.upcast_ref());
     }
     shown.clear();
-    let Some(file) = file else {
+    let config = match picked.transpose() {
+        Ok(config) => config,
+        Err(e) => {
+            shown.set_state("Can't debug", Some("failed"));
+            shown.append(&format!("{e}\n"));
+            return;
+        }
+    };
+    // The launch config's program stands in for the focused file.
+    let Some(file) = config.as_ref().map(|l| l.program.clone()).or(file) else {
         shown.set_state("Nothing to debug", Some("failed"));
         shown.append("Focus a C, C++, Rust, Python or Java file and press F5.\n");
         return;
     };
-    let name = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let name = config.as_ref().map_or_else(|| file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()), |l| l.name.clone());
     shown.title.set_text(&format!("Debug · {name}"));
     shown.set_state("Building…", None);
     // Planning (it asks Python about debugpy) and building run off the main thread.
@@ -343,7 +353,11 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>) {
             bridge: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tileide")),
             folder,
         };
-        let result = tileide_dap::plan(&file, &out_dir, &host).map_err(Failure::Missing).and_then(|plan| {
+        let plan = match &config {
+            Some(config) => tileide_dap::plan_launch(config, &out_dir, &host),
+            None => tileide_dap::plan(&file, &out_dir, &host),
+        };
+        let result = plan.map_err(Failure::Missing).and_then(|plan| {
             let mut log = String::new();
             for step in &plan.build {
                 log += &format!("$ {}\n", step.join(" "));

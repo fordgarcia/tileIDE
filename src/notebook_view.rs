@@ -786,6 +786,7 @@ impl NotebookView {
         view.set_monospace(true);
         view.set_auto_indent(true);
         view.set_tab_width(4);
+        view.set_insert_spaces_instead_of_tabs(true);
         view.set_wrap_mode(gtk::WrapMode::WordChar);
         view.set_left_margin(8);
         view.set_top_margin(4);

@@ -4,6 +4,7 @@
 pub mod columns;
 pub mod drawer;
 pub mod extension;
+pub mod launch;
 pub mod layout;
 pub mod motion;
 pub mod python;

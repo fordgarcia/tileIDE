@@ -408,6 +408,7 @@ fn execute(plan: &Plan, group: &AtomicI32, stopped: &AtomicBool, tx: &std::sync:
                 .env("NO_COLOR", "1")
                 .env("CARGO_TERM_COLOR", "never")
                 .env("PYTHONUNBUFFERED", "1")
+                .envs(plan.env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(writer))
                 .stderr(Stdio::from(for_stderr))

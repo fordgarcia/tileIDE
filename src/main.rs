@@ -49,6 +49,7 @@ mod wiki;
 mod workspaces;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -141,6 +142,8 @@ struct App {
     settings_card: Rc<settings_ui::SettingsCard>,
     keybinds_card: Rc<keybinds_card::KeybindsCard>,
     run_card: Rc<run_card::RunCard>,
+    /// The launch config Alt+R and F5 use, by workspace number (Alt+L); none = the focused file.
+    launch_pick: RefCell<HashMap<u8, String>>,
     visualizer: Rc<audio::Visualizer>,
     /// The visualizer under the file tree (drawer open).
     wave: gtk::DrawingArea,
@@ -627,6 +630,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             settings_card,
             keybinds_card,
             run_card,
+            launch_pick: RefCell::new(HashMap::new()),
             visualizer,
             wave: wave.clone(),
             raw_config: RefCell::new(Config::default()),
@@ -772,6 +776,17 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     println!("test action: keys → {}|{}", buffer.text(&line, &at, false), buffer.text(&at, &end, false));
                 }
             }
+            // `where`: the focused file, its cursor (1-based line:column) and its text.
+            (Some(app), _) if name == "where" => {
+                let current = app.workspaces.borrow().current();
+                let tiles = current.borrow();
+                if let Some(editor) = tiles.focused_code() {
+                    let buffer = editor.buffer();
+                    let at = buffer.iter_at_mark(&buffer.get_insert());
+                    let file = tiles.focused_file().map(|f| f.display().to_string()).unwrap_or_default();
+                    println!("where: {file}:{}:{}\n{}", at.line() + 1, at.line_offset() + 1, buffer.text(&buffer.start_iter(), &buffer.end_iter(), false));
+                }
+            }
             // `completions`: the open list's first 12 labels, best first.
             (Some(app), _) if name == "completions" => {
                 if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
@@ -831,6 +846,8 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                 }
             }
             // `tiles`: the workspace's tile rects, printed.
+            (Some(app), _) if name == "files" => app.files.borrow_mut().test_action(arg.as_deref().unwrap_or("rows")),
+            (Some(app), _) if name == "themes-select" => app.themes_panel.test_select(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
             (Some(app), _) if name == "tiles" => println!("tiles: {}", app.workspaces.borrow().current().borrow().describe()),
             // `diagnostics`: the focused editor's or cell's diagnostics, printed.
             (Some(app), _) if name == "hints" => {
@@ -1448,12 +1465,79 @@ impl App {
         };
         let out = glib::user_runtime_dir().join("tileide-run");
         let _ = std::fs::create_dir_all(&out);
-        let plan = tileide_core::run::plan(file.as_deref(), folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path);
+        let plan = match self.picked_launch(file.as_deref(), folder.as_deref()) {
+            Some(Ok(launch)) => tileide_core::run::plan_launch(&launch, folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path),
+            Some(Err(e)) => Err(e),
+            None => tileide_core::run::plan(file.as_deref(), folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path),
+        };
         match plan {
             Ok(plan) => self.run_card.run(plan),
             Err(_) if file.is_none() && self.run_card.rerun() => {}
             Err(e) => self.run_card.show_message("Run", &e),
         }
+    }
+
+    /// The launch configs of the active workspace: `tileide.lua`'s, then its folder's
+    /// `.vscode/launch.json` (with what that file has that can't be used, or its error).
+    fn launch_configs(&self, folder: Option<&Path>) -> (Vec<(tileide_core::launch::Launch, &'static str)>, Option<String>) {
+        let mut configs: Vec<_> = self.config.borrow().launches.iter().map(|l| (l.clone(), "tileide.lua")).collect();
+        let Some(text) = folder.and_then(|f| std::fs::read_to_string(f.join(".vscode/launch.json")).ok()) else { return (configs, None) };
+        match tileide_config::vscode::launch_configs(&text) {
+            Ok((found, skipped)) => {
+                configs.extend(found.into_iter().map(|l| (l, "launch.json")));
+                let note = (!skipped.is_empty()).then(|| format!("launch.json: skipped {} (attach, module or no program)", skipped.join(", ")));
+                (configs, note)
+            }
+            Err(e) => (configs, Some(e)),
+        }
+    }
+
+    /// The launch config picked for this workspace (Alt+L), resolved; `None` = none picked.
+    fn picked_launch(&self, file: Option<&Path>, folder: Option<&Path>) -> Option<Result<tileide_core::launch::Resolved, String>> {
+        let Active::Number(n) = self.workspaces.borrow().active() else { return None };
+        let name = self.launch_pick.borrow().get(&n).cloned()?;
+        let Some((launch, _)) = self.launch_configs(folder).0.into_iter().find(|(l, _)| l.name == name) else {
+            return Some(Err(format!("The launch config \"{name}\" is gone; Alt+L picks another.")));
+        };
+        Some(launch.resolve(&tileide_core::launch::Context { folder, file }))
+    }
+
+    /// `Alt+L`: picks what Alt+R and F5 launch in this workspace: a launch config, or the
+    /// focused file (the default).
+    fn pick_launch(&self) {
+        let Active::Number(n) = self.workspaces.borrow().active() else { return };
+        let folder = self.workspaces.borrow().folder(Active::Number(n));
+        let (configs, note) = self.launch_configs(folder.as_deref());
+        if let Some(note) = note {
+            self.notice(note);
+        }
+        if configs.is_empty() {
+            self.notice("No launch configs: add tileide.launch { name = …, program = … } to tileide.lua, or a .vscode/launch.json to the workspace folder.".into());
+            return;
+        }
+        let Some(editor) = self.workspaces.borrow().current().borrow().focused_code() else {
+            self.notice("Focus an editor, then Alt+L to pick a launch config.".into());
+            return;
+        };
+        let current = self.launch_pick.borrow().get(&n).cloned();
+        let mark = |on: bool| if on { "● " } else { "   " };
+        let mut rows = vec![format!("{}Focused file (no config)", mark(current.is_none()))];
+        rows.extend(configs.iter().map(|(l, from)| format!("{}{} · {} ({from})", mark(current.as_deref() == Some(l.name.as_str())), l.name, l.program)));
+        let names: Vec<String> = configs.into_iter().map(|(l, _)| l.name).collect();
+        let me = self.me.clone();
+        pick_card::show(&editor, "Alt+R and F5 launch", &rows, move |i| {
+            let Some(app) = me.upgrade() else { return };
+            match i.checked_sub(1).and_then(|i| names.get(i)) {
+                Some(name) => {
+                    app.launch_pick.borrow_mut().insert(n, name.clone());
+                    app.notice(format!("Alt+R and F5 launch \"{name}\" in this workspace."));
+                }
+                None => {
+                    app.launch_pick.borrow_mut().remove(&n);
+                    app.notice("Alt+R and F5 launch the focused file.".into());
+                }
+            }
+        });
     }
 
     /// `Alt+=` / `Alt+-`: the code font of every tile, one point at a time.
@@ -2012,7 +2096,9 @@ impl App {
                     let w = self.workspaces.borrow();
                     w.folder(w.active())
                 };
-                debug::start_or_continue(file, folder);
+                // While paused F5 continues, whatever is picked.
+                let launch = if debug::is_paused() { None } else { self.picked_launch(file.as_deref(), folder.as_deref()) };
+                debug::start_or_continue(file, folder, launch);
             }
             Action::DebugStop => debug::stop(),
             Action::Breakpoint => {
@@ -2031,6 +2117,7 @@ impl App {
             Action::StepOut => debug::step("stepOut"),
             Action::Toolchains => self.toggle_settings(settings_ui::Page::Toolchains),
             Action::Test => self.run_tests(),
+            Action::Launch => self.pick_launch(),
             Action::NextFailure => {
                 let tests = self.tests.borrow().clone();
                 if !tests.is_some_and(|t| t.next_failure()) {

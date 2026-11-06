@@ -1253,6 +1253,8 @@ fn editor(path: Option<&Path>, wrap: bool, theme: &Theme) -> (gtk::Widget, gtk::
     view.set_left_margin(8);
     view.set_top_margin(8);
     view.set_wrap_mode(wrap_mode(wrap));
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+    view.set_insert_spaces_instead_of_tabs(!crate::editing::indents_with_tabs(path, &text));
     crate::editing::attach(&view);
 
     let scroll = gtk::ScrolledWindow::new();

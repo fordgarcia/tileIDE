@@ -1,11 +1,11 @@
 format = 2
 pkgname = tileide
 pkgbase = tileide
-pkgver = 0.5.0-1
+pkgver = 0.6.0alpha4-1
 pkgarch = x86_64
-pkgbuild_sha256sum = f013805f3ef6076821903f087fd7456faaa7b69b96c0794a624e3ba25f332b90
+pkgbuild_sha256sum = 158a44f8ead33aa5b7361474c92aa3f627500d8329f26b03d7d3dfb356d825ec
 packager = Unknown Packager
-builddate = 1793755727
+builddate = 1793968340
 builddir = /home/paris/Documents/claude/projects/tileIDE/deploy/packaging/arch
 startdir = /home/paris/Documents/claude/projects/tileIDE/deploy/packaging/arch
 buildtool = makepkg

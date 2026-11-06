@@ -32,6 +32,8 @@ pub struct Config {
     pub explicit: BTreeSet<String>,
     /// `tileide.runner(".ext", "command {file}")`: Alt+R commands by extension.
     pub runners: BTreeMap<String, String>,
+    /// `tileide.launch { name, program, args, env, cwd }`: launch configs for Alt+R and F5.
+    pub launches: Vec<tileide_core::launch::Launch>,
 }
 
 /// Which messages pop up on the banner.
@@ -247,6 +249,8 @@ pub enum Action {
     Interpreter,
     /// pytest: the test at the cursor, else the file, else every test (v0.5 phase 9).
     Test,
+    /// Picks the launch config Alt+R and F5 use in this workspace (v0.6 phase 3).
+    Launch,
     /// The next failed test's failure.
     NextFailure,
     /// Valid, but its feature arrives in a later version; pressing it does nothing.
@@ -310,6 +314,7 @@ impl Default for Config {
             lsp: BTreeMap::new(),
             explicit: BTreeSet::new(),
             runners: BTreeMap::new(),
+            launches: Vec::new(),
         }
     }
 }
@@ -372,6 +377,7 @@ pub fn default_binds(m: &str) -> Vec<Bind> {
         bind(&[m], "minus", Action::FontSize(-1)),
         bind(&[m], "R", Action::Run),
         bind(&[m], "P", Action::Interpreter),
+        bind(&[m], "L", Action::Launch),
         bind(&[m, "SHIFT"], "R", Action::Test),
         bind(&[], "F8", Action::NextFailure),
         bind(&[], "F5", Action::Debug),

@@ -198,7 +198,7 @@ fn attach_doc(buffer: &sourceview5::Buffer, view: &sourceview5::View, path: Path
     let root = project.as_deref().unwrap_or(root);
     let Some(servers) = HUB.with_borrow_mut(|hub| {
         let main = start(hub, root, spec)?;
-        Some(std::iter::once(main).chain(servers::linters_for(&path).into_iter().filter_map(|l| start(hub, root, l))).collect::<Vec<usize>>())
+        Some(std::iter::once(main).chain(servers::linters_for(&path, root).into_iter().filter_map(|l| start(hub, root, l))).collect::<Vec<usize>>())
     }) else {
         return;
     };
@@ -342,9 +342,38 @@ fn attach_doc(buffer: &sourceview5::Buffer, view: &sourceview5::View, path: Path
             if let Some(s) = hub.servers[id].as_mut() {
                 let version = *s.versions.entry(path.clone()).or_insert(1);
                 send(s, protocol::did_open(&path, language, version, &text));
+                pull_diagnostics(id, s, &path);
             }
         }
     });
+}
+
+/// Asks a server that doesn't send diagnostics for `path`'s (ESLint); nothing for one
+/// still starting (`initialized` asks then) or one that sends them.
+fn pull_diagnostics(id: usize, s: &mut Server, path: &Path) {
+    if !s.caps.as_ref().is_some_and(|c| c.pull_diagnostics) {
+        return;
+    }
+    let Ok(rid) = s.conn.request("textDocument/diagnostic", protocol::document_diagnostic(path)) else { return };
+    let path = path.to_path_buf();
+    s.pending.insert(
+        rid,
+        Box::new(move |m: &Value| {
+            if let Some(list) = protocol::pulled_diagnostics(&path, &m["result"]) {
+                show_diagnostics(id, &path, list);
+            }
+        }),
+    );
+}
+
+/// Every open file's diagnostics from server `id`, asked again.
+fn pull_all(hub: &mut Hub, id: usize) {
+    let paths: Vec<PathBuf> = hub.docs.iter().filter(|d| d.servers.contains(&id)).map(|d| d.path.clone()).collect();
+    if let Some(s) = hub.servers[id].as_mut() {
+        for path in paths {
+            pull_diagnostics(id, s, &path);
+        }
+    }
 }
 
 /// Ends language support for `buffer` (tile closed or replaced, file renamed).
@@ -675,6 +704,66 @@ fn python_settings(spec: &Spec, root: &Path) -> Value {
     python.map_or(Value::Null, |p| serde_json::json!({"python": {"pythonPath": p}}))
 }
 
+/// TypeScript's inlay hints are off unless asked for: TypeScript 7's server reads them
+/// as settings (VS Code's names), typescript-language-server as `preferences`.
+fn typescript_settings() -> Value {
+    let hints = serde_json::json!({"inlayHints": {
+        "parameterNames": {"enabled": "all", "suppressWhenArgumentMatchesName": true},
+        "variableTypes": {"enabled": true},
+        "propertyDeclarationTypes": {"enabled": true},
+        "functionLikeReturnTypes": {"enabled": true},
+        "enumMemberValues": {"enabled": true},
+    }});
+    serde_json::json!({"typescript": hints, "javascript": hints, "js/ts": hints})
+}
+
+/// jdtls keeps signature help off unless asked; parameter-name hints cover every
+/// argument, as for the other languages (its default is literals only).
+fn java_settings() -> Value {
+    serde_json::json!({"java": {"signatureHelp": {"enabled": true}, "inlayHints": {"parameterNames": {"enabled": "all"}}}})
+}
+
+/// rust-analyzer checks on save with Clippy when it's installed (lints beyond the
+/// compiler's), else with `cargo check` as before. rustup has a `cargo-clippy` proxy
+/// even without the component, so ask Clippy itself, once.
+fn rust_settings() -> Value {
+    thread_local! {
+        static CLIPPY: bool = std::process::Command::new("cargo")
+            .args(["clippy", "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    }
+    if CLIPPY.with(|c| *c) { serde_json::json!({"check": {"command": "clippy"}}) } else { Value::Null }
+}
+
+/// What vscode-eslint-language-server needs answered (it asks for the whole object):
+/// lint as you type, no formatting (the TypeScript server formats).
+fn eslint_settings(root: &Path) -> Value {
+    let name = root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    serde_json::json!({
+        "validate": "on", "run": "onType", "format": false, "quiet": false, "onIgnoredFiles": "off",
+        "nodePath": null, "packageManager": "npm", "useESLintClass": false, "experimental": {},
+        "rulesCustomizations": [], "problems": {"shortenToSingleLine": false},
+        "codeActionOnSave": {"enable": false, "mode": "all"},
+        "codeAction": {"disableRuleComment": {"enable": true, "location": "separateLine"}, "showDocumentation": {"enable": false}},
+        "workingDirectory": {"mode": "location"},
+        "workspaceFolder": {"uri": tileide_lsp::text::path_to_uri(root), "name": name},
+    })
+}
+
+fn typescript_preferences() -> Value {
+    serde_json::json!({
+        "includeInlayParameterNameHints": "all",
+        "includeInlayParameterNameHintsWhenArgumentMatchesName": false,
+        "includeInlayVariableTypeHints": true,
+        "includeInlayPropertyDeclarationTypeHints": true,
+        "includeInlayFunctionLikeReturnTypeHints": true,
+        "includeInlayEnumMemberValueHints": true,
+    })
+}
+
 /// The Python chosen for `project` changed: its Python servers (and those of folders
 /// inside it) analyse with the new one.
 pub fn python_changed(project: &Path) {
@@ -705,12 +794,27 @@ fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
     let venvs = tileide_core::python::venvs(root, None, std::env::var_os("VIRTUAL_ENV").map(PathBuf::from).as_deref(), home.as_deref());
     let venv_bins: Vec<PathBuf> = tileide_core::python::chosen(root).iter().chain(&venvs).filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
     let extra = servers::user_dirs(home.as_deref());
-    let Some(cmd) = servers::command(spec, setting.and_then(|s| s.cmd.as_deref()), |p| servers::locate(p, &venv_bins, &extra)) else {
+    let override_cmd = setting.and_then(|s| s.cmd.as_deref());
+    let typescript = (spec.name == "typescript" && override_cmd.is_none()).then(|| {
+        let path_dirs = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+        servers::typescript(root, &path_dirs.into_iter().chain(extra.iter().cloned()).collect::<Vec<_>>())
+    });
+    let cmd = match typescript.as_ref().and_then(Option::as_ref) {
+        Some(servers::TypeScript::Native(tsc)) => Some(vec![tsc.to_string_lossy().into_owned(), "--lsp".into(), "--stdio".into()]),
+        _ => servers::command(spec, override_cmd, |p| servers::locate(p, &venv_bins, &extra)),
+    };
+    let Some(cmd) = cmd else {
         hub.failed.insert(key);
         crate::alerts::missing(format!("No {} language server found. To get one: {}.", spec.label, spec.install));
         return None;
     };
-    let settings = python_settings(spec, root);
+    let settings = match spec.name {
+        "typescript" => typescript_settings(),
+        "java" => java_settings(),
+        "rust" => serde_json::json!({"rust-analyzer": rust_settings()}),
+        "eslint" => eslint_settings(root),
+        _ => python_settings(spec, root),
+    };
     let id = hub.servers.len();
     let deliver = move |message: Incoming| glib::MainContext::default().invoke(move || receive(id, message));
     println!("lsp: starting {} for {}", cmd.join(" "), root.display());
@@ -722,7 +826,16 @@ fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
             return None;
         }
     };
-    let Ok(request) = conn.request("initialize", protocol::initialize_params(root)) else {
+    let options = match typescript.flatten() {
+        Some(servers::TypeScript::Classic(Some(tsserver))) => serde_json::json!({"tsserver": {"path": tsserver}, "preferences": typescript_preferences()}),
+        Some(servers::TypeScript::Native(_)) => Value::Null,
+        _ if spec.name == "typescript" => serde_json::json!({"preferences": typescript_preferences()}),
+        // Read once at start (signature help is registered then or never).
+        _ if spec.name == "java" => serde_json::json!({"settings": java_settings()}),
+        _ if spec.name == "rust" => rust_settings(),
+        _ => Value::Null,
+    };
+    let Ok(request) = conn.request("initialize", protocol::initialize_params(root, options)) else {
         hub.failed.insert(key);
         return None;
     };
@@ -745,6 +858,7 @@ fn initialized(id: usize, reply: &Value) {
         for message in std::mem::take(&mut s.queue) {
             let _ = s.conn.send(&message);
         }
+        pull_all(hub, id);
     });
 }
 
@@ -774,6 +888,24 @@ fn receive(id: usize, incoming: Incoming) {
     if message["method"] == "workspace/applyEdit" {
         apply_workspace_edit(&message["params"]["edit"], server_encoding(id));
     }
+    let method = message["method"].as_str().unwrap_or("");
+    if method == "client/registerCapability" || method == "client/unregisterCapability" {
+        HUB.with_borrow_mut(|hub| {
+            if let Some(caps) = hub.servers.get_mut(id).and_then(Option::as_mut).and_then(|s| s.caps.as_mut()) {
+                caps.register(&message["params"], method == "client/registerCapability");
+            }
+        });
+    }
+    if method == "workspace/diagnostic/refresh" {
+        HUB.with_borrow_mut(|hub| pull_all(hub, id));
+    }
+    // The server's hints changed without an edit (rust-analyzer once it has indexed).
+    if message["method"] == "workspace/inlayHint/refresh" {
+        let buffers: Vec<sourceview5::Buffer> = HUB.with_borrow(|hub| hub.docs.iter().filter(|d| d.servers.contains(&id)).filter_map(|d| d.buffer.upgrade()).collect());
+        for buffer in buffers {
+            schedule_hints(&buffer, Duration::ZERO);
+        }
+    }
 }
 
 fn exited(id: usize) {
@@ -792,10 +924,6 @@ fn exited(id: usize) {
     });
     for buffer in buffers {
         render_diagnostics(&buffer);
-        // Diagnostics mean the server has analysed the file: the first hints can come.
-        if with_doc(&buffer, |d| !d.hinted).unwrap_or(false) {
-            schedule_hints(&buffer, Duration::ZERO);
-        }
     }
 }
 
@@ -997,6 +1125,7 @@ fn sync_text(buffer: &sourceview5::Buffer) {
             *version += 1;
             let version = *version;
             send(s, protocol::did_change(&path, version, &text));
+            pull_diagnostics(id, s, &path);
         }
     });
     schedule_hints(buffer, HINTS_DELAY);
@@ -1145,6 +1274,10 @@ fn show_diagnostics(server: usize, path: &Path, list: Vec<Diagnostic>) {
     });
     for buffer in buffers {
         render_diagnostics(&buffer);
+        // Diagnostics mean the server has analysed the file: the first hints can come.
+        if with_doc(&buffer, |d| !d.hinted).unwrap_or(false) {
+            schedule_hints(&buffer, Duration::ZERO);
+        }
     }
 }
 
@@ -1789,12 +1922,19 @@ fn request_hints(buffer: &sourceview5::Buffer) {
         let Some(id) = d.servers.iter().copied().find(|&id| hub.servers[id].as_ref().and_then(|s| s.caps.as_ref()).is_some_and(|c| c.inlay_hints)) else { return };
         let Some(s) = hub.servers[id].as_mut() else { return };
         let encoding = s.caps.as_ref().map_or(Encoding::Utf16, |c| c.encoding);
-        let range = protocol::Range { start: Position { line: offset, column: 0 }, end: Position { line: offset + lines, column: 0 } };
+        // The buffer's real end: rust-analyzer refuses a range past the last line.
+        let end = position_of(buffer.upcast_ref(), &buffer.end_iter(), encoding);
+        let range = protocol::Range { start: Position { line: offset, column: 0 }, end: Position { line: offset + end.line, column: end.column } };
         let Ok(rid) = s.conn.request("textDocument/inlayHint", protocol::inlay_hint(&path, range)) else { return };
         s.pending.insert(
             rid,
             Box::new(move |m: &Value| {
                 let Some(buffer) = b.upgrade() else { return };
+                // ContentModified: rust-analyzer answers this while it loads the project.
+                if m["error"]["code"] == -32801 {
+                    schedule_hints(&buffer, Duration::from_secs(1));
+                    return;
+                }
                 let hints = protocol::inlay_hints(&m["result"]).into_iter().filter(|h| h.at.line >= offset && h.at.line < offset + lines).map(|mut h| {
                     h.at.line -= offset;
                     h
@@ -1808,7 +1948,8 @@ fn request_hints(buffer: &sourceview5::Buffer) {
 fn show_hints(buffer: &sourceview5::Buffer, hints: Vec<protocol::InlayHint>, encoding: Encoding) {
     let Some(provider) = HUB.with_borrow_mut(|hub| {
         let d = hub.docs.iter_mut().find(|d| d.buffer.upgrade().as_ref() == Some(buffer))?;
-        d.hinted = true;
+        // A server still indexing answers with none: the next diagnostics ask again.
+        d.hinted = !hints.is_empty();
         Some(d.hints.clone())
     }) else {
         return;
@@ -1839,11 +1980,13 @@ pub fn hint_lines(buffer: &sourceview5::Buffer) -> Vec<String> {
 }
 
 /// A hint as it reads at the end of its line: `x: int` (the name before it), `-> str`,
-/// `a=10` (the argument after a parameter name, cut short).
+/// `a=10` (the argument after a parameter name, cut short; also C's designators,
+/// `.width=2.0`).
 fn hint_text(line: &str, at: usize, hint: &protocol::InlayHint) -> String {
     let chars: Vec<char> = line.chars().collect();
     let at = at.min(chars.len());
-    if hint.parameter {
+    let designator = hint.label.starts_with(['.', '[']) && hint.label.ends_with('=');
+    if hint.parameter || designator {
         let name = hint.label.trim_end_matches([':', '=']).trim();
         let mut depth = 0i32;
         let arg: String = chars[at..]
@@ -1885,6 +2028,7 @@ mod hint_tests {
         assert_eq!(hint_text("total = add(1, f(2, 3))", 15, &hint("b=", true)), "b=f(2, 3)");
         assert_eq!(hint_text("add(\"a very long string here\")", 4, &hint("text:", true)), "text=\"a very long st…");
         assert_eq!(hint_text("def f(x)", 8, &hint("-> int", false)), "-> int");
+        assert_eq!(hint_text("Rect box = { 2.0, 3.0 };", 13, &hint(".width=", false)), ".width=2.0");
     }
 }
 
@@ -1981,11 +2125,20 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
         if cell && tileide_notebook::python_view(&source).lines().zip(source.lines()).any(|(py, src)| py != src && !src.trim().is_empty()) {
             let ruff = d.servers.iter().find_map(|&id| hub.servers[id].as_ref().filter(|s| s.spec.name == "ruff")).ok_or("Cells with % or ! lines need Ruff to format (pacman -S ruff).")?;
             let (masked, taken) = tileide_notebook::mask_ipython(&source).ok_or("A %% cell isn't Python: not formatted.")?;
-            let (program, root) = (ruff.program.clone(), ruff.root.clone());
-            return Ok(Some((program, root, masked, taken)));
+            let command = vec![ruff.program.clone(), "format".into(), "--stdin-filename".into(), "cell.py".into(), "-".into()];
+            return Ok(Some(Piped { command, label: "Ruff", root: ruff.root.clone(), text: masked, taken }));
+        }
+        if !cell
+            && let Some(f) = servers::formatter_for(&path)
+            && let Some(program) = servers::locate(f.command[0], &[], &servers::user_dirs(std::env::var_os("HOME").map(PathBuf::from).as_deref()))
+        {
+            let root = hub.servers[d.servers[0]].as_ref().map_or_else(|| path.parent().unwrap_or(Path::new("/")).to_path_buf(), |s| s.root.clone());
+            let command = std::iter::once(program).chain(f.command[1..].iter().map(|a| a.to_string())).collect();
+            return Ok(Some(Piped { command, label: f.label, root, text: source.clone(), taken: Vec::new() }));
         }
         let wanted = |c: &Capabilities| if cell { c.range_formatting } else { c.formatting };
-        let id = d.servers.iter().copied().find(|&id| hub.servers[id].as_ref().and_then(|s| s.caps.as_ref()).is_some_and(wanted)).ok_or("No formatter for this file. For Python: install Ruff (pacman -S ruff).")?;
+        // A linter that formats (Ruff, Biome) before the main server: it's there by choice.
+        let id = d.servers.iter().rev().copied().find(|&id| hub.servers[id].as_ref().and_then(|s| s.caps.as_ref()).is_some_and(wanted)).ok_or("No formatter for this file. For Python: install Ruff (pacman -S ruff).")?;
         let s = hub.servers[id].as_mut().ok_or("No formatter for this file.")?;
         let encoding = s.caps.as_ref().map_or(Encoding::Utf16, |c| c.encoding);
         let params = if cell {
@@ -2029,8 +2182,8 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
         );
         Ok(None)
     });
-    if let Ok(Some((program, root, masked, taken))) = outcome {
-        return format_masked(view, &program, &root, masked, taken, then_now);
+    if let Ok(Some(piped)) = outcome {
+        return format_piped(view, piped, then_now);
     }
     if let Err(message) = outcome {
         // Saving shouldn't nag about a file no formatter knows.
@@ -2045,23 +2198,33 @@ fn format_with(view: &sourceview5::View, then: Option<Then>) {
 
 /// A cell with IPython lines: `ruff format` on the masked cell (from the project's
 /// folder, so its settings apply), then the lines back and the cell replaced.
-fn format_masked(view: &sourceview5::View, program: &str, root: &Path, masked: String, taken: Vec<String>, then: Option<Then>) {
-    let (program, root) = (program.to_string(), root.to_path_buf());
+/// A formatter run as a command: `text` on its stdin (IPython lines masked as `taken`
+/// for Ruff on a cell), the result on its stdout.
+struct Piped {
+    command: Vec<String>,
+    label: &'static str,
+    root: PathBuf,
+    text: String,
+    taken: Vec<String>,
+}
+
+fn format_piped(view: &sourceview5::View, piped: Piped, then: Option<Then>) {
+    let Piped { command, label, root, text, taken } = piped;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(ruff_format(&program, &root, &masked));
+        let _ = tx.send(pipe_format(&command, label, &root, &text));
     });
     let v = view.downgrade();
     glib::timeout_add_local(Duration::from_millis(20), move || {
         let formatted = match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             Ok(formatted) => formatted,
-            Err(_) => Err("Ruff didn't answer.".to_string()),
+            Err(_) => Err(format!("{label} didn't answer.")),
         };
         if let Some(view) = v.upgrade() {
             let buffer = view.buffer();
             let source = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
-            let restored = formatted.and_then(|f| tileide_notebook::unmask_ipython(&f, &taken).ok_or_else(|| "Ruff moved a % or ! line: not formatted.".to_string()));
+            let restored = formatted.and_then(|f| if taken.is_empty() { Ok(f) } else { tileide_notebook::unmask_ipython(&f, &taken).ok_or_else(|| format!("{label} moved a % or ! line: not formatted.")) });
             match restored {
                 Ok(mut text) => {
                     if !source.ends_with('\n') && text.ends_with('\n') {
@@ -2083,23 +2246,23 @@ fn format_masked(view: &sourceview5::View, program: &str, root: &Path, masked: S
     });
 }
 
-fn ruff_format(program: &str, root: &Path, source: &str) -> Result<String, String> {
+fn pipe_format(command: &[String], label: &str, root: &Path, source: &str) -> Result<String, String> {
     use std::io::Write;
-    let mut child = std::process::Command::new(program)
-        .args(["format", "--stdin-filename", "cell.py", "-"])
+    let mut child = std::process::Command::new(&command[0])
+        .args(&command[1..])
         .current_dir(root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Can't run Ruff: {e}"))?;
+        .map_err(|e| format!("Can't run {label}: {e}"))?;
     child.stdin.take().map(|mut i| i.write_all(source.as_bytes()));
-    let out = child.wait_with_output().map_err(|e| format!("Ruff: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("{label}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("Can't format: {}", err.lines().find(|l| !l.trim().is_empty()).unwrap_or("Ruff failed")));
+        return Err(format!("Can't format: {}", err.lines().find(|l| !l.trim().is_empty()).unwrap_or("it failed")));
     }
-    String::from_utf8(out.stdout).map_err(|_| "Ruff gave back invalid text.".to_string())
+    String::from_utf8(out.stdout).map_err(|_| format!("{label} gave back invalid text."))
 }
 
 /// Applies edits as one undo step, last first so earlier positions stay valid; the

@@ -68,8 +68,8 @@ impl Connection {
                 match answer {
                     Some(answer) => {
                         let _ = write(&replies, &answer);
-                        // The edit itself is the app's to apply.
-                        if message["method"] == "workspace/applyEdit" {
+                        // Acknowledged here; the app applies the edit, refreshes hints, notes capabilities.
+                        if ["workspace/applyEdit", "workspace/inlayHint/refresh", "workspace/diagnostic/refresh", "client/registerCapability", "client/unregisterCapability"].contains(&message["method"].as_str().unwrap_or("")) {
                             deliver(Incoming::Message(message));
                         }
                     }

@@ -44,6 +44,22 @@ pub fn attach(view: &sourceview5::View) {
     view.add_controller(keys);
 }
 
+/// Whether a file indents with tabs: Makefiles do, and so does one whose indented lines
+/// mostly start with a tab. Anything else gets spaces (Tab, auto-indent, and formatters
+/// that follow the editor's choice, such as jdtls).
+pub fn indents_with_tabs(path: Option<&std::path::Path>, text: &str) -> bool {
+    let name = path.and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+    if matches!(name, "Makefile" | "makefile" | "GNUmakefile") || name.ends_with(".mk") {
+        return true;
+    }
+    let (tabs, spaces) = text.lines().fold((0, 0), |(t, s), line| match line.chars().next() {
+        Some('\t') => (t + 1, s),
+        Some(' ') => (t, s + 1),
+        _ => (t, s),
+    });
+    tabs > spaces
+}
+
 /// Headless checks: `c` as if typed (`\x08` = Backspace).
 pub fn type_char(buffer: &sourceview5::Buffer, c: char) {
     let handled = AUTO_CLOSE.get() && if c == '\x08' { backspace(buffer) } else { typed(buffer, c) };
@@ -168,6 +184,15 @@ fn backspace(buffer: &sourceview5::Buffer) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indentation_follows_the_file() {
+        use std::path::Path;
+        assert!(!indents_with_tabs(None, ""));
+        assert!(!indents_with_tabs(Some(Path::new("a.py")), "def f():\n    pass\n"));
+        assert!(indents_with_tabs(Some(Path::new("main.go")), "func f() {\n\treturn\n}\n"));
+        assert!(indents_with_tabs(Some(Path::new("Makefile")), "all:\n"));
+    }
 
     #[test]
     fn brackets_pair_only_before_free_space() {

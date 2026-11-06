@@ -417,6 +417,9 @@ impl Bridge {
         let cwd = args["cwd"].as_str().map_or_else(|| self.source_root.clone(), PathBuf::from);
         let mut cmd = Command::new("jdb");
         cmd.args(["-classpath", classpath, "-sourcepath"]).arg(&self.source_root).arg(class).current_dir(&cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // A launch config's arguments (after the class, for `main`) and environment.
+        cmd.args(args["args"].as_array().into_iter().flatten().filter_map(Value::as_str));
+        cmd.envs(args["env"].as_object().into_iter().flatten().filter_map(|(k, v)| Some((k, v.as_str()?))));
         // jdb (and the program it started) end with the bridge.
         unsafe {
             use std::os::unix::process::CommandExt;

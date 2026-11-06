@@ -84,6 +84,39 @@ pub fn parse(text: &str) -> Result<Value, String> {
     serde_json::from_str(&strip_jsonc(text.trim_start_matches('\u{feff}'))).map_err(|e| format!("not a VS Code theme (JSON error: {e})"))
 }
 
+/// A project's `.vscode/launch.json` (v0.6 phase 3): its `launch` configurations with a
+/// `program`, read for the common fields (name, program, args, env, cwd). Others (attach,
+/// a Python `module`, compounds) are named in the second list, as they can't be used.
+pub fn launch_configs(text: &str) -> Result<(Vec<tileide_core::launch::Launch>, Vec<String>), String> {
+    let json: Value = serde_json::from_str(&strip_jsonc(text.trim_start_matches('\u{feff}'))).map_err(|e| format!("launch.json: {e}"))?;
+    let (mut used, mut skipped) = (Vec::new(), Vec::new());
+    let strings = |v: &Value| -> Vec<String> {
+        match v {
+            Value::Array(items) => items.iter().filter_map(|i| i.as_str().map(String::from)).collect(),
+            // Node's launch configs accept one string; it's split like a shell would.
+            Value::String(s) => s.split_whitespace().map(String::from).collect(),
+            _ => Vec::new(),
+        }
+    };
+    for config in json["configurations"].as_array().into_iter().flatten() {
+        let name = config["name"].as_str().unwrap_or("unnamed").to_string();
+        match (config["request"].as_str(), config["program"].as_str()) {
+            (Some("launch") | None, Some(program)) => {
+                let mut env: std::collections::BTreeMap<String, String> = config["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), String::from))).collect();
+                // cppdbg's form: `environment: [{ name, value }]`.
+                for pair in config["environment"].as_array().into_iter().flatten() {
+                    if let (Some(k), Some(v)) = (pair["name"].as_str(), pair["value"].as_str()) {
+                        env.insert(k.into(), v.into());
+                    }
+                }
+                used.push(tileide_core::launch::Launch { name, program: program.into(), args: strings(&config["args"]), env, cwd: config["cwd"].as_str().map(String::from) });
+            }
+            _ => skipped.push(name),
+        }
+    }
+    Ok((used, skipped))
+}
+
 /// `#RGB`, `#RGBA`, `#RRGGBB` or `#RRGGBBAA`; alpha is composited over `under`.
 fn colour(text: &str, under: Rgb) -> Option<Rgb> {
     let hex = text.strip_prefix('#')?;
@@ -321,6 +354,27 @@ pub fn import(path: &Path, dir: &Path) -> Result<Vec<(PathBuf, String, Vec<Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_launch_json() {
+        let text = r#"{
+            // comments and trailing commas, as VS Code writes them
+            "version": "0.2.0",
+            "configurations": [
+                { "name": "App", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/app.py",
+                  "args": ["--port", "80"], "env": { "DEBUG": "1", "N": 2 }, "cwd": "${workspaceFolder}/run", },
+                { "name": "Native", "type": "cppdbg", "request": "launch", "program": "build/app", "args": "-v -x",
+                  "environment": [{ "name": "K", "value": "v" }] },
+                { "name": "Attach", "type": "debugpy", "request": "attach", "connect": { "port": 5678 } },
+                { "name": "Module", "type": "debugpy", "request": "launch", "module": "flask" },
+            ],
+        }"#;
+        let (used, skipped) = super::launch_configs(text).unwrap();
+        assert_eq!(skipped, ["Attach", "Module"]);
+        assert_eq!((used[0].args.as_slice(), used[0].cwd.as_deref()), (&["--port".to_string(), "80".into()][..], Some("${workspaceFolder}/run")));
+        assert_eq!(used[0].env.get("N").map(String::as_str), Some("2"));
+        assert_eq!((used[1].args.as_slice(), used[1].env.get("K").map(String::as_str)), (&["-v".to_string(), "-x".into()][..], Some("v")));
+    }
+
     use super::*;
     use serde_json::json;
 

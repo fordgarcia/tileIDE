@@ -36,7 +36,6 @@ you can code with it.
 
 ![TileIDE](docs/1.png)
 ![TileIDE](docs/2.png)
-![TileIDE](docs/6.png)
 ![TileIDE](docs/3.png)
 ![TileIDE](docs/4.png)
 ![TileIDE](docs/5.png)
@@ -96,6 +95,7 @@ tileide --help           # all options, incl. backgrounds (--bg image:FILE)
 | `Alt+R` | run the focused file (output card; `Ctrl+C` stop, `Esc` close); in a notebook, run all cells |
 | Notebook | `Shift+Enter` run and move on, `Ctrl+Enter` run; `↑`/`↓` at a cell's first/last line go to the next cell; `Backspace` in an empty cell deletes it; `Enter` edits a rendered text cell |
 | Notebook command mode (`Esc`) | `↑`/`↓` or `K`/`J` move, `Shift+↑/↓` select several, `Enter` edit, `A`/`B` add above/below, `DD` delete, `Z` undo delete, `M`/`Y` text/code, `C`/`X`/`V` copy/cut/paste (`Shift+V` above), `Shift+Enter`/`Ctrl+Enter` run, `II` interrupt. The toolbar's ⋮ menu: run above/below, clear outputs, **Show variables** (a tile; a DataFrame's name opens it as a table). In outputs, traceback lines (`Cell In[3], line 5`, `File …:12`) are links, and output over 60 lines is folded |
+| `Alt+L` | pick what `Alt+R` and `F5` launch in this workspace: a launch config, or the focused file |
 | `Alt+P` | the Python for this project, or the notebook's kernel (also: click the kernel chip); also creates a `.venv` and installs `requirements.txt` in a terminal tile (uv, else pip) |
 | `Alt+Shift+R` / `F8` | run tests with pytest (the test at the cursor, the test file, or all) in a Tests tile / go to the next failure |
 | `F9` / `F5` | breakpoint / debug (start or continue); `F10` over, `F11` into, `Shift+F11` out, `Shift+F5` stop. In a notebook, `F5` debugs the current cell in its kernel (breakpoints in any cell apply; `Shift+F5` detaches, the kernel keeps running) |
@@ -123,7 +123,9 @@ Changes apply as you make them and are kept in `state.lua`; anything `tileide.lu
 - **Extensions** and **Toolchains**: what's installed, what it costs, and which compilers, interpreters and debuggers were found. Toolchains starts with **This project**: its Python and the Ruff, pyright and pytest settings from `pyproject.toml`, `ruff.toml` or `pyrightconfig.json` (read-only).
 
 ## Config
-Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`/`stack`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `format`, `rename`, `references`, `code_action`, `outline`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`, `interpreter`, `test`, `next_failure`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
+Config lives in `~/.config/tileide/` (created on first run): `tileide.lua`, `rices/` (layout and design) and `themes/` (colours only). Saved changes apply at once; `tileide --check-config` checks the file from a shell. Every key above can be rebound with `tileide.bind(mods, key, action, arg)`. Actions: `workspace` (1–10 or `"config"`), `sidebar`, `layout` (`toggle`/`dwindle`/`columns`/`stack`), `split` (`vertical`/`horizontal`), `focus`/`move`/`resize` (`left`/`right`/`up`/`down`), `close`, `terminal`, `editor`, `search`, `wrap`, `save`, `quit`, `overview`, `themes`, `themes_section`, `folder`, `workspace_close`, `hover`, `definition`, `complete`, `format`, `rename`, `references`, `code_action`, `outline`, `extensions_section`, `extension` (a command id), `settings`, `keybinds`, `font_size` (`up`/`down`), `run`, `debug`, `debug_stop`, `breakpoint`, `step_over`, `step_into`, `step_out`, `toolchains`, `interpreter`, `test`, `next_failure`, `launch`. Add or change what `Alt+R` runs with `tileide.runner(".py", "python3 -u {file}")`.
+
+**Launch configs** (picked with `Alt+L`, then used by both `Alt+R` and `F5`): `tileide.launch { name = "server", program = "src/main.py", args = { "--port", "8080" }, env = { DEBUG = "1" }, cwd = "${workspaceFolder}" }`. A project's `.vscode/launch.json` is read too (its `launch` configurations' `name`, `program`, `args`, `env`/`environment` and `cwd`). `program` is a source file (run or debugged as `Alt+R`/`F5` would), a Cargo project folder, or an executable (debugged with gdb). VS Code's variables work (`${workspaceFolder}`, `${file}`, `${fileDirname}`, `${fileBasenameNoExtension}`, `${env:NAME}` …); relative paths start at the workspace folder.
 
 Extensions are programs in any language that run in their own process and start only when needed; the Extensions section shows what each one costs. See [docs/extensions.md](docs/extensions.md) and [docs/compatibility.md](docs/compatibility.md).
 

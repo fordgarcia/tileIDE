@@ -14,6 +14,8 @@ pub struct Plan {
     /// Run in order; a step that fails stops the rest (compile, then run).
     pub steps: Vec<Vec<String>>,
     pub cwd: PathBuf,
+    /// Set for the run (a launch config's `env`).
+    pub env: Vec<(String, String)>,
 }
 
 /// Built-in runners by extension: program to check, then the steps. Placeholders:
@@ -80,7 +82,7 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
         if !found("cargo") {
             return Err(format!("cargo is not installed. Install it with: sudo pacman -S {}", package_for("cargo")));
         }
-        Ok(Plan { label: "cargo run".into(), steps: vec![vec!["cargo".into(), "run".into()]], cwd: root })
+        Ok(Plan { label: "cargo run".into(), steps: vec![vec!["cargo".into(), "run".into()]], cwd: root, env: Vec::new() })
     };
     let Some(file) = file else {
         return match folder.and_then(|f| cargo_root(f, Some(f))) {
@@ -96,7 +98,7 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
 
     if let Some(cmd) = runners.get(&format!(".{ext}")) {
         let cmd = cmd.replace("{file}", &quote(&file.to_string_lossy())).replace("{dir}", &quote(&dir.to_string_lossy())).replace("{out}", &quote(&out.to_string_lossy())).replace("{stem}", &quote(&file.file_stem().unwrap_or_default().to_string_lossy()));
-        return Ok(Plan { label: name, steps: vec![vec!["sh".into(), "-c".into(), cmd]], cwd: dir });
+        return Ok(Plan { label: name, steps: vec![vec!["sh".into(), "-c".into(), cmd]], cwd: dir, env: Vec::new() });
     }
     if ext == "rs"
         && let Some(root) = cargo_root(&dir, folder)
@@ -120,7 +122,45 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
     if let Some(python) = venv {
         steps[0][0] = python.to_string_lossy().into_owned();
     }
-    Ok(Plan { label: name, steps, cwd: dir })
+    Ok(Plan { label: name, steps, cwd: dir, env: Vec::new() })
+}
+
+/// Plans a launch config's run: its program as `plan` would run it (a folder runs its
+/// Cargo project; a file without a runner runs itself if it's executable), with the
+/// config's arguments, environment and working folder.
+pub fn plan_launch(launch: &crate::launch::Resolved, folder: Option<&Path>, runners: &BTreeMap<String, String>, out_dir: &Path, found: impl Fn(&str) -> bool) -> Result<Plan, String> {
+    let program = &launch.program;
+    let mut plan = if program.is_dir() {
+        plan(None, Some(program), runners, out_dir, found)?
+    } else if !program.exists() {
+        return Err(format!("{}: {} doesn't exist", launch.name, program.display()));
+    } else {
+        match plan(Some(program), folder, runners, out_dir, found) {
+            Err(_) if crate::launch::is_executable(program) => {
+                let dir = program.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+                Plan { label: String::new(), steps: vec![vec![program.to_string_lossy().into_owned()]], cwd: dir, env: Vec::new() }
+            }
+            other => other?,
+        }
+    };
+    let last = plan.steps.last_mut().expect("a plan has a step");
+    if last.starts_with(&["sh".into(), "-c".into()]) {
+        for arg in &launch.args {
+            last[2] += &format!(" {}", quote(arg));
+        }
+    } else if last[..] == ["cargo", "run"] {
+        // The manifest keeps `cargo run` working from any `cwd`.
+        last.extend(["--manifest-path".into(), plan.cwd.join("Cargo.toml").to_string_lossy().into_owned(), "--".into()]);
+        last.extend(launch.args.iter().cloned());
+    } else {
+        last.extend(launch.args.iter().cloned());
+    }
+    plan.label = launch.name.clone();
+    plan.env = launch.env.clone();
+    if let Some(cwd) = &launch.cwd {
+        plan.cwd = cwd.clone();
+    }
+    Ok(plan)
 }
 
 /// Whether `program` is an executable file on `PATH`.
@@ -190,6 +230,37 @@ mod tests {
         assert!(e.contains("node is not installed") && e.contains("pacman -S nodejs"), "{e}");
         assert!(plan(Some(Path::new("/w/a.xyz")), None, &BTreeMap::new(), Path::new("/o"), all).unwrap_err().contains("tileide.runner(\".xyz\""));
         assert!(plan(None, None, &BTreeMap::new(), Path::new("/o"), all).unwrap_err().contains("focus a file"));
+    }
+
+    #[test]
+    fn launch_configs_add_args_env_and_cwd() {
+        let dir = std::env::temp_dir().join(format!("tileide-launch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crate/src")).unwrap();
+        let script = dir.join("app.py");
+        std::fs::write(&script, "").unwrap();
+        std::fs::write(dir.join("crate/Cargo.toml"), "").unwrap();
+        let launch = |program: &Path| crate::launch::Resolved { name: "dev".into(), program: program.to_path_buf(), args: vec!["a b".into(), "it's".into()], env: vec![("K".into(), "v".into())], cwd: Some("/tmp".into()) };
+
+        let p = plan_launch(&launch(&script), None, &BTreeMap::new(), Path::new("/o"), all).unwrap();
+        assert_eq!((p.label.as_str(), &p.steps[0][1..], p.cwd.as_path()), ("dev", &["-u".to_string(), script.to_string_lossy().into(), "a b".into(), "it's".into()][..], Path::new("/tmp")));
+        assert_eq!(p.env, [("K".to_string(), "v".to_string())]);
+
+        let runners = BTreeMap::from([(".py".to_string(), "uv run {file}".to_string())]);
+        let p = plan_launch(&launch(&script), None, &runners, Path::new("/o"), all).unwrap();
+        assert!(p.steps[0][2].ends_with(" 'a b' 'it'\\''s'"), "{}", p.steps[0][2]);
+
+        let p = plan_launch(&launch(&dir.join("crate")), None, &BTreeMap::new(), Path::new("/o"), all).unwrap();
+        assert_eq!(p.steps[0][..3], ["cargo", "run", "--manifest-path"]);
+        assert_eq!(p.steps[0][4..], ["--", "a b", "it's"]);
+
+        // A compiled file's last step is the binary alone.
+        let c = dir.join("t.c");
+        std::fs::write(&c, "").unwrap();
+        let p = plan_launch(&launch(&c), None, &BTreeMap::new(), Path::new("/o"), all).unwrap();
+        assert_eq!(p.steps[1], ["/o/t", "a b", "it's"]);
+
+        assert!(plan_launch(&launch(&dir.join("gone.py")), None, &BTreeMap::new(), Path::new("/o"), all).unwrap_err().contains("doesn't exist"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

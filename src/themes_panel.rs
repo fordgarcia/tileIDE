@@ -248,6 +248,14 @@ impl ThemesPanel {
         &self.root
     }
 
+    /// Test action `themes-select:<n>`: focuses row `n` and selects it, as the arrow keys do.
+    pub fn test_select(&self, n: i32) {
+        if let Some(row) = self.c.list.row_at_index(n) {
+            row.grab_focus();
+            self.c.list.select_row(Some(&row));
+        }
+    }
+
     /// Keyboard focus on the theme in use: ↑/↓ preview, Enter applies.
     pub fn focus(&self) {
         match self.c.list.selected_row() {
@@ -300,7 +308,7 @@ impl ThemesPanel {
         let weak = Rc::downgrade(self);
         motion.connect_leave(move |_| {
             if let Some(p) = weak.upgrade() {
-                p.end_preview();
+                p.end_preview_later();
             }
         });
         c.list.add_controller(motion);
@@ -308,7 +316,7 @@ impl ThemesPanel {
         let weak = Rc::downgrade(self);
         focus.connect_leave(move |_| {
             if let Some(p) = weak.upgrade() {
-                p.end_preview();
+                p.end_preview_later();
             }
         });
         c.list.add_controller(focus);
@@ -372,11 +380,20 @@ impl ThemesPanel {
         }
     }
 
-    fn end_preview(&self) {
+    /// Called from leave handlers, which GTK runs inside whatever moved the focus or
+    /// pointer away (often a tile grabbing focus while the app's state is borrowed), so
+    /// the preview ends from the main loop instead (0.5.0-alpha.5 crash, `RefCell
+    /// already borrowed` via `App::refresh`).
+    fn end_preview_later(self: &Rc<Self>) {
         if let Some(old) = self.dwell.take() {
             old.remove();
         }
-        (self.callbacks.preview)(None);
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(p) = weak.upgrade() {
+                (p.callbacks.preview)(None);
+            }
+        });
     }
 
     /// Shows `s` without reporting anything back.

@@ -69,6 +69,11 @@ tileide.tiling {
 -- {stem}, {out} = a binary path); the command runs through sh -c.
 -- tileide.runner(".py", "python3 -u {file}")
 
+-- Launch configs for Alt+R and F5, picked per workspace with Alt+L (a project's
+-- .vscode/launch.json shows up there too). VS Code's ${…} variables work; relative
+-- paths start at the workspace folder.
+-- tileide.launch { name = "server", program = "src/main.py", args = { "--port", "8080" }, env = { DEBUG = "1" }, cwd = "${workspaceFolder}" }
+
 -- Banner popups: a language server, debugger, Jupyter or Python module is missing;
 -- a new tile was refused (Most tiles per workspace reached).
 -- tileide.alerts { missing_tools = true, tile_limit = true }

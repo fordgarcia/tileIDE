@@ -273,6 +273,29 @@ pub fn install(lua: &Lua, shared: &Shared) -> Result<Table> {
         Ok(())
     })?)?;
 
+    let b = shared.clone();
+    api.set("launch", lua.create_function(move |lua, value: Value| {
+        let mut f = options(lua, "launch", value)?;
+        let location = caller(lua);
+        let (Some(name), Some(program)) = (f.string("name")?, f.string("program")?) else {
+            return Err(error(&location, "launch: needs a name and a program, e.g. launch { name = \"app\", program = \"main.py\" }"));
+        };
+        let mut launch = tileide_core::launch::Launch { name, program, args: f.strings("args")?.unwrap_or_default(), cwd: f.string("cwd")?, ..Default::default() };
+        if let Some(mut env) = f.table("env")? {
+            for key in env.keys() {
+                let value = env.string(&key)?.unwrap_or_default();
+                launch.env.insert(key, value);
+            }
+        }
+        let mut b = b.borrow_mut();
+        if b.config.launches.iter().any(|l| l.name == launch.name) {
+            return Err(error(&location, &format!("launch: \"{}\" is defined twice", launch.name)));
+        }
+        f.finish(&mut b.warnings);
+        b.config.launches.push(launch);
+        Ok(())
+    })?)?;
+
     // Later versions (v0.3 extensions, v0.4 toolchains): accepted so configs written
     // for them load today, and ignored.
     for func in ["extension", "toolchain"] {
@@ -373,6 +396,7 @@ pub fn parse_action(action: &str, arg: Option<&str>) -> std::result::Result<Acti
         "toolchains" => Action::Toolchains,
         "interpreter" => Action::Interpreter,
         "test" => Action::Test,
+        "launch" => Action::Launch,
         "next_failure" => Action::NextFailure,
         "moveto" | "palette" => Action::Unavailable(action.into()),
         other => return Err(format!("unknown action \"{other}\"")),

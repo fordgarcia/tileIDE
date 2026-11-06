@@ -378,11 +378,18 @@ fn paint_image(cr: &Context, image: &ImageSurface, w: f64, h: f64, fit: Fit, the
     cr.restore()
 }
 
-/// Cheap blur: shrink by the radius, then scale back up with bilinear filtering.
-/// Good enough for a static background that is baked once.
+/// Gaussian blur with `radius` as its standard deviation, like CSS `blur()` (what Zen's
+/// `backdrop-filter` draws through Firefox's WebRender). Done the same way: shrink by
+/// powers of two until the deviation is below `MAX_SMALL_SIGMA` px, blur that copy with
+/// a Gaussian, scale back up. The shrunk copy is already smooth, so bilinear
+/// upscaling shows no blocks.
 fn blur(surface: ImageSurface, radius: f64) -> Result<ImageSurface, cairo::Error> {
     blur_with(surface, radius, Ok)
 }
+
+/// From this deviation on the copy is halved first. WebRender uses 4 on the GPU; 2 keeps
+/// the CPU bake fast, and a copy blurred by at least 1 px still upscales without blocks.
+const MAX_SMALL_SIGMA: f64 = 2.0;
 
 /// `blur` with a step on the shrunk copy. Saturation is linear in RGB, so applying it
 /// there gives the same result at a fraction of the pixels.
@@ -391,18 +398,27 @@ fn blur_with(surface: ImageSurface, radius: f64, on_small: impl FnOnce(ImageSurf
         return on_small(surface);
     }
     let (w, h) = (surface.width(), surface.height());
-    let factor = radius.max(2.0);
+    let mut factor = 1.0;
+    while radius / factor >= MAX_SMALL_SIGMA && w as f64 / factor >= 4.0 && h as f64 / factor >= 4.0 {
+        factor *= 2.0;
+    }
     let (sw, sh) = (((w as f64 / factor).ceil() as i32).max(1), ((h as f64 / factor).ceil() as i32).max(1));
     let small = ImageSurface::create(Format::Rgb24, sw, sh)?;
     {
         let cr = Context::new(&small)?;
         cr.scale(sw as f64 / w as f64, sh as f64 / h as f64);
         let pattern = SurfacePattern::create(&surface);
+        // Good averages every source pixel when shrinking (no aliasing).
         pattern.set_filter(Filter::Good);
+        pattern.set_extend(cairo::Extend::Pad);
         cr.set_source(&pattern)?;
+        cr.set_operator(Operator::Source);
         cr.paint()?;
     }
-    let small = on_small(small)?;
+    let small = on_small(gaussian(small, radius / factor)?)?;
+    if factor == 1.0 {
+        return Ok(small);
+    }
     let out = ImageSurface::create(Format::Rgb24, w, h)?;
     {
         let cr = Context::new(&out)?;
@@ -415,6 +431,84 @@ fn blur_with(surface: ImageSurface, radius: f64, on_small: impl FnOnce(ImageSurf
         cr.paint()?;
     }
     Ok(out)
+}
+
+/// Gaussian on an RGB24 surface as the CSS Filter Effects spec approximates it: three
+/// box blurs of size `d` per axis (Firefox and Skia do the same). Running sums make
+/// the cost independent of `sigma`. Edges are clamped (CSS blurs extend the edge).
+fn gaussian(mut surface: ImageSurface, sigma: f64) -> Result<ImageSurface, cairo::Error> {
+    let d = ((sigma * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5).floor() as usize).max(1);
+    // (left, right) reach of each box. An even size can't centre on a pixel, so the spec
+    // shifts the first box left, the second right, and makes the third one wider.
+    let boxes = if d % 2 == 1 { [(d / 2, d / 2); 3] } else { [(d / 2, d / 2 - 1), (d / 2 - 1, d / 2), (d / 2, d / 2)] };
+    let (w, h, stride) = (surface.width() as usize, surface.height() as usize, surface.stride() as usize / 4);
+    surface.flush();
+    {
+        let mut data = surface.data().map_err(|_| cairo::Error::InvalidStatus)?;
+        let mut px: Vec<[f32; 3]> = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = u32::from_ne_bytes(data[(y * stride + x) * 4..][..4].try_into().unwrap());
+                px.push([((v >> 16) & 0xFF) as f32, ((v >> 8) & 0xFF) as f32, (v & 0xFF) as f32]);
+            }
+        }
+        for (l, r) in boxes {
+            box_across(&mut px, w, l, r);
+        }
+        for (l, r) in boxes {
+            box_down(&mut px, w, h, l, r);
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let c = |v: f32| v.round().clamp(0.0, 255.0) as u32;
+                let [r, g, b] = px[y * w + x];
+                data[(y * stride + x) * 4..][..4].copy_from_slice(&((c(r) << 16) | (c(g) << 8) | c(b)).to_ne_bytes());
+            }
+        }
+    }
+    surface.mark_dirty();
+    Ok(surface)
+}
+
+/// Each pixel becomes the mean of the `l` pixels left of it, itself and the `r` right of it.
+fn box_across(px: &mut [[f32; 3]], w: usize, l: usize, r: usize) {
+    let n = (l + r + 1) as f64;
+    let mut line = vec![[0f32; 3]; w];
+    for row in px.chunks_exact_mut(w) {
+        line.copy_from_slice(row);
+        let at = |i: isize| line[i.clamp(0, w as isize - 1) as usize];
+        let mut sum = [0f64; 3];
+        for i in -(l as isize)..=r as isize {
+            add(&mut sum, at(i), 1.0);
+        }
+        for (x, out) in row.iter_mut().enumerate() {
+            *out = sum.map(|s| (s / n) as f32);
+            add(&mut sum, at(x as isize + r as isize + 1), 1.0);
+            add(&mut sum, at(x as isize - l as isize), -1.0);
+        }
+    }
+}
+
+/// `box_across` down the columns, a whole row at a time (sequential memory).
+fn box_down(px: &mut [[f32; 3]], w: usize, h: usize, l: usize, r: usize) {
+    let n = (l + r + 1) as f64;
+    let src = px.to_vec();
+    let row = |y: isize| &src[y.clamp(0, h as isize - 1) as usize * w..][..w];
+    let mut sums = vec![[0f64; 3]; w];
+    for y in -(l as isize)..=r as isize {
+        sums.iter_mut().zip(row(y)).for_each(|(s, p)| add(s, *p, 1.0));
+    }
+    for (y, out) in px.chunks_exact_mut(w).enumerate() {
+        out.iter_mut().zip(&sums).for_each(|(o, s)| *o = s.map(|s| (s / n) as f32));
+        sums.iter_mut().zip(row(y as isize + r as isize + 1)).for_each(|(s, p)| add(s, *p, 1.0));
+        sums.iter_mut().zip(row(y as isize - l as isize)).for_each(|(s, p)| add(s, *p, -1.0));
+    }
+}
+
+fn add(sum: &mut [f64; 3], p: [f32; 3], sign: f64) {
+    for (s, c) in sum.iter_mut().zip(p) {
+        *s += sign * c as f64;
+    }
 }
 
 fn copy(surface: &ImageSurface) -> Result<ImageSurface, cairo::Error> {
@@ -522,6 +616,26 @@ mod tests {
         let mut changed = Background::new(image("/b.png"), Theme::builtin()).unwrap();
         changed.keep_image(Some(other));
         assert!(changed.needs_image(), "another file is decoded");
+    }
+
+    #[test]
+    fn blur_is_a_smooth_gaussian() {
+        // Black left half, white right half; a Gaussian turns the edge into a smooth ramp.
+        let (w, h) = (400, 8);
+        let edge = ImageSurface::create(Format::Rgb24, w, h).unwrap();
+        {
+            let cr = Context::new(&edge).unwrap();
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.rectangle(w as f64 / 2.0, 0.0, w as f64 / 2.0, h as f64);
+            cr.fill().unwrap();
+        }
+        let out = blur(edge, 20.0).unwrap();
+        let row: Vec<f64> = luminances(&out).into_iter().take(w as usize).map(|(r, _, _)| r * 255.0).collect();
+        assert!(row.windows(2).all(|p| p[1] >= p[0] - 0.5), "monotonic ramp");
+        assert!(row.windows(2).all(|p| p[1] - p[0] < 6.5), "no steps (a Gaussian edge at σ=20 rises at most 255/(20·√2π) ≈ 5.1 per px)");
+        assert!((row[200] - 127.5).abs() < 8.0, "edge centred: {}", row[200]);
+        // σ = 20: about 84% white one σ past the edge.
+        assert!((row[220] / 255.0 - 0.84).abs() < 0.05, "deviation matches CSS blur(20px): {}", row[220] / 255.0);
     }
 
     #[test]

@@ -54,6 +54,8 @@ pub struct Capabilities {
     pub code_actions: bool,
     pub symbols: bool,
     pub inlay_hints: bool,
+    /// Diagnostics asked for (`textDocument/diagnostic`) rather than sent: ESLint.
+    pub pull_diagnostics: bool,
 }
 
 impl Capabilities {
@@ -76,6 +78,24 @@ impl Capabilities {
             code_actions: offered(&caps["codeActionProvider"]),
             symbols: offered(&caps["documentSymbolProvider"]),
             inlay_hints: offered(&caps["inlayHintProvider"]),
+            pull_diagnostics: caps["diagnosticProvider"].is_object(),
+        }
+    }
+}
+
+impl Capabilities {
+    /// `client/registerCapability` (`on`) or `client/unregisterCapability`: Biome
+    /// offers formatting and code actions this way, after it starts.
+    pub fn register(&mut self, params: &Value, on: bool) {
+        // The spec spells the unregister list "unregisterations".
+        let list = if on { &params["registrations"] } else { &params["unregisterations"] };
+        for method in list.as_array().into_iter().flatten().filter_map(|r| r["method"].as_str()) {
+            match method {
+                "textDocument/formatting" => self.formatting = on,
+                "textDocument/rangeFormatting" => self.range_formatting = on,
+                "textDocument/codeAction" => self.code_actions = on,
+                _ => {}
+            }
         }
     }
 }
@@ -85,10 +105,11 @@ fn chars(v: &Value) -> Vec<char> {
     v.as_array().into_iter().flatten().filter_map(|t| t.as_str()?.chars().last()).collect()
 }
 
-pub fn initialize_params(root: &Path) -> Value {
+/// `options`: the server's own `initializationOptions` (left out when null).
+pub fn initialize_params(root: &Path, options: Value) -> Value {
     let uri = path_to_uri(root);
     let name = root.file_name().map_or_else(|| "root".into(), |n| n.to_string_lossy().into_owned());
-    json!({
+    let mut params = json!({
         "processId": std::process::id(),
         "clientInfo": {"name": "TileIDE", "version": env!("CARGO_PKG_VERSION")},
         "rootUri": uri,
@@ -96,24 +117,28 @@ pub fn initialize_params(root: &Path) -> Value {
         "workspaceFolders": [{"uri": uri, "name": name}],
         "capabilities": {
             "general": {"positionEncodings": ["utf-8", "utf-16"]},
-            "workspace": {"configuration": true, "workspaceFolders": true, "applyEdit": true, "workspaceEdit": {"documentChanges": true}},
+            "workspace": {"configuration": true, "workspaceFolders": true, "applyEdit": true, "workspaceEdit": {"documentChanges": true}, "inlayHint": {"refreshSupport": true}},
             "textDocument": {
                 "synchronization": {"didSave": true},
                 "hover": {"contentFormat": ["markdown", "plaintext"]},
                 "completion": {"completionItem": {"snippetSupport": false, "documentationFormat": ["plaintext", "markdown"]}, "contextSupport": true},
                 "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"], "parameterInformation": {"labelOffsetSupport": true}, "activeParameterSupport": true}},
                 "definition": {"linkSupport": true},
-                "formatting": {},
-                "rangeFormatting": {},
+                "formatting": {"dynamicRegistration": true},
+                "rangeFormatting": {"dynamicRegistration": true},
                 "rename": {"prepareSupport": false},
                 "references": {},
                 "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
                 "inlayHint": {},
-                "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"]}}, "isPreferredSupport": true},
+                "codeAction": {"dynamicRegistration": true, "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"]}}, "isPreferredSupport": true},
                 "publishDiagnostics": {"relatedInformation": false, "tagSupport": {"valueSet": [1, 2]}}
             }
         }
-    })
+    });
+    if !options.is_null() {
+        params["initializationOptions"] = options;
+    }
+    params
 }
 
 pub fn request(id: i64, method: &str, params: Value) -> Value {
@@ -177,11 +202,12 @@ pub fn formatting(path: &Path, tab_size: u32, spaces: bool) -> Value {
 
 /// The reply to a request the server sends us. Servers stall if these go unanswered
 /// (spike 7): configuration gets each item's section of `settings` (dotted, like
-/// `python.analysis`; `null` when absent), everything else an empty success.
+/// `python.analysis`; `null` when absent; all of `settings` for no section), everything else an empty success.
 pub fn answer_server_request(message: &Value, settings: &Value) -> Option<Value> {
     let id = message.get("id")?;
     let method = message.get("method")?.as_str()?;
-    let section = |item: &Value| item["section"].as_str().map_or(Value::Null, |s| s.split('.').fold(settings, |v, key| &v[key]).clone());
+    // No section (vscode-eslint-language-server): the whole object.
+    let section = |item: &Value| item["section"].as_str().filter(|s| !s.is_empty()).map_or_else(|| settings.clone(), |s| s.split('.').fold(settings, |v, key| &v[key]).clone());
     let result = match method {
         "workspace/configuration" => Value::Array(message["params"]["items"].as_array().map_or_else(Vec::new, |items| items.iter().map(section).collect())),
         // Applied on the main thread (the message is delivered as well); acknowledged here.
@@ -216,6 +242,20 @@ pub struct Diagnostic {
 }
 
 /// `textDocument/publishDiagnostics` params → the file and its diagnostics.
+/// `textDocument/diagnostic` params.
+pub fn document_diagnostic(path: &Path) -> Value {
+    json!({"textDocument": {"uri": path_to_uri(path)}})
+}
+
+/// A `textDocument/diagnostic` report: its list when it's a full one ("unchanged" and
+/// errors leave what's shown).
+pub fn pulled_diagnostics(path: &Path, result: &Value) -> Option<Vec<Diagnostic>> {
+    if result["kind"] != "full" {
+        return None;
+    }
+    diagnostics(&json!({"uri": path_to_uri(path), "diagnostics": result["items"]})).map(|(_, list)| list)
+}
+
 pub fn diagnostics(params: &Value) -> Option<(PathBuf, Vec<Diagnostic>)> {
     let path = uri_to_path(params["uri"].as_str()?)?;
     let list = params["diagnostics"]
@@ -321,6 +361,10 @@ pub fn markup_blocks(contents: &Value) -> Vec<(bool, String)> {
             }
             if !trimmed.is_empty() && trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_') {
                 flush(&mut blocks, &mut current, false);
+                continue;
+            }
+            // jdtls separates lists with an empty HTML comment.
+            if trimmed.starts_with("<!--") && trimmed.ends_with("-->") {
                 continue;
             }
             let line = if trimmed.starts_with('#') { trimmed.trim_start_matches('#').trim_start() } else { line };
@@ -481,7 +525,13 @@ pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
                 Value::Array(parts) => parts.iter().filter_map(|p| p["value"].as_str()).collect(),
                 _ => return None,
             };
-            Some(InlayHint { at: position(&h["position"])?, label: label.trim().to_string(), parameter: h["kind"].as_u64() == Some(2) })
+            let label = label.trim().to_string();
+            // jdtls leaves `kind` out; its parameter names read `width:`.
+            let parameter = match h["kind"].as_u64() {
+                Some(kind) => kind == 2,
+                None => label.ends_with(':') && !label.starts_with(':'),
+            };
+            Some(InlayHint { at: position(&h["position"])?, label, parameter })
         })
         .filter(|h| !h.label.is_empty())
         .collect();
@@ -650,12 +700,37 @@ mod tests {
     }
 
     #[test]
+    fn pulled_reports() {
+        let path = Path::new("/p/app.js");
+        let full = json!({"kind": "full", "items": [{"range": {"start": {"line": 2, "character": 10}, "end": {"line": 2, "character": 12}}, "severity": 1, "message": "Expected '==='", "source": "eslint"}]});
+        assert_eq!(pulled_diagnostics(path, &full).map(|l| l.len()), Some(1));
+        assert_eq!(pulled_diagnostics(path, &json!({"kind": "unchanged", "resultId": "1"})), None);
+    }
+
+    #[test]
+    fn capabilities_registered_later() {
+        let mut caps = Capabilities::parse(&json!({"capabilities": {}}));
+        caps.register(&json!({"registrations": [{"id": "1", "method": "textDocument/formatting"}, {"id": "2", "method": "textDocument/codeAction"}]}), true);
+        assert!(caps.formatting && caps.code_actions && !caps.range_formatting);
+        caps.register(&json!({"unregisterations": [{"id": "1", "method": "textDocument/formatting"}]}), false);
+        assert!(!caps.formatting && caps.code_actions);
+    }
+
+    #[test]
     fn inlay_hint_labels() {
         let hints = inlay_hints(&json!([
             {"position": {"line": 1, "character": 9}, "label": "a=", "kind": 2},
-            {"position": {"line": 0, "character": 1}, "label": [{"value": ": "}, {"value": "int"}], "kind": 1, "paddingLeft": false}
+            {"position": {"line": 0, "character": 1}, "label": [{"value": ": "}, {"value": "int"}], "kind": 1, "paddingLeft": false},
+            {"position": {"line": 2, "character": 4}, "label": "width:"}
         ]));
-        assert_eq!(hints, vec![InlayHint { at: Position { line: 0, column: 1 }, label: ": int".into(), parameter: false }, InlayHint { at: Position { line: 1, column: 9 }, label: "a=".into(), parameter: true }]);
+        assert_eq!(
+            hints,
+            vec![
+                InlayHint { at: Position { line: 0, column: 1 }, label: ": int".into(), parameter: false },
+                InlayHint { at: Position { line: 1, column: 9 }, label: "a=".into(), parameter: true },
+                InlayHint { at: Position { line: 2, column: 4 }, label: "width:".into(), parameter: true },
+            ]
+        );
     }
 
     #[test]
@@ -664,7 +739,7 @@ mod tests {
             "positionEncoding": "utf-8", "hoverProvider": true, "definitionProvider": {},
             "completionProvider": {"triggerCharacters": [".", "::", ">"]}
         }}));
-        assert_eq!(caps, Capabilities { encoding: Encoding::Utf8, hover: true, completion: true, completion_resolve: false, definition: true, triggers: vec!['.', ':', '>'], signature_triggers: vec![], signature: false, formatting: false, range_formatting: false, rename: false, references: false, code_actions: false, symbols: false, inlay_hints: false });
+        assert_eq!(caps, Capabilities { encoding: Encoding::Utf8, hover: true, completion: true, completion_resolve: false, definition: true, triggers: vec!['.', ':', '>'], signature_triggers: vec![], signature: false, formatting: false, range_formatting: false, rename: false, references: false, code_actions: false, symbols: false, inlay_hints: false, pull_diagnostics: false });
         let py = Capabilities::parse(&json!({"capabilities": {"signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [")"]}, "documentFormattingProvider": true}}));
         assert!(py.signature && py.formatting);
         assert_eq!(py.signature_triggers, vec!['(', ',', ')']);
@@ -677,6 +752,7 @@ mod tests {
         let config = json!({"jsonrpc": "2.0", "id": 4, "method": "workspace/configuration", "params": {"items": [{}, {}]}});
         let none = Value::Null;
         assert_eq!(answer_server_request(&config, &none).unwrap()["result"], json!([null, null]));
+        assert_eq!(answer_server_request(&config, &json!({"run": "onType"})).unwrap()["result"], json!([{"run": "onType"}, {"run": "onType"}]));
         let settings = json!({"python": {"pythonPath": "/v/bin/python", "analysis": {"typeCheckingMode": "basic"}}});
         let asked = json!({"jsonrpc": "2.0", "id": 5, "method": "workspace/configuration", "params": {"items": [{"section": "python"}, {"section": "python.analysis"}, {"section": "pyright"}]}});
         assert_eq!(answer_server_request(&asked, &settings).unwrap()["result"], json!([settings["python"], {"typeCheckingMode": "basic"}, null]));
@@ -708,6 +784,7 @@ mod tests {
         assert_eq!(hover_text(&json!({"contents": {"kind": "markdown", "value": "```rust\nfn area(w: i32) -> i32\n```\n\nThe area."}})).as_deref(), Some("fn area(w: i32) -> i32\n\nThe area."));
         assert_eq!(hover_text(&json!({"contents": ["a", {"language": "c", "value": "int x"}]})).as_deref(), Some("a\n\nint x"));
         assert_eq!(hover_text(&json!({"contents": {"kind": "markdown", "value": "### function `area`\n\n---\n→ `int`\n\n---\nstatic int area()"}})).as_deref(), Some("function area\n\n→ int\n\nstatic int area()"));
+        assert_eq!(hover_blocks(&json!({"contents": {"kind": "markdown", "value": "* a\n\n<!-- -->\n\n* b"}})), vec![(false, "* a\n\n* b".into())]);
         assert_eq!(hover_text(&json!({"contents": ""})), None);
         assert_eq!(hover_text(&Value::Null), None);
     }

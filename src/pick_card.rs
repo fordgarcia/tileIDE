@@ -30,14 +30,14 @@ fn matches(row: &str, query: &str) -> bool {
 
 /// Shows the rows matching a query; gives back their texts.
 type Refilter = Rc<dyn Fn(&str) -> Vec<String>>;
-/// The open filtered card, for test actions: (refilter, pick a shown row).
+/// The open card, for test actions: (refilter, pick a shown row).
 type Open = Option<(Refilter, Rc<dyn Fn(i32)>)>;
 
 thread_local! {
     static TEST: RefCell<Open> = const { RefCell::new(None) };
 }
 
-/// Test actions: types `query` into the open filtered card, prints the rows left and
+/// Test actions: types `query` into the open card (a filtered one), prints the rows left and
 /// picks row `pick` of them.
 pub fn test(query: &str, pick: Option<usize>) -> Vec<String> {
     let Some((filter, pick_row)) = TEST.with_borrow(|t| t.clone()) else { return Vec::new() };
@@ -140,10 +140,7 @@ fn open(view: &sourceview5::View, title: &str, rows: &[String], keys: Option<Vec
             fill(q)
         })
     };
-    if filtered {
-        let pick = pick.clone();
-        TEST.with_borrow_mut(|t| *t = Some((refilter.clone(), Rc::new(pick))));
-    }
+    TEST.with_borrow_mut(|t| *t = Some((refilter.clone(), Rc::new(pick.clone()))));
 
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
