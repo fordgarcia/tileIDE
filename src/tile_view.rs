@@ -104,15 +104,21 @@ fn tracing() -> bool {
 /// (the header), and the last one (the content) gets the rest, but never less than
 /// `token::MIN_TILE`. A tile may shrink to a sliver (no limit on splits); the frame
 /// clips what doesn't fit. Without the floor a terminal in a tiny tile gets a negative
-/// size and GTK aborts.
+/// size and GTK aborts. While the tile moves (a glide, the drawer sliding) the content
+/// keeps the size it will have at the end (`set_content`): an editor then lays its text
+/// out once, not on every frame, and a terminal's shell isn't resized 15 times.
 mod floor {
+    use std::cell::Cell;
+
     use gtk::subclass::prelude::*;
     use gtk::{glib, prelude::*};
     use gtk4 as gtk;
     use tileide_core::token::MIN_TILE;
 
     #[derive(Default)]
-    pub struct Imp;
+    pub struct Imp {
+        pub content: Cell<Option<(i32, i32)>>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for Imp {
@@ -133,6 +139,7 @@ mod floor {
         }
 
         fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, _: i32) {
+            let (width, height) = self.content.get().unwrap_or((width, height));
             let width = width.max(MIN_TILE.0 as i32);
             let mut y = 0;
             let mut child = widget.first_child();
@@ -160,6 +167,12 @@ mod floor {
     impl FloorLayout {
         pub fn new() -> FloorLayout {
             glib::Object::new()
+        }
+
+        /// The size to lay the content out at instead of the frame's; `None` = the frame's.
+        /// Returns whether it changed.
+        pub fn set_content(&self, size: Option<(i32, i32)>) -> bool {
+            self.imp().content.replace(size) != size
         }
     }
 }
@@ -246,6 +259,8 @@ pub struct TileView {
     me: Weak<RefCell<TileView>>,
     /// Word wrap for this view's editors (Alt+Z).
     wrap: bool,
+    /// The code region the drawer's slide ends at, while it slides (`set_area`).
+    settle: Option<Rect>,
     theme: Rc<Theme>,
     /// The workspace's folder: language servers start for it, terminals in it (home
     /// when `None`).
@@ -354,6 +369,7 @@ impl TileView {
             glide: Glide::default(),
             me: Weak::new(),
             wrap: false,
+            settle: None,
             theme,
             folder,
             on_change,
@@ -382,9 +398,12 @@ impl TileView {
     }
 
     /// The code region (stage minus `gaps_out`) and the stage itself (the frame's hole,
-    /// the clip), recomputed on resize and drawer animation.
-    pub fn set_area(&mut self, area: Rect, stage: Rect) {
-        if area != self.area || stage != self.stage {
+    /// the clip), recomputed on resize and drawer animation. `settle`: the code region
+    /// the drawer's slide ends at, while it slides (tile contents take that size).
+    pub fn set_area(&mut self, area: Rect, stage: Rect, settle: Option<Rect>) {
+        let settled = self.settle.is_some() && settle.is_none();
+        self.settle = settle;
+        if area != self.area || stage != self.stage || settled {
             self.area = area;
             self.stage = stage;
             self.container.set_margin_start(stage.x.max(0.0) as i32);
@@ -1071,12 +1090,20 @@ impl TileView {
     fn place(&mut self) {
         let (ox, oy) = (self.stage.x, self.stage.y);
         let mut shown = HashMap::new();
+        // Where each tile ends up, while something moves: its content is laid out there.
+        let settled: Option<HashMap<TileId, Rect>> = self.settle.map(|area| self.layout.layout(area, self.gap, self.layout.scroll()).into_iter().collect());
         for (id, target) in self.layout.layout(self.area, self.gap, self.layout.scroll()) {
             let Some(tile) = self.tiles.get(&id) else { continue };
-            let r = match self.glide.from.get(&id) {
-                Some(&from) => tileide_core::motion::lerp_rect(from, target, self.glide.k),
-                None => target,
+            let (r, end) = match self.glide.from.get(&id) {
+                Some(&from) => (tileide_core::motion::lerp_rect(from, target, self.glide.k), Some(target)),
+                None => (target, None),
             };
+            let end = settled.as_ref().and_then(|s| s.get(&id).copied()).or(end);
+            if let Some(floor) = tile.frame.layout_manager().and_downcast::<floor::FloorLayout>()
+                && floor.set_content(end.map(|e| (e.w.max(1.0) as i32, e.h.max(1.0) as i32)))
+            {
+                tile.frame.queue_allocate();
+            }
             shown.insert(id, r);
             let visible = r.x < self.stage.x + self.stage.w && r.x + r.w > self.stage.x;
             tile.frame.set_visible(visible);

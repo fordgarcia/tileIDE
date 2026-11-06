@@ -108,6 +108,8 @@ struct App {
     window: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
     drawer: RefCell<Drawer>,
+    /// The drawer's slide has a tick callback running (`slide_drawer`).
+    drawer_tick: Cell<bool>,
     /// The Files section, laid over the open drawer.
     panel: gtk::Box,
     files: Rc<RefCell<file_tree::FileTree>>,
@@ -127,6 +129,8 @@ struct App {
     /// A tray pick made while the config pins the theme: lasts until restart (Q15).
     session_theme: RefCell<Option<String>>,
     theme_name: RefCell<String>,
+    /// `editor.theme_syntax` as the current theme was built with it.
+    theme_syntax: Cell<bool>,
     theme: RefCell<Rc<Theme>>,
     binds: RefCell<Vec<KeyBind>>,
     css: gtk::CssProvider,
@@ -147,6 +151,9 @@ struct App {
     visualizer: Rc<audio::Visualizer>,
     /// The visualizer under the file tree (drawer open).
     wave: gtk::DrawingArea,
+    /// The visualizer on the rail (drawer closed), and how shown it was last frame.
+    rail_wave: gtk::DrawingArea,
+    rail_wave_k: Cell<f64>,
     /// The config as `tileide.lua` gives it; `config` is it with the GUI settings applied.
     raw_config: RefCell<Config>,
     save_timer: RefCell<Option<glib::SourceId>>,
@@ -163,7 +170,8 @@ struct App {
     draft_theme: RefCell<Option<Rc<Theme>>>,
     /// Bumped on every draft change, so `refresh_theme` sees a new name each time.
     draft_count: Cell<u32>,
-    /// A background picked while the config pins one: lasts until restart.
+    /// The background picked in Settings this session (also saved in `state.lua`); it
+    /// shows over `--bg`.
     session_background: RefCell<Option<tileide_config::model::Background>>,
     /// The rail's workspace dots, fading in and out as workspaces come and go.
     dots: RefCell<Presence>,
@@ -349,6 +357,13 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
     wave.set_visible(false);
     panel.append(&wave);
     overlay.add_overlay(&panel);
+    // The visualizer on the rail (drawer closed): placed by margins over the logo.
+    let rail_wave = gtk::DrawingArea::new();
+    rail_wave.set_halign(gtk::Align::Start);
+    rail_wave.set_valign(gtk::Align::Start);
+    rail_wave.set_can_target(false);
+    rail_wave.set_visible(false);
+    overlay.add_overlay(&rail_wave);
     let peek = build_peek(&overlay, &workspaces);
     // The Wikipedia rice's bars: above the tiles and the drawer, below every card.
     // Built before the app, so their callbacks reach it through `link`.
@@ -584,10 +599,31 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
         let m15 = me.clone();
         let visualizer = audio::Visualizer::new(Rc::new(move || {
             let Some(app) = m15.upgrade() else { return };
-            let shown = app.visualizer.shown().is_some() && app.config.borrow().sidebar.show_visualizer;
-            app.wave.set_visible(shown);
-            app.wave.queue_draw();
-            app.area.queue_draw();
+            let shown = app.visualizer.shown().filter(|_| app.config.borrow().sidebar.show_visualizer);
+            let k = shown.as_ref().map_or(0.0, |(_, k)| *k);
+            // Under the file tree while the drawer is open, else on the rail.
+            let closed = app.drawer.try_borrow().is_ok_and(|d| d.extension() <= 0.0);
+            app.wave.set_visible(shown.is_some());
+            if shown.is_some() && !closed {
+                app.wave.queue_draw();
+            }
+            let on_rail = shown.as_ref().filter(|_| closed && token::rice() == token::Rice::Default);
+            app.rail_wave.set_visible(on_rail.is_some());
+            if let Some((bars, _)) = on_rail {
+                let r = draw::rail_wave_rect(app.area.height() as f64, bars.len());
+                let (x, y, w, h) = (r.x.round() as i32, r.y.round() as i32, r.w.round() as i32, r.h.round() as i32);
+                if (app.rail_wave.margin_start(), app.rail_wave.margin_top(), app.rail_wave.width_request(), app.rail_wave.height_request()) != (x, y, w, h) {
+                    app.rail_wave.set_margin_start(x);
+                    app.rail_wave.set_margin_top(y);
+                    app.rail_wave.set_size_request(w, h);
+                }
+                app.rail_wave.queue_draw();
+            }
+            // The canvas only for the logo fading out and back in.
+            let before = app.rail_wave_k.replace(k);
+            if before != k && (k < 1.0 || before < 1.0) {
+                app.area.queue_draw();
+            }
         }));
         // Last, so confirmations sit above every other layer.
         dialog::install(&overlay);
@@ -603,6 +639,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             window: window.clone(),
             area: area.clone(),
             drawer: RefCell::new(Drawer::default()),
+            drawer_tick: Cell::new(false),
             panel,
             files,
             peek,
@@ -618,6 +655,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             state: RefCell::new(state),
             session_theme: RefCell::new(None),
             theme_name: RefCell::new(String::new()),
+            theme_syntax: Cell::new(true),
             theme: RefCell::new(theme),
             binds: RefCell::new(Vec::new()),
             css,
@@ -633,6 +671,8 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             launch_pick: RefCell::new(HashMap::new()),
             visualizer,
             wave: wave.clone(),
+            rail_wave: rail_wave.clone(),
+            rail_wave_k: Cell::new(0.0),
             raw_config: RefCell::new(Config::default()),
             save_timer: RefCell::new(None),
             themes_panel,
@@ -714,6 +754,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
 
     watch_config(&app_state);
     connect_drawing(&app_state, started);
+    trace_frames(window.upcast_ref());
     connect_wave(&app_state);
     connect_mouse(&app_state);
     connect_keys(&app_state);
@@ -845,6 +886,27 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     app.change_setting(key, value);
                 }
             }
+            // `syntax`: the current theme's keyword and string colours.
+            (Some(app), _) if name == "syntax" => {
+                let s = app.theme.borrow().syntax();
+                println!("syntax: keyword {:?} string {:?}", s.keyword, s.string);
+            }
+            // `pick-folder:<path>`: the folder search's pick; prints whether the file tree shows.
+            (Some(app), _) if name == "pick-folder" => {
+                app.open_picked(quick_open::Target::Folder, arg.map(PathBuf::from));
+                println!("pick-folder: drawer opens = {}", app.drawer.borrow().opens());
+            }
+            // `background-state`: the background in effect for all workspaces.
+            (Some(app), _) if name == "background-state" => println!("background-state: {:?}", app.background_choice(None, None).map(|b| format!("{:?}", b.source))),
+            // `background:<mode>[:<source>]`: a pick for all workspaces, as the Themes page makes it.
+            (Some(app), _) if name == "background" => {
+                let (mode, source) = arg.as_deref().unwrap_or("see-through").split_once(':').map_or((arg.as_deref().unwrap_or("see-through"), None), |(m, s)| (m, Some(s.to_string())));
+                let bg = tileide_config::model::Background { mode: mode.into(), source, ..app.config.borrow().background.clone() };
+                app.apply_background(bg, themes_panel::Scope::All);
+                println!("background: {:?}", app.background_choice(None, None).map(|b| format!("{:?}", b.source)));
+            }
+            // `settings-page`: the page Settings shows, or None when closed.
+            (Some(app), _) if name == "settings-page" => println!("settings-page: {:?}", app.settings_card.page()),
             // `tiles`: the workspace's tile rects, printed.
             (Some(app), _) if name == "files" => app.files.borrow_mut().test_action(arg.as_deref().unwrap_or("rows")),
             (Some(app), _) if name == "themes-select" => app.themes_panel.test_select(arg.and_then(|a| a.parse().ok()).unwrap_or(0)),
@@ -1016,6 +1078,11 @@ impl App {
         if config.appearance.theme != self.config.borrow().appearance.theme {
             *self.session_theme.borrow_mut() = None;
         }
+        // Editing `tileide.background` replaces this session's Settings pick (the saved one
+        // yields too: `settings::saved_background`).
+        if config.background != self.raw_config.borrow().background {
+            *self.session_background.borrow_mut() = None;
+        }
         *self.binds.borrow_mut() = binds;
         let me = self.me.clone();
         let notice: Rc<dyn Fn(String)> = Rc::new(move |message| {
@@ -1048,7 +1115,7 @@ impl App {
         self.workspaces.borrow_mut().set_rice(a.rice);
         // The Wikipedia rice's left sidebar is Files: open it on the way in.
         if entering_wiki && !self.drawer.borrow().is_open() {
-            self.drawer.borrow_mut().toggle();
+            self.slide_drawer();
         }
         self.visualizer.set_enabled(config.sidebar.show_visualizer);
         // Widgets placed beside the rail (or the Wikipedia rice's bars) follow its size.
@@ -1148,19 +1215,23 @@ impl App {
             Some(_) => format!("\u{1}draft {}", self.draft_count.get()),
             None => self.theme_for(preview.as_deref(), workspace, number),
         };
-        if *self.theme_name.borrow() == name {
+        let match_syntax = self.config.try_borrow().map_or(self.theme_syntax.get(), |c| c.editor.theme_syntax);
+        if *self.theme_name.borrow() == name && self.theme_syntax.get() == match_syntax {
             return None;
         }
-        let theme = match draft {
-            Some(draft) => draft,
+        let mut theme = match draft {
+            Some(draft) => (*draft).clone(),
             None => {
                 let (theme, problem) = self.paths.theme(&name);
                 if let Some(problem) = problem {
                     self.problems.borrow_mut().push(problem);
                 }
-                Rc::new(theme)
+                theme
             }
         };
+        theme.match_syntax = match_syntax;
+        self.theme_syntax.set(match_syntax);
+        let theme = Rc::new(theme);
         // Before the new theme is stored: the still must show the old colours. Painting it
         // draws the canvas now, which needs the workspaces and config; inside a workspace
         // switch they are borrowed, and the switch's own fade covers the change.
@@ -1194,7 +1265,7 @@ impl App {
         let config = self.config.borrow();
         let session = self.session_background.borrow();
         let picked = number.and_then(|n| state.workspaces.get(&n)?.background.as_ref());
-        match settings::background_from(image, picked, session.as_ref(), self.options.background.is_some(), config.background_set, state.background.as_ref()) {
+        match settings::background_from(image, picked, session.as_ref(), self.options.background.is_some(), settings::saved_background(&state, &self.raw_config.borrow())) {
             settings::BackgroundFrom::Config(image) => settings::background(&config.background, image),
             settings::BackgroundFrom::Picked(b) => settings::background(b, None),
             settings::BackgroundFrom::CommandLine => Ok(self.options.background.clone().expect("checked")),
@@ -1216,6 +1287,14 @@ impl App {
         settings.tile_opacity = surfaces.tiles.opacity;
         settings.tile_blur = surfaces.tiles.blur;
         settings.frame_blur = surfaces.sidebar.blur;
+        // See-through with blur: the backdrops come from the desktop's wallpaper, the one
+        // thing behind a full-screen TileIDE.
+        if settings.source == background::Source::SeeThrough
+            && (settings.tile_blur >= 1.0 || settings.frame_blur >= 1.0)
+            && let Some(wallpaper) = background::wallpaper()
+        {
+            settings.source = background::Source::Wallpaper(wallpaper);
+        }
         let key = Some((settings.clone(), self.theme_name.borrow().clone()));
         if *self.background_key.borrow() == key {
             return;
@@ -1238,7 +1317,7 @@ impl App {
     /// Settings → Themes & background → Sidebar / Tiles & terminals, in effect now.
     fn surfaces(&self) -> tileide_core::theme::Surfaces {
         let legacy = self.background_key.borrow().as_ref().map_or(self.config.borrow().background.tile_opacity, |(s, _)| s.tile_opacity);
-        let see_behind = self.background.borrow().is_some();
+        let see_behind = self.background.borrow().as_ref().is_some_and(background::Background::paints);
         self.surfaces_with(see_behind, legacy)
     }
 
@@ -1589,7 +1668,7 @@ impl App {
             _ => themes_panel::Scope::All,
         };
         let session = self.session_background.borrow().clone();
-        let background = match settings::background_from(image.as_deref(), picks.and_then(|p| p.background.as_ref()), session.as_ref(), self.options.background.is_some(), config.background_set, state.background.as_ref()) {
+        let background = match settings::background_from(image.as_deref(), picks.and_then(|p| p.background.as_ref()), session.as_ref(), self.options.background.is_some(), settings::saved_background(&state, &self.raw_config.borrow())) {
             settings::BackgroundFrom::Picked(b) => b.clone(),
             _ => config.background.clone(),
         };
@@ -1613,7 +1692,7 @@ impl App {
             fullscreen: self.options.mode == Mode::Fullscreen,
             note: (!notes.is_empty()).then(|| notes.join(" ")),
             surfaces: self.surfaces(),
-            can_blur: self.background.borrow().is_some(),
+            can_blur: self.options.mode == Mode::Fullscreen && (self.background.borrow().is_some() || background::wallpaper().is_some()),
             locked: themes_panel::SURFACE_KEYS.into_iter().filter(|k| self.config.borrow().explicit.contains(*k)).collect(),
         });
     }
@@ -1755,12 +1834,12 @@ impl App {
                 {
                     pick.background = None;
                 }
-                if self.config.borrow().background_set {
-                    *self.session_background.borrow_mut() = Some(bg);
-                } else {
-                    *self.session_background.borrow_mut() = None;
-                    self.state.borrow_mut().background = Some(bg);
-                }
+                // Saved, so it is there next session; also live, so it shows over `--bg`.
+                *self.session_background.borrow_mut() = Some(bg.clone());
+                let over = self.raw_config.borrow().background_set.then(|| self.raw_config.borrow().background.clone());
+                let mut state = self.state.borrow_mut();
+                state.background = Some(bg);
+                state.background_over = over;
             }
             themes_panel::Scope::Workspace(n) => self.state.borrow_mut().workspaces.entry(n).or_default().background = Some(bg),
         }
@@ -1851,8 +1930,8 @@ impl App {
         self.area.queue_draw();
     }
 
-    /// The folder search's pick: the workspace follows it, and it goes to the top of
-    /// the recent folders in `state.lua`.
+    /// The folder search's pick: the workspace follows it, the file tree opens, and it
+    /// goes to the top of the recent folders in `state.lua`.
     fn set_workspace_folder(&self, folder: PathBuf) {
         let mut state = self.state.borrow_mut();
         state.remember_folder(&folder.to_string_lossy());
@@ -1861,6 +1940,10 @@ impl App {
         }
         drop(state);
         self.workspaces.borrow_mut().set_folder(folder);
+        // A folder was just opened: show its file tree.
+        if !self.drawer.borrow().opens() {
+            self.toggle_drawer();
+        }
         self.workspaces.borrow().current().borrow().grab_focused();
     }
 
@@ -1941,8 +2024,17 @@ impl App {
     fn sync(&self) {
         let numbers = self.rail_dots();
         let clock = self.clock.borrow();
-        let scene = self.scene(&numbers, &clock);
-        self.workspaces.borrow_mut().set_area(draw::tile_area(&scene), draw::stage_rect(&scene));
+        let mut scene = self.scene(&numbers, &clock);
+        let area = (draw::tile_area(&scene), draw::stage_rect(&scene));
+        // While the drawer slides, tile contents take the size they end with.
+        let settle = {
+            let d = self.drawer.borrow();
+            d.animating().then(|| {
+                scene.drawer = d.final_extension();
+                draw::tile_area(&scene)
+            })
+        };
+        self.workspaces.borrow_mut().set_area(area.0, area.1, settle);
 
         // The panel appears once the drawer is wide enough for its content (it fades
         // in during the last part of the expansion, design.md §8).
@@ -1991,8 +2083,40 @@ impl App {
             return;
         }
         drop(config);
+        self.slide_drawer();
+    }
+
+    /// Opens or closes the drawer; the frame clock drives the slide only while it runs
+    /// (an idle tick callback would keep the clock, and the compositor, busy every frame).
+    fn slide_drawer(&self) {
         self.drawer.borrow_mut().toggle();
         self.area.queue_draw();
+        if self.drawer_tick.get() {
+            return;
+        }
+        self.drawer_tick.set(true);
+        let me = self.me.clone();
+        self.area.add_tick_callback(move |area, clock| {
+            let Some(s) = me.upgrade() else { return glib::ControlFlow::Break };
+            let now = clock.frame_time();
+            {
+                let mut d = s.drawer.borrow_mut();
+                let mut stats = s.stats.borrow_mut();
+                if !d.animating() {
+                    stats.last_frame_us = None;
+                    s.drawer_tick.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                d.tick(now);
+                if let Some(last) = stats.last_frame_us {
+                    stats.intervals_us.push(now - last);
+                }
+                stats.last_frame_us = Some(now);
+            }
+            s.sync();
+            area.queue_draw();
+            glib::ControlFlow::Continue
+        });
     }
 
     fn run(&self, action: &Action) {
@@ -2290,6 +2414,14 @@ fn screenshot(window: &gtk::Window, path: &str) -> Result<(), String> {
 /// The visualizer strip under the file tree (drawer open).
 fn connect_wave(state: &Rc<App>) {
     let me = Rc::downgrade(state);
+    state.rail_wave.set_draw_func(move |_, cr, w, h| {
+        let Some(app) = me.upgrade() else { return };
+        if let Some((bars, k)) = app.visualizer.shown() {
+            let accent = app.theme.borrow().accent;
+            let _ = draw::waveform(cr, tileide_core::tiles::Rect { x: 0.0, y: 0.0, w: w as f64, h: h as f64 }, &bars, accent, k, true);
+        }
+    });
+    let me = Rc::downgrade(state);
     state.wave.set_draw_func(move |_, cr, w, h| {
         let Some(app) = me.upgrade() else { return };
         if let Some((bars, k)) = app.visualizer.shown() {
@@ -2467,7 +2599,8 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
         // Cheap clone (refcounted); baked only when the size changes.
         // The fractional scale (e.g. 1.5), so the paint is a 1:1 copy, not a resample.
         let scale = area.native().and_then(|n| n.surface()).map_or(area.scale_factor() as f64, |s| s.scale());
-        let background = s.background.borrow_mut().as_mut().and_then(|b| b.surface(width, height, scale).cloned());
+        // Baked either way (it makes the backdrops); painted only when it isn't the wallpaper.
+        let background = s.background.borrow_mut().as_mut().and_then(|b| b.surface(width, height, scale).cloned().filter(|_| b.paints()));
         let frosted = s.background.borrow().as_ref().and_then(|b| b.frosted().cloned());
         let frosted_frame = s.background.borrow().as_ref().and_then(|b| b.frosted_frame().cloned());
         let tile_rects = if frosted.is_some() { s.workspaces.borrow().current().borrow().tile_rects() } else { Vec::new() };
@@ -2515,27 +2648,6 @@ fn connect_drawing(state: &Rc<App>, started: Instant) {
     let s = state.clone();
     state.area.connect_resize(move |_, _, _| s.sync());
 
-    // Frame clock drives the drawer animation; intervals are recorded only while it moves.
-    let s = state.clone();
-    state.area.add_tick_callback(move |area, clock| {
-        let now = clock.frame_time();
-        {
-            let mut d = s.drawer.borrow_mut();
-            let mut stats = s.stats.borrow_mut();
-            if !d.animating() {
-                stats.last_frame_us = None;
-                return glib::ControlFlow::Continue;
-            }
-            d.tick(now);
-            if let Some(last) = stats.last_frame_us {
-                stats.intervals_us.push(now - last);
-            }
-            stats.last_frame_us = Some(now);
-        }
-        s.sync();
-        area.queue_draw();
-        glib::ControlFlow::Continue
-    });
 }
 
 fn connect_mouse(state: &Rc<App>) {
@@ -2757,5 +2869,43 @@ fn start_bench(app: &gtk::Application, state: &Rc<App>, toggles: u32) {
         remaining.set(remaining.get() - 1);
         s.toggle_drawer();
         glib::ControlFlow::Continue
+    });
+}
+
+/// One second of `trace_frames`, in µs.
+#[derive(Clone, Copy, Default)]
+struct FrameTrace {
+    second: i64,
+    last: i64,
+    frames: u32,
+    longest_gap: i64,
+    frame_began: i64,
+    longest_frame: i64,
+}
+
+/// `TILEIDE_TRACE_FRAMES`: frames per second, the longest gap between two, and the
+/// longest time the main thread spent inside one (layout + paint), printed each second.
+fn trace_frames(window: &gtk::Window) {
+    if std::env::var_os("TILEIDE_TRACE_FRAMES").is_none() {
+        return;
+    }
+    let stats: Rc<Cell<FrameTrace>> = Rc::default();
+    window.connect_realize(move |w| {
+        let Some(clock) = w.frame_clock() else { return };
+        let s = stats.clone();
+        clock.connect_before_paint(move |_| s.set(FrameTrace { frame_began: glib::monotonic_time(), ..s.get() }));
+        let s = stats.clone();
+        clock.connect_after_paint(move |clock| {
+            let (now, v) = (clock.frame_time(), s.get());
+            let took = glib::monotonic_time() - v.frame_began;
+            if v.second == 0 || now - v.second >= 1_000_000 {
+                if v.second != 0 {
+                    println!("trace: {} frames/s, longest gap {:.1} ms, longest frame {:.1} ms", v.frames, v.longest_gap as f64 / 1000.0, v.longest_frame as f64 / 1000.0);
+                }
+                s.set(FrameTrace { second: now, last: now, frames: 1, longest_gap: 0, frame_began: v.frame_began, longest_frame: took });
+            } else {
+                s.set(FrameTrace { last: now, frames: v.frames + 1, longest_gap: v.longest_gap.max(now - v.last), longest_frame: v.longest_frame.max(took), ..v });
+            }
+        });
     });
 }

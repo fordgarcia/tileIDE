@@ -334,7 +334,7 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked:
     // The launch config's program stands in for the focused file.
     let Some(file) = config.as_ref().map(|l| l.program.clone()).or(file) else {
         shown.set_state("Nothing to debug", Some("failed"));
-        shown.append("Focus a C, C++, Rust, Python or Java file and press F5.\n");
+        shown.append("Focus a C, C++, Rust, Python, Java, JavaScript or TypeScript file and press F5.\n");
         return;
     };
     let name = config.as_ref().map_or_else(|| file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()), |l| l.name.clone());
@@ -352,6 +352,8 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked:
             python_has: &tileide_core::python::imports,
             bridge: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tileide")),
             folder,
+            node: node(&dir),
+            js_debug: tileide_dap::js_debug(std::env::var_os("HOME").map(PathBuf::from).as_deref()),
         };
         let plan = match &config {
             Some(config) => tileide_dap::plan_launch(config, &out_dir, &host),
@@ -395,6 +397,16 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked:
     });
 }
 
+/// A `node` that runs in `dir`: PATH's first (a mise shim fails outside a project
+/// that pins one), else one from the user's tool folders.
+fn node(dir: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    let user = tileide_lsp::servers::user_dirs(std::env::var_os("HOME").map(PathBuf::from).as_deref());
+    path.iter().chain(&user).map(|d| d.join("node")).filter(|n| n.is_file()).find(|n| {
+        std::process::Command::new(n).arg("--version").current_dir(dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+    })
+}
+
 fn launch(plan: Plan) {
     let generation = HUB.with_borrow_mut(|h| {
         h.generation += 1;
@@ -403,7 +415,8 @@ fn launch(plan: Plan) {
     let deliver = move |m: Incoming| {
         glib::MainContext::default().invoke(move || receive(generation, m));
     };
-    let session = match Session::start(&plan.cmd, &plan.cwd, deliver) {
+    let started = if plan.listens { Session::serve(&plan.cmd, &plan.cwd, deliver) } else { Session::start(&plan.cmd, &plan.cwd, deliver) };
+    let session = match started {
         Ok(s) => s,
         Err(e) => {
             let p = panel();
@@ -834,7 +847,9 @@ impl Panel {
             name.add_css_class("title");
         }
         name.set_xalign(0.0);
-        let value = gtk::Label::new(Some(value));
+        // One line: js-debug gives a function's whole source as its value.
+        let one_line = value.contains('\n').then(|| value.lines().map(str::trim).collect::<Vec<_>>().join(" "));
+        let value = gtk::Label::new(Some(one_line.as_deref().unwrap_or(value)));
         value.add_css_class("var-value");
         value.set_xalign(0.0);
         value.set_hexpand(true);

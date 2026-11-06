@@ -353,7 +353,7 @@ impl Workspaces {
 
     fn new_view(&self, layout: LayoutKind, folder: Option<PathBuf>) -> Rc<RefCell<TileView>> {
         let view = TileView::new(layout, self.tiling.column_width, self.gap, self.theme.clone(), folder, self.on_change.clone());
-        view.borrow_mut().set_area(self.area, self.stage);
+        view.borrow_mut().set_area(self.area, self.stage, None);
         view.borrow_mut().set_wrap(self.wrap);
         view.borrow_mut().set_max_tiles(self.tiling.max_tiles);
         view.borrow_mut().set_peek(self.tiling.peek);
@@ -421,17 +421,24 @@ impl Workspaces {
                 view.borrow().set_visible(false);
             }
         }
+        current.borrow_mut().set_area(self.area, self.stage, None);
         current.borrow().set_visible(true);
         self.notify_switch();
         (self.on_change)();
     }
 
     /// Every workspace gets the same code region, so switching never has to relayout.
-    pub fn set_area(&mut self, area: Rect, stage: Rect) {
+    /// While the drawer slides (`settle`: where it ends) only the shown one follows; the
+    /// others catch up when it stops, or when shown.
+    pub fn set_area(&mut self, area: Rect, stage: Rect, settle: Option<Rect>) {
         self.area = area;
         self.stage = stage;
+        if settle.is_some() {
+            self.current().borrow_mut().set_area(area, stage, settle);
+            return;
+        }
         for view in self.views() {
-            view.borrow_mut().set_area(area, stage);
+            view.borrow_mut().set_area(area, stage, None);
         }
     }
 }

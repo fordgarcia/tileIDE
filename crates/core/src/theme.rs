@@ -33,6 +33,9 @@ pub struct Theme {
     pub ansi: [Option<Rgb>; 16],
     /// Syntax colours the theme sets itself (`SYNTAX_KEYS` order); the rest are derived.
     pub code: [Option<Rgb>; 8],
+    /// Derived syntax colours come from the theme's own colours (`editor.theme_syntax`),
+    /// not the terminal's hues. Set by the app, not by theme files.
+    pub match_syntax: bool,
 }
 
 /// Theme file keys of `syntax = { … }`, in `Theme::code` order.
@@ -142,6 +145,7 @@ impl Theme {
             glass: None,
             ansi: [None; 16],
             code: [None; 8],
+            match_syntax: false,
         }
     }
 
@@ -214,9 +218,29 @@ pub struct Syntax {
 
 impl Theme {
     pub fn syntax(&self) -> Syntax {
-        let p = self.terminal_palette();
         let pick = |i: usize, derived: Rgb| self.code[i].unwrap_or(derived);
+        if self.match_syntax {
+            let d = self.theme_syntax();
+            return Syntax { keyword: pick(0, d[0]), type_: pick(1, d[1]), string: pick(2, d[2]), constant: pick(3, d[3]), function: pick(4, d[4]), preprocessor: pick(5, d[5]), builtin: pick(6, d[6]), comment: pick(7, d[7]) };
+        }
+        let p = self.terminal_palette();
         Syntax { keyword: pick(0, p[5]), type_: pick(1, p[3]), string: pick(2, p[2]), constant: pick(3, p[6]), function: pick(4, p[4]), preprocessor: pick(5, p[13]), builtin: pick(6, p[14]), comment: pick(7, p[8]) }
+    }
+
+    /// Syntax colours made from the theme (`SYNTAX_KEYS` order): keywords in the accent,
+    /// the other kinds in hues beside it at the accent's saturation, strings in the
+    /// theme's mid tone (the wallpaper's), comments muted. A grey accent gives grey code.
+    fn theme_syntax(&self) -> [Rgb; 8] {
+        let (bg, dark) = (self.tile, self.dark);
+        let (h, s, _) = to_hsl(self.accent);
+        let s = s.min(0.65);
+        let l = if dark { 0.70 } else { 0.36 };
+        let near = |turn: f64, l: f64| legible(from_hsl(h + turn, s, l), bg, dark);
+        let (mid_h, mid_s, _) = to_hsl(self.strip[1]);
+        // A grey mid tone has no hue of its own: the accent's opposite instead.
+        let string = if mid_s > 0.15 { legible(from_hsl(mid_h, mid_s.clamp(0.3, s.max(0.3)), l), bg, dark) } else { near(180.0, l) };
+        let lift = if dark { 0.08 } else { -0.08 };
+        [legible(self.accent, bg, dark), near(-35.0, l), string, near(70.0, l + lift), near(35.0, l), near(-70.0, l), near(105.0, l + lift), legible(self.muted, bg, dark)]
     }
 }
 
@@ -340,6 +364,22 @@ mod tests {
             assert!(contrast(*c, t.tile) >= 4.5, "syntax colour {i}");
             assert!(all[..i].iter().all(|o| o != c), "syntax colour {i} repeats");
         }
+    }
+
+    #[test]
+    fn matched_syntax_follows_the_accent() {
+        let t = Theme { match_syntax: true, ..Theme::builtin() };
+        let s = t.syntax();
+        let all = [s.keyword, s.type_, s.string, s.constant, s.function, s.preprocessor, s.builtin, s.comment];
+        for (i, c) in all.iter().enumerate() {
+            assert!(contrast(*c, t.tile) >= 4.5, "syntax colour {i}");
+            assert!(all[..i].iter().all(|o| o != c), "syntax colour {i} repeats");
+        }
+        assert_eq!(s.keyword, t.accent, "the accent already reads on the tile");
+        assert_ne!(s, Theme::builtin().syntax(), "differs from the terminal hues");
+        let light = Theme { dark: false, surface: rgb(0xF2E8D8), tile: rgb(0xFBF5EA), text: rgb(0x2B241C), muted: rgb(0x6E6253), accent: rgb(0x2E6B5E), error: rgb(0xB3402A), match_syntax: true, ..Theme::builtin() };
+        let s = light.syntax();
+        assert!([s.keyword, s.type_, s.string, s.constant, s.function, s.preprocessor, s.builtin, s.comment].iter().all(|c| contrast(*c, light.tile) >= 4.5));
     }
 
     #[test]

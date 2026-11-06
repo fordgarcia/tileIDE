@@ -35,6 +35,11 @@ impl Drawer {
         self.progress != self.target
     }
 
+    /// Open, or opening.
+    pub fn opens(&self) -> bool {
+        self.target > 0.5
+    }
+
     pub fn is_open(&self) -> bool {
         self.target > 0.5 && !self.animating()
     }
@@ -50,6 +55,11 @@ impl Drawer {
     /// Current extension in px (the motion curve, `motion::ease`).
     pub fn extension(&self) -> f64 {
         self.width * motion::ease(self.progress)
+    }
+
+    /// The extension the running slide ends at.
+    pub fn final_extension(&self) -> f64 {
+        self.width * motion::ease(self.target)
     }
 
     pub fn set_width(&mut self, width: f64) {

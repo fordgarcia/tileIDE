@@ -38,7 +38,6 @@ you can code with it.
 ![TileIDE](docs/2.png)
 ![TileIDE](docs/3.png)
 ![TileIDE](docs/4.png)
-![TileIDE](docs/5.png)
 @creadits to the artist of the wallpaper
 
 
@@ -57,7 +56,7 @@ Optional, for the parts you use:
 ```
 sudo pacman -S --needed pyright ruff python-ipykernel python-jupyter-client python-debugpy gdb
 ```
-`pyright` + `ruff`: Python completion, diagnostics and formatting (with the Python picked with `Alt+P`, else the project's `.venv`) · `python-ipykernel` + `python-jupyter-client`: notebooks · `python-debugpy`: Python debugging · `gdb`: C, C++ and Rust debugging · `otf-space-grotesk` (AUR): the intended UI font. Settings → Toolchains shows what TileIDE found and the command for anything missing.
+`pyright` + `ruff`: Python completion, diagnostics and formatting (with the Python picked with `Alt+P`, else the project's `.venv`) · `python-ipykernel` + `python-jupyter-client`: notebooks · `python-debugpy`: Python debugging · `gdb`: C, C++ and Rust debugging · `vscode-js-debug-bin` (AUR, `yay -S vscode-js-debug-bin`): JavaScript and TypeScript debugging · `otf-space-grotesk` (AUR): the intended UI font. Settings → Toolchains shows what TileIDE found and the command for anything missing.
 
 **Debian / Ubuntu** (untested; needs GTK 4.12 or newer, e.g. Ubuntu 24.04+)
 ```

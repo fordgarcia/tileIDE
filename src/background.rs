@@ -16,6 +16,10 @@ use tileide_core::token;
 pub enum Source {
     /// The desktop shows through (compositor blur); TileIDE draws nothing.
     SeeThrough,
+    /// See-through, over this wallpaper (`wallpaper()`): nothing is painted across the
+    /// canvas, but the blurred backdrops under the tiles and sidebar are made from it,
+    /// so their blur works without a background of TileIDE's own.
+    Wallpaper(PathBuf),
     Image(PathBuf),
     /// Top to bottom.
     Gradient(Rgb, Rgb),
@@ -69,7 +73,7 @@ impl Default for Settings {
     }
 }
 
-pub const USAGE: &str = "--bg see-through|image:PATH|gradient:RRGGBB,RRGGBB|solid:RRGGBB [--dim 0..100] [--tint RRGGBB@0..100] [--tile-opacity 88..100] [--blur PX] [--fit cover|contain|tile] [--no-auto-dim]";
+pub const USAGE: &str = "--bg see-through|wallpaper:PATH|image:PATH|gradient:RRGGBB,RRGGBB|solid:RRGGBB [--dim 0..100] [--tint RRGGBB@0..100] [--tile-opacity 88..100] [--blur PX] [--fit cover|contain|tile] [--no-auto-dim]";
 
 impl Settings {
     /// Reads the background flags; values are percentages on the command line.
@@ -119,6 +123,8 @@ fn parse_source(text: &str) -> Result<Source, String> {
     match text.split_once(':') {
         None if text == "see-through" => Ok(Source::SeeThrough),
         Some(("image", path)) => Ok(Source::Image(expand_home(path))),
+        // See-through over this wallpaper (what full-screen picks when blur is set).
+        Some(("wallpaper", path)) => Ok(Source::Wallpaper(expand_home(path))),
         Some(("solid", hex)) => Ok(Source::Solid(parse_hex(hex)?)),
         Some(("gradient", pair)) => {
             let (a, b) = pair.split_once(',').ok_or("gradient needs two colours: gradient:RRGGBB,RRGGBB")?;
@@ -188,13 +194,19 @@ impl Background {
         (settings.source != Source::SeeThrough).then_some(Background { settings, theme, image: None, baked: None, report: None })
     }
 
+    /// Whether the canvas paints `surface()` (not for `Source::Wallpaper`, which only
+    /// feeds the backdrops).
+    pub fn paints(&self) -> bool {
+        !matches!(self.settings.source, Source::Wallpaper(_))
+    }
+
     pub fn report(&self) -> Option<&Report> {
         self.report.as_ref()
     }
 
     pub fn image_path(&self) -> Option<PathBuf> {
         match &self.settings.source {
-            Source::Image(path) => Some(path.clone()),
+            Source::Image(path) | Source::Wallpaper(path) => Some(path.clone()),
             _ => None,
         }
     }
@@ -262,9 +274,11 @@ impl Background {
             let cr = Context::new(&surface)?;
             self.paint_source(&cr, width as f64, height as f64)?;
         }
-        let surface = blur(surface, self.settings.blur)?;
-        let mut dim = self.settings.dim;
-        if self.settings.auto_dim {
+        let wallpaper = !self.paints();
+        // The desktop as it is: no blur, dim or tint of its own, no legibility report.
+        let surface = if wallpaper { surface } else { blur(surface, self.settings.blur)? };
+        let mut dim = if wallpaper { 0.0 } else { self.settings.dim };
+        if self.settings.auto_dim && !wallpaper {
             let needed = required_dim(&luminances(&surface), &self.theme, self.settings.tile_opacity, self.settings.tint, dim);
             if needed > dim {
                 eprintln!(
@@ -275,17 +289,19 @@ impl Background {
                 dim = needed;
             }
         }
-        let cr = Context::new(&surface)?;
-        if let Some((tint, strength)) = self.settings.tint {
-            cr.set_source_rgba(tint.0, tint.1, tint.2, strength);
+        if !wallpaper {
+            let cr = Context::new(&surface)?;
+            if let Some((tint, strength)) = self.settings.tint {
+                cr.set_source_rgba(tint.0, tint.1, tint.2, strength);
+                cr.paint()?;
+            }
+            cr.set_source_rgba(0.0, 0.0, 0.0, dim);
             cr.paint()?;
+            drop(cr);
+            let report = legibility(&luminances(&surface), &self.theme, self.settings.tile_opacity);
+            println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the empty-workspace hint (minimum {MIN_CONTRAST}:1)", report.tile, report.hint);
+            self.report = Some(Report { contrast: report.tile.min(report.hint), dim: (self.settings.dim, dim) });
         }
-        cr.set_source_rgba(0.0, 0.0, 0.0, dim);
-        cr.paint()?;
-        drop(cr);
-        let report = legibility(&luminances(&surface), &self.theme, self.settings.tile_opacity);
-        println!("background: worst contrast {:.1}:1 on tiles, {:.1}:1 on the empty-workspace hint (minimum {MIN_CONTRAST}:1)", report.tile, report.hint);
-        self.report = Some(Report { contrast: report.tile.min(report.hint), dim: (self.settings.dim, dim) });
         let saturation = self.theme.glass.map_or(1.0, |g| g.saturate);
         let backdrop = |radius: f64, saturation: f64| -> Result<Option<ImageSurface>, cairo::Error> {
             if radius < 1.0 {
@@ -315,9 +331,41 @@ impl Background {
                 cr.paint()
             }
             (Source::Image(_), Some(image)) => paint_image(cr, image, w, h, self.settings.fit, &self.theme),
+            // Wallpaper tools fill the screen and crop (omarchy, swaybg's default).
+            (Source::Wallpaper(_), Some(image)) => paint_image(cr, image, w, h, Fit::Cover, &self.theme),
             _ => Ok(()),
         }
     }
+}
+
+/// The desktop's wallpaper image, from the tool that draws it: omarchy's shell, swww,
+/// hyprpaper or swaybg. `None` when none is found (an animated or colour-only desktop).
+pub fn wallpaper() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let state = std::env::var_os("XDG_STATE_HOME").map_or_else(|| home.join(".local/state"), PathBuf::from);
+    let omarchy = [state.join("omarchy/current/background"), home.join(".config/omarchy/current/background")];
+    if let Some(path) = omarchy.into_iter().find_map(|p| std::fs::canonicalize(p).ok().filter(|p| p.is_file())) {
+        return Some(path);
+    }
+    let output = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    // swww: "eDP-1: 1920x1080, scale: 1, currently displaying: image: /path".
+    let swww = output("swww", &["query"]).and_then(|o| o.lines().find_map(|l| l.split_once("image: ").map(|(_, p)| PathBuf::from(p.trim()))));
+    // hyprpaper: "eDP-1 = /path".
+    let hyprpaper = || output("hyprctl", &["hyprpaper", "listactive"]).and_then(|o| o.lines().find_map(|l| l.split_once(" = ").map(|(_, p)| PathBuf::from(p.trim()))));
+    swww.or_else(hyprpaper).or_else(swaybg_image).filter(|p| p.is_file())
+}
+
+/// The `-i`/`--image` of a running swaybg.
+fn swaybg_image() -> Option<PathBuf> {
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+        let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        if !args.first()?.ends_with("swaybg") {
+            return None;
+        }
+        let i = args.iter().position(|a| a == "-i" || a == "--image")?;
+        args.get(i + 1).map(PathBuf::from)
+    })
 }
 
 /// Decoded pixels in cairo's ARGB32 layout; plain data, so it can cross threads.

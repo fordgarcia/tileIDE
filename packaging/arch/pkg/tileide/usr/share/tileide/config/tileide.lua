@@ -78,8 +78,9 @@ tileide.tiling {
 -- a new tile was refused (Most tiles per workspace reached).
 -- tileide.alerts { missing_tools = true, tile_limit = true }
 
--- Typing aids in editors and notebook cells.
--- tileide.editor { auto_close = true, match_brackets = false, format_on_save = false, inlay_hints = false }
+-- Typing aids in editors and notebook cells. theme_syntax: code colours made from the
+-- theme's accent (off: the terminal's colours).
+-- tileide.editor { auto_close = true, match_brackets = false, format_on_save = false, inlay_hints = false, theme_syntax = true }
 
 -- keybinds: tileide.bind(mods, key, action, arg). These replace the built-in key with
 -- the same mods; everything else keeps its default (see the README).

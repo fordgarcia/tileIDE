@@ -59,6 +59,8 @@ pub struct Editor {
     /// Inferred types and parameter names at the end of each line (servers that offer
     /// them: basedpyright, clangd, rust-analyzer, TypeScript).
     pub inlay_hints: bool,
+    /// Code colours made from the theme's colours instead of the terminal's hues.
+    pub theme_syntax: bool,
 }
 
 /// Overrides for one built-in language server.
@@ -308,7 +310,7 @@ impl Default for Config {
             background_set: false,
             tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5, max_tiles: tileide_core::token::MAX_TILES, peek: tileide_core::token::PEEK },
             alerts: Alerts { missing_tools: true, tile_limit: true },
-            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false, inlay_hints: false },
+            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false, inlay_hints: false, theme_syntax: true },
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),

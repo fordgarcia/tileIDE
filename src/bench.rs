@@ -97,7 +97,7 @@ pub fn render(args: &[String]) -> Result<(), String> {
     {
         b.set_image(crate::background::decode(&path)?)?;
     }
-    let background = backdrop.as_mut().and_then(|b| b.surface(w as i32, h as i32, scale).cloned());
+    let background = backdrop.as_mut().and_then(|b| b.surface(w as i32, h as i32, scale).cloned().filter(|_| b.paints()));
     let frosted = backdrop.as_ref().and_then(|b| b.frosted().cloned());
     let frosted_frame = backdrop.as_ref().and_then(|b| b.frosted_frame().cloned());
     let scene = draw::Scene {

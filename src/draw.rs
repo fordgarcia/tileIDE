@@ -139,6 +139,15 @@ fn rail_height(s: &Scene) -> f64 {
     s.height / token::rail_scale()
 }
 
+/// Where the rail's visualizer bars go (the logo's place), in window px, for `bars` bars.
+pub fn rail_wave_rect(height: f64, bars: usize) -> Rect {
+    let k = token::rail_scale();
+    let rail = height / k;
+    let h = (bars as f64 * 6.0).min(rail * 0.3);
+    let r = Rect { x: PILL_INSET + 4.0, y: rail / 2.0 - h / 2.0, w: RAIL_WIDTH - 2.0 * PILL_INSET - 8.0, h };
+    Rect { x: r.x * k, y: r.y * k, w: r.w * k, h: r.h * k }
+}
+
 /// (hit, centre y, hit radius) for each rail item, top to bottom, on screen.
 pub fn rail_items(s: &Scene) -> Vec<(RailHit, f64, f64)> {
     let k = token::rail_scale();
@@ -594,11 +603,8 @@ fn draw_rail_units(cr: &Context, s: &Scene) -> Result<(), Error> {
             crate::logo::fill(cr, cx, rail_height(s) / 2.0, MID_LOGO)?;
         }
     }
-    if let Some((bars, k)) = wave {
-        let h = (bars.len() as f64 * 6.0).min(rail_height(s) * 0.3);
-        let area = Rect { x: cx - (RAIL_WIDTH - 2.0 * PILL_INSET) / 2.0 + 4.0, y: rail_height(s) / 2.0 - h / 2.0, w: RAIL_WIDTH - 2.0 * PILL_INSET - 8.0, h };
-        waveform(cr, area, bars, t.accent, k, true)?;
-    }
+    // The bars themselves are a small widget over the rail (`rail_wave_rect`), so music
+    // doesn't repaint the whole canvas 30 times a second.
     if s.modules.clock {
         draw_clock(cr, s, cx)?;
     }

@@ -11,6 +11,8 @@ enum Check {
     Program(&'static str, &'static str),
     /// Python modules `python3` (or the distro's `/usr/bin/python3`) must import.
     Modules(&'static str),
+    /// js-debug's DAP server (from the AUR, so installed with yay).
+    JsDebug,
 }
 
 const TOOLCHAINS: &[(&str, &str, Check, &str)] = &[
@@ -22,6 +24,7 @@ const TOOLCHAINS: &[(&str, &str, Check, &str)] = &[
     ("GDB", "Debugging C, C++, Rust (F5)", Check::Program("gdb", "--version"), "gdb"),
     ("Rust", "rustc and cargo", Check::Program("rustc", "--version"), "rustup"),
     ("Node.js", "JavaScript: Alt+R", Check::Program("node", "--version"), "nodejs"),
+    ("js-debug", "JavaScript and TypeScript debugging (F5)", Check::JsDebug, "vscode-js-debug-bin"),
     ("Java", "Java: Alt+R (single file)", Check::Program("java", "-version"), "jdk-openjdk"),
     ("jdb", "Java debugging (F5), with javac", Check::Program("jdb", "-version"), "jdk-openjdk"),
     ("Go", "Go: Alt+R", Check::Program("go", "version"), "go"),
@@ -62,8 +65,13 @@ pub fn detect() -> Vec<Found> {
                     .flatten()
                     .find(|p| tileide_core::python::imports(p, modules))
                     .map(|p| format!("importable by {}", p.display())),
+                Check::JsDebug => tileide_dap::js_debug(std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref()).map(|p| p.display().to_string()),
             };
-            Found { name, used_for, detail, install: format!("sudo pacman -S {package}") }
+            let install = match check {
+                Check::JsDebug => format!("yay -S {package}"),
+                _ => format!("sudo pacman -S {package}"),
+            };
+            Found { name, used_for, detail, install }
         })
         .collect()
 }

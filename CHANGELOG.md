@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0-alpha.7 (2026-11-06): JavaScript and TypeScript debugging
+
+### Added
+- **F5 debugs JavaScript and TypeScript** (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`) with Microsoft's js-debug, the adapter VS Code uses: breakpoints (F9), stepping, the call stack and variables, program output in the debug tile. TypeScript runs as Node runs it (Node ≥ 22.6 strips the types; line numbers stay the same). Install it with `yay -S vscode-js-debug-bin` (AUR); a release unpacked into `~/.local/share/js-debug` works too. Settings → Toolchains shows whether it was found.
+- Launch configs (`Alt+L`) debug Node programs with their arguments, environment and working folder, from `tileide.launch{}` or `.vscode/launch.json`.
+
+### Changed
+- Multi-line values in the debug tile's variables (a function's source) show on one line.
+
+## 0.6.0-alpha.6 (2026-11-06): smoother motion, blur over See-through
+
+### Added
+- **Blur over See-through** (full-screen): with a Tiles or Sidebar blur set, TileIDE finds your desktop's wallpaper (omarchy's shell, swww, hyprpaper or swaybg) and paints it blurred under the tiles and sidebar; the gaps stay truly see-through. The blur sliders now work without picking an Image background. Windowed, blur still comes from the compositor.
+- `TILEIDE_TRACE_FRAMES=1`: frames per second, longest gap and longest frame, printed each second (for finding stutters).
+
+### Changed
+- **Smoother tile glides and drawer slides with big files open.** While a tile moves, its editor or terminal is laid out once at its final size instead of on every frame (an editor re-measured every line of a large file each frame; a terminal resized its shell 15 times). Measured full-screen with a 2,800-line Rust file: main-thread frame time during closing glides dropped from up to 21 ms to under 10 ms.
+- While the drawer slides, only the shown workspace follows it frame by frame (others catch up at the end).
+- The canvas no longer asks for a frame every 16 ms when nothing moves (the drawer's frame callback now runs only while it slides).
+- The rail's audio visualizer is its own small widget: music no longer repaints the whole canvas 30 times a second.
+
+## 0.6.0-alpha.5 (2026-11-06): settings fixes, code colours from the theme
+
+### Added
+- **Code colours from the theme** (Settings → Editor, `tileide.editor { theme_syntax = true }`, on by default): keywords take the theme's accent, types, functions, constants and the rest take hues beside it, strings the theme's mid tone, comments its muted colour; all kept readable (4.5:1). Works for every theme, including ones made in the theme editor. A theme's own `syntax = { … }` colours still win. Off: the terminal-style colours as before.
+
+### Changed
+- **Dragging a slider in Settings fades the whole card out** so the change shows on the tiles behind it; it comes back on release (a plain click doesn't hide it).
+- **Opening a folder** (`Alt+D`, or the welcome card's Open folder in a new workspace) opens the file tree.
+- **A background picked in Themes & background is kept for the next session** even when `tileide.lua` has a `tileide.background { … }` block. Editing that block afterwards (TileIDE open or closed) makes the config's background win again; `state.lua` keeps the config's block as it was at the pick (`background_over`).
+
+### Fixed
+- Settings closed when a slider drag ended outside the card (a release over the dimmed backdrop counted as a click outside); the card now closes only on a click that starts and ends outside it.
+
 ## 0.6.0-alpha.4 (2026-11-06): launch configs
 
 ### Added

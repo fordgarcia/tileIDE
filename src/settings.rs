@@ -162,10 +162,17 @@ pub enum BackgroundFrom<'a> {
     CommandLine,
 }
 
+/// The background saved from Settings, unless `tileide.background` was edited after it
+/// was picked (then the config's is the newer choice).
+pub fn saved_background<'a>(state: &'a tileide_config::State, config: &tileide_config::Config) -> Option<&'a model::Background> {
+    state.background.as_ref().filter(|_| !config.background_set || state.background_over.as_ref() == Some(&config.background))
+}
+
 /// The config's workspace image wins (Q15), then the picker's live or per-workspace
-/// choice, then the command line, then `tileide.background` if set, else the picker's
-/// saved choice.
-pub fn background_from<'a>(workspace_image: Option<&'a str>, picked_workspace: Option<&'a model::Background>, session: Option<&'a model::Background>, command_line: bool, config_set: bool, saved: Option<&'a model::Background>) -> BackgroundFrom<'a> {
+/// choice, then the command line, then the picker's saved choice, else
+/// `tileide.background`. Editing `tileide.background` clears the saved choice
+/// (`App::apply_config`), so the latest of the two wins.
+pub fn background_from<'a>(workspace_image: Option<&'a str>, picked_workspace: Option<&'a model::Background>, session: Option<&'a model::Background>, command_line: bool, saved: Option<&'a model::Background>) -> BackgroundFrom<'a> {
     if workspace_image.is_some() {
         return BackgroundFrom::Config(workspace_image);
     }
@@ -175,7 +182,7 @@ pub fn background_from<'a>(workspace_image: Option<&'a str>, picked_workspace: O
     if command_line {
         return BackgroundFrom::CommandLine;
     }
-    match saved.filter(|_| !config_set) {
+    match saved {
         Some(b) => BackgroundFrom::Picked(b),
         None => BackgroundFrom::Config(None),
     }
@@ -201,12 +208,20 @@ mod tests {
     fn background_priority() {
         let a = tileide_config::Config::default().background;
         let b = model::Background { mode: "solid".into(), source: Some("112233".into()), ..a.clone() };
-        assert_eq!(background_from(Some("/w.png"), Some(&a), Some(&a), true, true, Some(&a)), BackgroundFrom::Config(Some("/w.png")));
-        assert_eq!(background_from(None, Some(&b), Some(&a), true, false, None), BackgroundFrom::Picked(&b), "a workspace pick beats the session's");
-        assert_eq!(background_from(None, None, Some(&b), true, false, None), BackgroundFrom::Picked(&b), "a live pick beats --bg");
-        assert_eq!(background_from(None, None, None, true, false, Some(&b)), BackgroundFrom::CommandLine, "--bg beats a saved pick");
-        assert_eq!(background_from(None, None, None, false, false, Some(&b)), BackgroundFrom::Picked(&b));
-        assert_eq!(background_from(None, None, None, false, true, Some(&b)), BackgroundFrom::Config(None), "tileide.background wins over a saved pick");
+        assert_eq!(background_from(Some("/w.png"), Some(&a), Some(&a), true, Some(&a)), BackgroundFrom::Config(Some("/w.png")));
+        assert_eq!(background_from(None, Some(&b), Some(&a), true, None), BackgroundFrom::Picked(&b), "a workspace pick beats the session's");
+        assert_eq!(background_from(None, None, Some(&b), true, None), BackgroundFrom::Picked(&b), "a live pick beats --bg");
+        assert_eq!(background_from(None, None, None, true, Some(&b)), BackgroundFrom::CommandLine, "--bg beats a saved pick");
+        assert_eq!(background_from(None, None, None, false, Some(&b)), BackgroundFrom::Picked(&b), "a saved pick beats tileide.background");
+        assert_eq!(background_from(None, None, None, false, None), BackgroundFrom::Config(None));
+
+        let mut config = tileide_config::Config::default();
+        let state = tileide_config::State { background: Some(b.clone()), background_over: Some(a.clone()), ..Default::default() };
+        assert_eq!(saved_background(&state, &config), Some(&b), "no tileide.background: the pick");
+        config.background_set = true;
+        assert_eq!(saved_background(&state, &config), Some(&b), "picked over this very config");
+        config.background.dim = 30;
+        assert_eq!(saved_background(&state, &config), None, "tileide.background edited since");
     }
 
     #[test]

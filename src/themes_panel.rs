@@ -58,7 +58,8 @@ pub struct Snapshot {
     pub note: Option<String>,
     /// Sidebar and tiles as they are now (the theme's look until the user moves a slider).
     pub surfaces: Surfaces,
-    /// TileIDE draws the background, so it can blur it under the sidebar and tiles.
+    /// Full-screen over a background TileIDE draws or a wallpaper it found, so it can
+    /// blur under the sidebar and tiles.
     pub can_blur: bool,
     /// Surface keys `tileide.lua` sets (their sliders are locked).
     pub locked: Vec<&'static str>,
@@ -213,7 +214,7 @@ impl ThemesPanel {
         content.append(&row);
         let (tile_b, row) = slider("Blur", 0.0, max.1, 1.0, " px");
         content.append(&row);
-        let blur_note = gtk::Label::new(Some("Blur shows over a background TileIDE draws: full-screen with Image, Gradient or Solid. Over the desktop (See-through, or windowed) blur comes from your compositor, e.g. Hyprland's decoration:blur."));
+        let blur_note = gtk::Label::new(Some("Blur works full-screen: over Image, Gradient or Solid, and over See-through too, where TileIDE blurs your desktop's wallpaper (omarchy, swww, hyprpaper or swaybg) under the tiles. Windowed, blur comes from your compositor, e.g. Hyprland's decoration:blur."));
         blur_note.add_css_class("note");
         blur_note.set_wrap(true);
         blur_note.set_xalign(0.0);
@@ -602,6 +603,7 @@ pub fn flow_row(children: &[&gtk::Widget]) -> gtk::FlowBox {
 fn slider(name: &str, min: f64, max: f64, step: f64, unit: &'static str) -> (gtk::Scale, gtk::Box) {
     let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
     crate::settings_ui::ignore_wheel(&scale);
+    crate::settings_ui::see_through_while_dragged(&scale);
     scale.set_hexpand(true);
     scale.set_draw_value(false);
     let value = label("");

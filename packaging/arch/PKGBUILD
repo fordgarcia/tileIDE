@@ -5,7 +5,7 @@
 # An AUR package would instead fetch a tagged release from the repository.
 
 pkgname=tileide
-pkgver=0.6.0alpha4
+pkgver=0.6.0alpha7
 pkgrel=1
 pkgdesc="A tiling, riceable code editor for Hyprland"
 arch=('x86_64' 'aarch64')
@@ -20,6 +20,7 @@ optdepends=('otf-space-grotesk: the intended UI font (AUR; falls back to the def
             'libpulse: pactl and parec, for the audio visualizer (PipeWire users: pipewire-pulse)'
             'gdb: debugging C, C++ and Rust (F5)'
             'python-debugpy: debugging Python (F5)'
+            'vscode-js-debug-bin: debugging JavaScript and TypeScript (F5; AUR)'
             'python-ipykernel: Jupyter notebooks (.ipynb)'
             'python-jupyter-client: Jupyter notebooks (.ipynb)')
 # !lto: makepkg's -flto turns the vendored Luau (C++) into GCC LTO bitcode, which

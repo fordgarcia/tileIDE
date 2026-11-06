@@ -112,7 +112,7 @@ pub fn load_theme(path: &Path) -> Result<(Theme, Vec<String>), String> {
             }
             t.finish(&mut glass_warnings);
         }
-        Ok(Theme { name: f.string("name")?.unwrap_or(stem), dark: mode == "dark", surface, tile, text, muted, accent, on_accent, error, strip: [surface, mid, accent], glass, ansi, code })
+        Ok(Theme { name: f.string("name")?.unwrap_or(stem), dark: mode == "dark", surface, tile, text, muted, accent, on_accent, error, strip: [surface, mid, accent], glass, ansi, code, match_syntax: false })
     })?;
     warnings.append(&mut glass_warnings);
     Ok((theme, warnings))
@@ -192,6 +192,9 @@ pub struct State {
     pub recent_folders: Vec<String>,
     /// The background picker's choice for every workspace.
     pub background: Option<model::Background>,
+    /// `tileide.background` when that choice was made: once the config's differs (it
+    /// was edited since), the config wins again.
+    pub background_over: Option<model::Background>,
     /// Themes section picks for one workspace, by number.
     pub workspaces: BTreeMap<u8, WorkspacePick>,
     /// Extensions section choices, by extension id.
@@ -244,6 +247,7 @@ pub fn load_state(path: &Path) -> Result<State, String> {
     data_table(path, "state", |f| {
         let mut state = State { theme: f.string("theme")?, recent_folders: f.strings("recent_folders")?.unwrap_or_default(), ..State::default() };
         state.background = f.table("background")?.map(|mut b| state_background(&mut b)).transpose()?;
+        state.background_over = f.table("background_over")?.map(|mut b| state_background(&mut b)).transpose()?;
         if let Some(mut list) = f.table("workspaces")? {
             for key in list.keys() {
                 let Ok(n) = key.parse::<u8>() else { continue };
@@ -301,6 +305,9 @@ pub fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
     }
     if let Some(bg) = &state.background {
         text += &format!("  background = {},\n", background_lua(bg));
+    }
+    if let Some(bg) = &state.background_over {
+        text += &format!("  background_over = {},\n", background_lua(bg));
     }
     let picks: Vec<String> = state
         .workspaces

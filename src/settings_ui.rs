@@ -123,6 +123,7 @@ const SECTIONS: &[(&str, &[Spec])] = &[
             ("editor.auto_close", "Close brackets and quotes", "Typing ( [ { \" ' adds the closing one; typing it again steps over", "auto pair autoclose brackets parentheses quotes complete"),
             ("editor.match_brackets", "Highlight matching brackets", "The bracket that pairs with the one at the cursor", "bracket match highlight parentheses pair"),
             ("editor.format_on_save", "Format on save", "Saving sorts the imports and formats the file first (Python: Ruff)", "format save ruff black organize sort imports isort tidy"),
+            ("editor.theme_syntax", "Code colours from the theme", "Keywords, types, strings … in the theme's accent and its neighbouring hues (themes from the theme editor too); off: the terminal's colours", "syntax highlighting code colours theme accent palette match"),
             ("editor.inlay_hints", "Inlay hints", "Inferred types and parameter names at the end of the line (basedpyright, clangd, rust-analyzer; pyright has none)", "inlay hints types inferred parameter names annotations"),
         ],
     ),
@@ -494,12 +495,18 @@ impl SettingsCard {
         });
         self.root.add_controller(keys);
 
-        // Only clicks outside the card reach this.
+        // Only clicks outside the card close it: pressed and released there. A slider
+        // dragged out of the card is released outside but was pressed inside.
         let click = gtk::GestureClick::new();
+        let pressed_outside = Rc::new(Cell::new(false));
+        let (weak, outside) = (Rc::downgrade(self), pressed_outside.clone());
+        click.connect_pressed(move |_, _, x, y| {
+            outside.set(weak.upgrade().is_some_and(|v| v.root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == v.root)));
+        });
         let weak = Rc::downgrade(self);
         click.connect_released(move |gesture, _, x, y| {
             let Some(v) = weak.upgrade() else { return };
-            if v.root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == v.root) {
+            if pressed_outside.replace(false) && v.root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == v.root) {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 v.close();
             }
@@ -719,6 +726,30 @@ impl SettingsCard {
     }
 }
 
+/// While a slider in Settings is dragged, the whole card fades out so the change can be
+/// seen on the tiles behind it; it comes back on release. A plain click doesn't hide it.
+pub fn see_through_while_dragged(scale: &gtk::Scale) {
+    const MOVED: f64 = 4.0;
+    let drag = gtk::GestureDrag::new();
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let settings = |w: &gtk::Widget| std::iter::successors(w.parent(), gtk::Widget::parent).find(|p| p.has_css_class("settings"));
+    drag.connect_drag_update(move |g, dx, dy| {
+        if dx.hypot(dy) > MOVED
+            && let Some(root) = g.widget().as_ref().and_then(settings)
+        {
+            root.set_opacity(0.0);
+        }
+    });
+    let show = move |g: &gtk::GestureDrag| {
+        if let Some(root) = g.widget().as_ref().and_then(settings).filter(|r| r.opacity() == 0.0) {
+            root.set_opacity(1.0);
+        }
+    };
+    drag.connect_drag_end(move |g, _, _| show(g));
+    drag.connect_cancel(move |g, _| show(g));
+    scale.add_controller(drag);
+}
+
 /// Removes GtkRange's wheel handler, so the wheel over a slider scrolls the page
 /// instead of changing the value; dragging, clicks and keys still work.
 pub fn ignore_wheel(scale: &gtk::Scale) {
@@ -776,6 +807,7 @@ fn build_item(key: &'static str, title: &str, subtitle: &str, section: usize) ->
         Some(Kind::Number(min, max)) => {
             let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step(key));
             ignore_wheel(&scale);
+            see_through_while_dragged(&scale);
             scale.set_draw_value(false);
             scale.set_size_request(180, -1);
             scale.set_valign(gtk::Align::Center);

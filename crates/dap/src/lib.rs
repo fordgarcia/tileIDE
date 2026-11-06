@@ -5,10 +5,11 @@
 //! the spike 7 client (gdb's own DAP, 10/10 runs). TileIDE installs nothing: a missing
 //! adapter says what to install.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -28,6 +29,8 @@ pub struct Plan {
     /// The `launch` request's arguments.
     pub launch: Value,
     pub cwd: PathBuf,
+    /// The adapter listens on a port it prints (`Session::serve`), not on stdio.
+    pub listens: bool,
 }
 
 /// What `plan` may ask about this machine (closures, so tests can fake it).
@@ -42,6 +45,23 @@ pub struct Host<'a> {
     pub bridge: PathBuf,
     /// The workspace folder (a Cargo project is looked for up to it).
     pub folder: Option<PathBuf>,
+    /// A Node.js that runs here (a mise shim may not, outside a project).
+    pub node: Option<PathBuf>,
+    /// js-debug's `dapDebugServer.js` (`js_debug`).
+    pub js_debug: Option<PathBuf>,
+}
+
+/// js-debug's DAP server: the Arch package's (`vscode-js-debug-bin`), one behind a
+/// `js-debug-dap` on PATH, or a release unpacked into `~/.local/share/js-debug`.
+pub fn js_debug(home: Option<&Path>) -> Option<PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).find_map(|d| std::fs::canonicalize(d.join("js-debug-dap")).ok()));
+    let mut candidates = vec![PathBuf::from("/usr/lib/js-debug/dapDebugServer.js")];
+    candidates.extend(on_path);
+    if let Some(home) = home {
+        let share = home.join(".local/share/js-debug");
+        candidates.extend([share.join("src/dapDebugServer.js"), share.join("js-debug/src/dapDebugServer.js"), share.join("dapDebugServer.js")]);
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// The debug adapter for `file`: gdb (≥ 14, `gdb -i dap`) for C, C++ and Rust (a
@@ -60,6 +80,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
         build,
         launch: json!({ "program": path(program), "cwd": path(cwd), "stopAtBeginningOfMainSubprogram": false }),
         cwd: cwd.to_path_buf(),
+        listens: false,
     };
     let native = |compiler: &str, args: &[&str]| -> Result<Plan, String> {
         if !found("gdb") {
@@ -101,6 +122,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
                 build: Vec::new(),
                 launch: json!({ "program": path(file), "cwd": path(&cwd), "console": "internalConsole", "justMyCode": true, "redirectOutput": true }),
                 cwd,
+                listens: false,
             })
         }
         "java" => {
@@ -121,10 +143,29 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
                 build: vec![build],
                 launch: json!({ "mainClass": class, "classPath": path(&classes), "sourceRoot": path(&root), "cwd": path(&cwd) }),
                 cwd,
+                listens: false,
+            })
+        }
+        // TypeScript runs as Node runs it (type stripping, Node ≥ 22.6), or through
+        // source maps when a launch config points at compiled JavaScript.
+        "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => {
+            let Some(node) = &host.node else {
+                return Err("Node.js is not installed. Install it with: sudo pacman -S nodejs".into());
+            };
+            let Some(server) = &host.js_debug else {
+                return Err("js-debug is not installed. Install it with: yay -S vscode-js-debug-bin (AUR)".into());
+            };
+            Ok(Plan {
+                adapter: "js-debug".into(),
+                cmd: vec![path(node), path(server), "0".into(), "127.0.0.1".into()],
+                build: Vec::new(),
+                launch: json!({ "type": "pwa-node", "name": stem, "program": path(file), "cwd": path(&cwd), "runtimeExecutable": path(node), "console": "internalConsole", "outputCapture": "std", "skipFiles": ["<node_internals>/**"] }),
+                cwd,
+                listens: true,
             })
         }
         "" => Err("This file has no extension, so TileIDE can't pick a debugger.".into()),
-        other => Err(format!("No debugger for .{other} files yet (C, C++, Rust with gdb; Python with debugpy; Java with jdb).")),
+        other => Err(format!("No debugger for .{other} files yet (C, C++, Rust with gdb; Python with debugpy; Java with jdb; JavaScript and TypeScript with js-debug).")),
     }
 }
 
@@ -148,12 +189,13 @@ pub fn plan_launch(launch: &tileide_core::launch::Resolved, out_dir: &Path, host
                     build: Vec::new(),
                     launch: json!({ "program": program.to_string_lossy(), "cwd": cwd.to_string_lossy(), "stopAtBeginningOfMainSubprogram": false }),
                     cwd,
+                    listens: false,
                 }
             }
             other => other?,
         }
     };
-    // gdb (≥ 15), debugpy and the jdb bridge all read `args`, `env` (an object) and `cwd`.
+    // gdb (≥ 15), debugpy, the jdb bridge and js-debug all read `args`, `env` (an object) and `cwd`.
     plan.launch["args"] = json!(launch.args);
     if !launch.env.is_empty() {
         plan.launch["env"] = Value::Object(launch.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
@@ -210,8 +252,7 @@ pub enum Incoming {
 pub struct Session {
     /// The adapter TileIDE started, or the socket to one it attached to.
     end: End,
-    stdin: Arc<Mutex<Box<dyn Write + Send>>>,
-    seq: i64,
+    shared: Arc<Shared>,
 }
 
 enum End {
@@ -221,70 +262,151 @@ enum End {
 
 type Input = Mutex<Box<dyn Write + Send>>;
 
+/// What the connections' readers share.
+struct Shared {
+    /// Where requests go: the adapter's connection, then each child session it asked
+    /// for (js-debug's `startDebugging`, one per Node process); the newest gets them.
+    route: Mutex<Vec<Arc<Input>>>,
+    seq: AtomicI64,
+    deliver: Box<dyn Fn(Incoming) + Send + Sync>,
+    /// A listening adapter's address, where child sessions connect.
+    address: Option<String>,
+}
+
 fn write(stdin: &Input, message: &Value) -> Result<(), String> {
     let mut stdin = stdin.lock().map_err(|_| "adapter stdin poisoned".to_string())?;
     stdin.write_all(&encode(message)).and_then(|()| stdin.flush()).map_err(|e| format!("write failed: {e}"))
 }
 
+/// Sends a request on one connection; returns its `seq` (unique across connections).
+fn send(shared: &Shared, to: &Input, command: &str, arguments: Value) -> Result<i64, String> {
+    let seq = shared.seq.fetch_add(1, Ordering::SeqCst) + 1;
+    write(to, &json!({ "seq": seq, "type": "request", "command": command, "arguments": arguments }))?;
+    Ok(seq)
+}
+
+/// Starts `cmd` in `cwd`, ending with TileIDE (and the debuggee with it).
+fn spawn(cmd: &[String], cwd: &Path) -> Result<Child, String> {
+    let (program, args) = cmd.split_first().ok_or("empty adapter command")?;
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    command.spawn().map_err(|e| format!("cannot start {program}: {e}"))
+}
+
+/// Reads messages from `output` on a thread. Only the first connection's end is
+/// `Exited`. `then`: a child session's `initialize` seq and the request (`launch` or
+/// `attach`) sent once it's answered; the child gets the client's requests from then on.
+fn read(shared: Arc<Shared>, input: Arc<Input>, output: impl Read + Send + 'static, first: bool, mut then: Option<(i64, String, Value)>) {
+    std::thread::spawn(move || {
+        let mut output = BufReader::new(output);
+        while let Ok(Some(message)) = read_message(&mut output) {
+            if message["type"] == "request" {
+                // Reverse requests other than `startDebugging` (`runInTerminal`) are refused.
+                let started = message["command"] == "startDebugging" && start_child(&shared, &message["arguments"]).is_ok();
+                let reason = if started { "" } else { "not supported by TileIDE" };
+                let reply = json!({ "seq": 0, "type": "response", "request_seq": message["seq"], "command": message["command"], "success": started, "message": reason });
+                let _ = write(&input, &reply);
+                continue;
+            }
+            if let Some((_, command, arguments)) = then.take_if(|(seq, ..)| message["type"] == "response" && message["request_seq"] == *seq) {
+                if let Ok(mut route) = shared.route.lock() {
+                    route.push(input.clone());
+                }
+                let _ = send(&shared, &input, &command, arguments);
+                continue;
+            }
+            (shared.deliver)(Incoming::Message(message));
+        }
+        if first {
+            (shared.deliver)(Incoming::Exited);
+        }
+    });
+}
+
+/// A child session (js-debug): a new connection to the adapter, initialized, then
+/// given the configuration the adapter asked for.
+fn start_child(shared: &Arc<Shared>, arguments: &Value) -> Result<(), String> {
+    let address = shared.address.as_deref().ok_or("not a listening adapter")?;
+    let socket = TcpStream::connect(address).map_err(|e| e.to_string())?;
+    let input: Arc<Input> = Arc::new(Mutex::new(Box::new(socket.try_clone().map_err(|e| e.to_string())?)));
+    let command = arguments["request"].as_str().unwrap_or("launch").to_string();
+    let seq = send(shared, &input, "initialize", initialize_args())?;
+    read(shared.clone(), input, socket, false, Some((seq, command, arguments["configuration"].clone())));
+    Ok(())
+}
+
 impl Session {
     /// Starts the adapter; messages arrive through `deliver` on a reader thread.
-    /// Reverse requests the client doesn't support (`runInTerminal`) are refused here.
-    pub fn start(cmd: &[String], cwd: &Path, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Session, String> {
-        let (program, args) = cmd.split_first().ok_or("empty adapter command")?;
-        let mut command = Command::new(program);
-        command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        // The adapter (and with it the debuggee) ends with TileIDE.
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().map_err(|e| format!("cannot start {program}: {e}"))?;
+    pub fn start(cmd: &[String], cwd: &Path, deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
+        let mut child = spawn(cmd, cwd)?;
         let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().ok_or("no stdin")?);
         let stdout = child.stdout.take().ok_or("no stdout")?;
-        let stdin = Self::read(stdin, stdout, deliver);
-        Ok(Session { end: End::Child(Arc::new(Mutex::new(child))), stdin, seq: 0 })
+        let shared = Self::read_first(stdin, stdout, deliver, None);
+        Ok(Session { end: End::Child(Arc::new(Mutex::new(child))), shared })
+    }
+
+    /// Starts an adapter that listens on a port it prints ("… listening at HOST:PORT",
+    /// js-debug's `dapDebugServer.js 0 127.0.0.1`) and connects to it.
+    pub fn serve(cmd: &[String], cwd: &Path, deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
+        let mut child = spawn(cmd, cwd)?;
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        // The adapter writes on: its stdout stays read until it ends.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let address = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(line) => match line.trim().rsplit(' ').next().filter(|a| a.parse::<std::net::SocketAddr>().is_ok()) {
+                    Some(address) => break address.to_string(),
+                    None => continue,
+                },
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{} didn't say where it listens", cmd.join(" ")));
+                }
+            }
+        };
+        let socket = TcpStream::connect(&address).map_err(|e| format!("cannot reach the debugger at {address}: {e}"))?;
+        let input = Box::new(socket.try_clone().map_err(|e| e.to_string())?);
+        let shared = Self::read_first(input, socket, deliver, Some(address));
+        Ok(Session { end: End::Child(Arc::new(Mutex::new(child))), shared })
     }
 
     /// Connects to an adapter listening on `address` (debugpy in a Jupyter kernel).
     /// `stop` then detaches and leaves the debuggee running.
-    pub fn connect(address: &str, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Session, String> {
+    pub fn connect(address: &str, deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
         let socket = TcpStream::connect(address).map_err(|e| format!("cannot reach the debugger at {address}: {e}"))?;
         let clone = |s: &TcpStream| s.try_clone().map_err(|e| e.to_string());
-        let stdin = Self::read(Box::new(clone(&socket)?), clone(&socket)?, deliver);
-        Ok(Session { end: End::Socket(socket), stdin, seq: 0 })
+        let shared = Self::read_first(Box::new(clone(&socket)?), clone(&socket)?, deliver, None);
+        Ok(Session { end: End::Socket(socket), shared })
     }
 
-    /// Reads messages from `output` on a thread; gives back the input end.
-    fn read(input: Box<dyn Write + Send>, output: impl Read + Send + 'static, deliver: impl Fn(Incoming) + Send + 'static) -> Arc<Input> {
-        let stdin = Arc::new(Mutex::new(input));
-        let mut stdout = BufReader::new(output);
-        let replies = stdin.clone();
-        std::thread::spawn(move || {
-            while let Ok(Some(message)) = read_message(&mut stdout) {
-                if message["type"] == "request" {
-                    let refuse = json!({ "seq": 0, "type": "response", "request_seq": message["seq"], "command": message["command"], "success": false, "message": "not supported by TileIDE" });
-                    let _ = write(&replies, &refuse);
-                    continue;
-                }
-                deliver(Incoming::Message(message));
-            }
-            deliver(Incoming::Exited);
-        });
-        stdin
+    fn read_first(input: Box<dyn Write + Send>, output: impl Read + Send + 'static, deliver: impl Fn(Incoming) + Send + Sync + 'static, address: Option<String>) -> Arc<Shared> {
+        let input = Arc::new(Mutex::new(input));
+        let shared = Arc::new(Shared { route: Mutex::new(vec![input.clone()]), seq: AtomicI64::new(0), deliver: Box::new(deliver), address });
+        read(shared.clone(), input, output, true, None);
+        shared
     }
 
     /// Sends a request; returns its `seq` (the response arrives through `deliver`).
     pub fn request(&mut self, command: &str, arguments: Value) -> Result<i64, String> {
-        self.seq += 1;
-        write(&self.stdin, &json!({ "seq": self.seq, "type": "request", "command": command, "arguments": arguments }))?;
-        Ok(self.seq)
+        let to = self.shared.route.lock().ok().and_then(|r| r.last().cloned()).ok_or("no connection")?;
+        send(&self.shared, &to, command, arguments)
     }
 
-    /// `disconnect` (ending the debuggee), then a kill if the adapter lingers. Over a
-    /// socket: detaches, and the debuggee runs on.
+    /// `disconnect` (ending the debuggee) on every connection, newest first, then a
+    /// kill if the adapter lingers. Over a socket: detaches, and the debuggee runs on.
     pub fn stop(mut self) {
         let child = match &self.end {
             End::Child(child) => child.clone(),
@@ -301,7 +423,10 @@ impl Session {
                 return;
             }
         };
-        let _ = self.request("disconnect", json!({ "terminateDebuggee": true }));
+        let route = self.shared.route.lock().map(|r| r.clone()).unwrap_or_default();
+        for to in route.iter().rev() {
+            let _ = send(&self.shared, to, "disconnect", json!({ "terminateDebuggee": true }));
+        }
         std::thread::spawn(move || {
             for _ in 0..40 {
                 if child.lock().map(|mut c| c.try_wait().ok().flatten().is_some()).unwrap_or(true) {
@@ -328,7 +453,7 @@ mod tests {
     use std::time::Duration;
 
     fn host<'a>(found: &'a dyn Fn(&str) -> bool, python_has: &'a dyn Fn(&Path, &str) -> bool) -> Host<'a> {
-        Host { found, pythons: vec![PathBuf::from("/w/.venv/bin/python"), PathBuf::from("python3")], python_has, bridge: PathBuf::from("/usr/bin/tileide"), folder: None }
+        Host { found, pythons: vec![PathBuf::from("/w/.venv/bin/python"), PathBuf::from("python3")], python_has, bridge: PathBuf::from("/usr/bin/tileide"), folder: None, node: Some(PathBuf::from("/usr/bin/node")), js_debug: Some(PathBuf::from("/usr/lib/js-debug/dapDebugServer.js")) }
     }
 
     #[test]
@@ -346,7 +471,13 @@ mod tests {
         assert_eq!(plan(Path::new("/w/a.py"), Path::new("/o"), &host(&all, &system_only)).unwrap().cmd[0], "python3");
         assert!(plan(Path::new("/w/a.py"), Path::new("/o"), &host(&all, &|_, _| false)).unwrap_err().contains("debugpy"));
         assert!(plan(Path::new("/w/m.c"), Path::new("/o"), &host(&|p| p != "gdb", &any)).unwrap_err().contains("pacman -S gdb"));
-        assert!(plan(Path::new("/w/a.js"), Path::new("/o"), &host(&all, &any)).unwrap_err().contains(".js"));
+        assert!(plan(Path::new("/w/a.go"), Path::new("/o"), &host(&all, &any)).unwrap_err().contains(".go"));
+        let js = plan(Path::new("/w/a.ts"), Path::new("/o"), &host(&all, &any)).unwrap();
+        assert_eq!((js.adapter.as_str(), js.listens), ("js-debug", true));
+        assert_eq!(js.cmd, ["/usr/bin/node", "/usr/lib/js-debug/dapDebugServer.js", "0", "127.0.0.1"]);
+        assert_eq!((js.launch["program"].as_str(), js.launch["runtimeExecutable"].as_str()), (Some("/w/a.ts"), Some("/usr/bin/node")));
+        let no_js_debug = Host { js_debug: None, ..host(&all, &any) };
+        assert!(plan(Path::new("/w/a.js"), Path::new("/o"), &no_js_debug).unwrap_err().contains("vscode-js-debug"));
         let java = plan(Path::new("/w/Main.java"), Path::new("/o"), &host(&all, &any)).unwrap();
         assert_eq!(java.cmd, ["/usr/bin/tileide", "dap-jdb"]);
         assert_eq!((java.launch["mainClass"].as_str(), java.launch["classPath"].as_str()), (Some("Main"), Some("/o/Main-classes")));
@@ -366,7 +497,7 @@ mod tests {
         // Writes its argument and $K into out.txt, in its working folder.
         std::fs::write(&src, "#include <stdio.h>\n#include <stdlib.h>\nint main(int c, char **v) {\n  FILE *f = fopen(\"out.txt\", \"w\");\n  fprintf(f, \"%s|%s\", c > 1 ? v[1] : \"\", getenv(\"K\"));\n  return fclose(f);\n}\n").unwrap();
         let launch = tileide_core::launch::Resolved { name: "t".into(), program: src.clone(), args: vec!["a b".into()], env: vec![("K".into(), "v".into())], cwd: Some(dir.join("run")) };
-        let p = plan_launch(&launch, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None }).unwrap();
+        let p = plan_launch(&launch, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None, node: None, js_debug: None }).unwrap();
         assert!(Command::new(&p.build[0][0]).args(&p.build[0][1..]).status().unwrap().success());
         let (tx, rx) = std::sync::mpsc::channel();
         let mut s = Session::start(&p.cmd, &p.cwd, move |m| {
@@ -421,7 +552,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("t.c");
         std::fs::write(&src, "#include <stdio.h>\nint main(void) {\n  int a = 41;\n  a += 1;\n  printf(\"%d\\n\", a);\n  return 0;\n}\n").unwrap();
-        let p = plan(&src, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None }).unwrap();
+        let p = plan(&src, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None, node: None, js_debug: None }).unwrap();
         let status = Command::new(&p.build[0][0]).args(&p.build[0][1..]).status().unwrap();
         assert!(status.success());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -449,6 +580,65 @@ mod tests {
         let stack = s.request("stackTrace", json!({ "threadId": stopped["body"]["threadId"] })).unwrap();
         let stack = next(&|m| m["request_seq"] == stack);
         assert_eq!(stack["body"]["stackFrames"][0]["line"], 4);
+        s.stop();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// js-debug end to end on a TypeScript file (Node strips the types): the child
+    /// session it starts gets the breakpoint and stops. Skipped without node or
+    /// js-debug (`TILEIDE_TEST_JS_DEBUG` may point at an unpacked `dapDebugServer.js`).
+    #[test]
+    fn js_debug_stops_at_a_breakpoint_in_typescript() {
+        let server = std::env::var_os("TILEIDE_TEST_JS_DEBUG").map(PathBuf::from).or_else(|| js_debug(std::env::var_os("HOME").map(PathBuf::from).as_deref()));
+        let node_runs = Command::new("node").arg("--version").stdout(Stdio::null()).status().is_ok_and(|s| s.success());
+        let Some(server) = server.filter(|_| node_runs) else {
+            eprintln!("node or js-debug missing: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("tileide-dap-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("t.ts");
+        std::fs::write(&src, "function add(a: number, b: number): number {\n  const sum: number = a + b;\n  return sum;\n}\nconsole.log(add(40, 2));\n").unwrap();
+        let on = tileide_core::run::on_path;
+        let host = Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None, node: Some(PathBuf::from("node")), js_debug: Some(server) };
+        let p = plan(&src, &dir, &host).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut s = Session::serve(&p.cmd, &p.cwd, move |m| {
+            let _ = tx.send(m);
+        })
+        .unwrap();
+        let next = |pred: &dyn Fn(&Value) -> bool| loop {
+            match rx.recv_timeout(Duration::from_secs(20)).expect("adapter message") {
+                Incoming::Message(m) if pred(&m) => return m,
+                Incoming::Message(_) => {}
+                Incoming::Exited => panic!("adapter exited"),
+            }
+        };
+        let init = s.request("initialize", initialize_args()).unwrap();
+        next(&|m| m["request_seq"] == init);
+        s.request("launch", p.launch.clone()).unwrap();
+        // The parent session, then the child session for the Node process: each is
+        // configured as the app does it.
+        for _ in 0..2 {
+            next(&|m| m["event"] == "initialized");
+            let bp = s.request("setBreakpoints", json!({ "source": { "path": src }, "breakpoints": [{ "line": 3 }] })).unwrap();
+            next(&|m| m["request_seq"] == bp);
+            s.request("configurationDone", json!({})).unwrap();
+        }
+        let stopped = next(&|m| m["event"] == "stopped");
+        let stack = s.request("stackTrace", json!({ "threadId": stopped["body"]["threadId"] })).unwrap();
+        let stack = next(&|m| m["request_seq"] == stack);
+        assert_eq!(stack["body"]["stackFrames"][0]["line"], 3);
+        assert!(stack["body"]["stackFrames"][0]["source"]["path"].as_str().is_some_and(|p| p.ends_with("t.ts")));
+        let frame = stack["body"]["stackFrames"][0]["id"].clone();
+        let scopes = s.request("scopes", json!({ "frameId": frame })).unwrap();
+        let scopes = next(&|m| m["request_seq"] == scopes);
+        let locals = s.request("variables", json!({ "variablesReference": scopes["body"]["scopes"][0]["variablesReference"] })).unwrap();
+        let locals = next(&|m| m["request_seq"] == locals);
+        assert!(locals["body"]["variables"].as_array().unwrap().iter().any(|v| v["name"] == "sum" && v["value"] == "42"));
+        let cont = s.request("continue", json!({ "threadId": stopped["body"]["threadId"] })).unwrap();
+        next(&|m| m["request_seq"] == cont);
+        next(&|m| m["event"] == "output" && m["body"]["output"].as_str().is_some_and(|o| o.contains("42")));
         s.stop();
         let _ = std::fs::remove_dir_all(dir);
     }
