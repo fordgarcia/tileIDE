@@ -56,6 +56,8 @@ pub struct Editor {
     pub match_brackets: bool,
     /// Saving organizes imports and formats the file first (when its language server can).
     pub format_on_save: bool,
+    /// Edited files and notebooks write themselves a moment after the typing stops.
+    pub auto_save: bool,
     /// Inferred types and parameter names at the end of each line (servers that offer
     /// them: basedpyright, clangd, rust-analyzer, TypeScript).
     pub inlay_hints: bool,
@@ -310,7 +312,7 @@ impl Default for Config {
             background_set: false,
             tiling: Tiling { layout: LayoutKind::Dwindle, gaps_in: 10, gaps_out: 16, column_width: 0.5, max_tiles: tileide_core::token::MAX_TILES, peek: tileide_core::token::PEEK },
             alerts: Alerts { missing_tools: true, tile_limit: true },
-            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false, inlay_hints: false, theme_syntax: true },
+            editor: Editor { auto_close: true, match_brackets: false, format_on_save: false, auto_save: true, inlay_hints: false, theme_syntax: true },
             binds: Vec::new(),
             workspaces: BTreeMap::new(),
             lsp: BTreeMap::new(),

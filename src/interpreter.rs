@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk4::glib;
-use tileide_core::python;
+use tileide_core::{python, toolchain};
 use tileide_notebook::kernel::{self, Spec};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,4 +235,56 @@ pub fn test(file: &Path, folder: Option<&Path>, pick: Option<usize>) {
             apply(row, &file, folder.as_deref());
         }
     });
+}
+
+/// `Alt+P` in a JavaScript, TypeScript, Java or Go file: the installs of its tool
+/// found here, to pin for the workspace (or none: the project's own, from mise,
+/// `.tool-versions` or PATH). Run, debugging and language servers use the pin.
+pub fn pick_toolchain(view: &sourceview5::View, file: &Path, folder: Option<&Path>, tool: &'static toolchain::Tool) {
+    let (scope, rows) = toolchain_rows(file, folder, tool);
+    let texts: Vec<String> = rows.iter().map(|(text, _)| text.clone()).collect();
+    crate::pick_card::show(view, &format!("{} for this workspace", tool.label), &texts, move |i| pin(&scope, tool, rows[i].1.as_deref()));
+}
+
+/// Where a pin applies (the workspace folder, else the file's), and the rows.
+fn toolchain_rows(file: &Path, folder: Option<&Path>, tool: &toolchain::Tool) -> (PathBuf, Vec<(String, Option<PathBuf>)>) {
+    let scope = folder.map(Path::to_path_buf).or_else(|| file.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("/"));
+    let pinned = toolchain::pinned(&scope, tool.name);
+    let mark = |on: bool| if on { "●" } else { "○" };
+    let mut rows = vec![(format!("{} The project's own (mise, .tool-versions or PATH)", mark(pinned.is_none())), None)];
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    rows.extend(toolchain::installs(tool, home.as_deref()).into_iter().map(|i| (format!("{} {}", mark(pinned.as_ref() == Some(&i.dir)), i.label), Some(i.dir))));
+    (scope, rows)
+}
+
+fn pin(scope: &Path, tool: &toolchain::Tool, install: Option<&Path>) {
+    let message = match toolchain::pin(scope, tool.name, install) {
+        Ok(()) => {
+            crate::lsp::toolchain_changed(scope);
+            match install {
+                Some(dir) => format!("{} pinned for {}: {}", tool.label, scope.display(), dir.display()),
+                None => format!("{} for {}: the project's own", tool.label, scope.display()),
+            }
+        }
+        Err(e) => format!("Couldn't keep the pin: {e}"),
+    };
+    println!("toolchain: {message}");
+    if let Some(h) = hooks() {
+        (h.notice)(message);
+    }
+}
+
+/// Test action `toolchains[:N]`: prints the rows for `file`, then picks row N.
+pub fn test_toolchains(file: &Path, folder: Option<&Path>, pick: Option<usize>) {
+    let ext = file.extension().map_or_else(String::new, |e| e.to_string_lossy().into_owned());
+    let Some(tool) = toolchain::tool_for(&ext) else { return };
+    let (scope, rows) = toolchain_rows(file, folder, tool);
+    for (text, _) in &rows {
+        println!("toolchain row: {text}");
+    }
+    if let Some((_, install)) = pick.and_then(|i| rows.get(i)) {
+        pin(&scope, tool, install.as_deref());
+    }
+    let tools = toolchain::env(file.parent().unwrap_or(&scope));
+    println!("toolchain: {} → {:?}", tool.program, tools.find(tool.program));
 }

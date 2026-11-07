@@ -2,7 +2,7 @@
 members = ["crates/core", "crates/config", "crates/lsp", "crates/extensions", "crates/notebook", "crates/dap"]
 
 [workspace.package]
-version = "0.6.0-alpha.7"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"

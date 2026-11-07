@@ -35,16 +35,17 @@ fn write(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<(), String> {
 }
 
 impl Connection {
-    /// Starts `cmd` (program and arguments) in `dir`. `settings` answers the server's
-    /// `workspace/configuration` requests.
-    pub fn spawn(cmd: &[String], dir: &std::path::Path, settings: Value, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Connection, String> {
+    /// Starts `cmd` (program and arguments) in `dir` with `env` (the project's
+    /// toolchains). `settings` answers the server's `workspace/configuration` requests.
+    pub fn spawn(cmd: &[String], dir: &std::path::Path, env: &[(String, String)], settings: Value, deliver: impl Fn(Incoming) + Send + 'static) -> Result<Connection, String> {
         let (program, args) = cmd.split_first().ok_or("empty command")?;
         let mut command = Command::new(program);
+        command.envs(env.iter().map(|(k, v)| (k, v)));
         // A server found by full path runs with its folder first on PATH: an npm-installed
         // one (`#!/usr/bin/env node`) then gets the node installed beside it, even when a
         // version manager's shim has no default outside a project.
         if let Some(dir) = std::path::Path::new(program).parent().filter(|d| d.is_absolute()) {
-            let rest = std::env::var_os("PATH").unwrap_or_default();
+            let rest = env.iter().rev().find(|(k, _)| k == "PATH").map_or_else(|| std::env::var_os("PATH").unwrap_or_default(), |(_, v)| v.into());
             if let Ok(path) = std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&rest))) {
                 command.env("PATH", path);
             }

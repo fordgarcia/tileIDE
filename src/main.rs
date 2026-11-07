@@ -917,6 +917,7 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
                     println!("hints: {}", lsp::hint_lines(&buffer).join(" | "));
                 }
             }
+            (Some(app), _) if name == "run-output" => println!("run-output: {}", app.run_card.describe()),
             _ if name == "debug-state" => println!("debug-state: {}", debug::describe()),
             (Some(app), _) if name == "diagnostics" => {
                 if let Some(editor) = app.workspaces.borrow().current().borrow().focused_code() {
@@ -948,6 +949,17 @@ fn build(app: &gtk::Application, options: Options, started: Instant) {
             _ if name == "pick" => {
                 let (query, n) = arg.as_deref().unwrap_or("").split_once('|').map_or((arg.as_deref().unwrap_or(""), None), |(q, n)| (q, n.parse().ok()));
                 println!("pick: {}", pick_card::test(query, n).join(" | "));
+            }
+            // `toolchains[:N]`: the Alt+P rows for the focused JS/TS/Java/Go file, then row N
+            // picked, then where its program resolves.
+            (Some(app), _) if name == "toolchains" => {
+                let folder = {
+                    let w = app.workspaces.borrow();
+                    w.folder(w.active())
+                };
+                if let Some(file) = app.workspaces.borrow().current().borrow().focused_file() {
+                    interpreter::test_toolchains(&file, folder.as_deref(), arg.as_deref().and_then(|n| n.parse().ok()));
+                }
             }
             // `pythons[:N]`: the Python picker's rows for the focused file, then row N picked.
             (Some(app), _) if name == "pythons" => {
@@ -1105,6 +1117,7 @@ impl App {
         editing::configure(config.editor.auto_close, config.editor.match_brackets);
         tile_view::set_limit_alert(config.alerts.tile_limit);
         tile_view::set_format_on_save(config.editor.format_on_save);
+        tile_view::set_auto_save(config.editor.auto_save);
         lsp::set_inlay_hints(config.editor.inlay_hints);
         tileide_core::motion::set_profile(a.motion, a.motion_speed);
         token::set_ui_font(&a.ui_font, a.ui_scale);
@@ -1544,13 +1557,20 @@ impl App {
         };
         let out = glib::user_runtime_dir().join("tileide-run");
         let _ = std::fs::create_dir_all(&out);
+        // The project's toolchains (pins, mise, .tool-versions) find and run the programs.
+        let tools = tileide_core::toolchain::env(file.as_deref().and_then(Path::parent).or(folder.as_deref()).unwrap_or(Path::new("/")));
+        let found = |p: &str| tools.find(p).is_some();
         let plan = match self.picked_launch(file.as_deref(), folder.as_deref()) {
-            Some(Ok(launch)) => tileide_core::run::plan_launch(&launch, folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path),
+            Some(Ok(launch)) => tileide_core::run::plan_launch(&launch, folder.as_deref(), &self.config.borrow().runners, &out, found),
             Some(Err(e)) => Err(e),
-            None => tileide_core::run::plan(file.as_deref(), folder.as_deref(), &self.config.borrow().runners, &out, tileide_core::run::on_path),
+            None => tileide_core::run::plan(file.as_deref(), folder.as_deref(), &self.config.borrow().runners, &out, found),
         };
         match plan {
-            Ok(plan) => self.run_card.run(plan),
+            Ok(mut plan) => {
+                // A launch config's own variables win.
+                plan.env = tools.vars.iter().cloned().chain(plan.env).collect();
+                self.run_card.run(plan)
+            }
             Err(_) if file.is_none() && self.run_card.rerun() => {}
             Err(e) => self.run_card.show_message("Run", &e),
         }
@@ -2256,8 +2276,11 @@ impl App {
                 let (notebook, editor, file) = (view.borrow().focused_notebook(), view.borrow().focused_code(), view.borrow().focused_file());
                 match (notebook, editor, file) {
                     (Some(nb), ..) => nb.pick_kernel(),
-                    (None, Some(editor), Some(file)) => interpreter::pick_for_file(&editor, &file, folder.as_deref()),
-                    _ => self.notice("Open a Python file or a notebook to pick its Python.".into()),
+                    (None, Some(editor), Some(file)) => match tileide_core::toolchain::tool_for(&file.extension().map_or_else(String::new, |e| e.to_string_lossy().into_owned())) {
+                        Some(tool) => interpreter::pick_toolchain(&editor, &file, folder.as_deref(), tool),
+                        None => interpreter::pick_for_file(&editor, &file, folder.as_deref()),
+                    },
+                    _ => self.notice("Open a file or a notebook to pick its Python, Node.js, Java or Go.".into()),
                 }
             }
             Action::Unavailable(_) => {}

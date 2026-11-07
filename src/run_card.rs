@@ -230,6 +230,12 @@ impl RunCard {
         self.show();
     }
 
+    /// Test action `run-output`: the status, the command line and the output.
+    pub fn describe(&self) -> String {
+        let buffer = self.output.buffer();
+        format!("{} · {} · {}", self.status.text(), self.command.text(), buffer.text(&buffer.start_iter(), &buffer.end_iter(), false))
+    }
+
     /// Runs `plan`, replacing whatever ran before.
     pub fn run(self: &Rc<Self>, plan: Plan) {
         self.stop();

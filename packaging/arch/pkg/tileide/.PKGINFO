@@ -3,12 +3,12 @@
 pkgname = tileide
 pkgbase = tileide
 xdata = pkgtype=pkg
-pkgver = 0.6.0alpha7-1
+pkgver = 0.6.2-1
 pkgdesc = A tiling, riceable code editor for Hyprland
 url = https://github.com/fordgarcia/tileIDE
-builddate = 1793974503
+builddate = 1794043846
 packager = Unknown Packager
-size = 6770788
+size = 6978126
 arch = x86_64
 license = GPL-3.0-or-later
 depend = gtk4
@@ -27,6 +27,8 @@ optdepend = git: install extensions from a git URL
 optdepend = python: the example extension
 optdepend = libpulse: pactl and parec, for the audio visualizer (PipeWire users: pipewire-pulse)
 optdepend = gdb: debugging C, C++ and Rust (F5)
+optdepend = maven: running and debugging Java in Maven projects
+optdepend = gradle: running and debugging Java in Gradle projects (without a gradlew)
 optdepend = python-debugpy: debugging Python (F5)
 optdepend = vscode-js-debug-bin: debugging JavaScript and TypeScript (F5; AUR)
 optdepend = python-ipykernel: Jupyter notebooks (.ipynb)

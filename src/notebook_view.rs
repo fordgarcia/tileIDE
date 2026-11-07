@@ -109,6 +109,20 @@ type EvalReply = Box<dyn FnOnce(&NotebookView, Result<String, String>)>;
 /// button for the rest.
 const FOLD_LINES: usize = 60;
 const FOLD_SHOWN: usize = 30;
+/// Past this many lines, "Show all" puts the text in a text view: a label lays out every
+/// line at once, a text view only the ones on screen.
+const LABEL_LINES: usize = 1000;
+/// Text outputs longer than this many characters fold too (a long one-line repr).
+const FOLD_CHARS: usize = 3000;
+/// Past this many characters, "Show all" uses the text view too.
+const LABEL_CHARS: usize = 100_000;
+/// The text view breaks lines longer than this.
+const LONG_LINE: usize = 2000;
+/// Up to this many rows a table output is a grid of labels; past it, a list that only
+/// makes widgets for the rows on screen (a grid of 100k rows froze TileIDE for minutes).
+const GRID_ROWS: usize = 200;
+/// How tall long text and long tables are in a cell (they scroll inside).
+const LONG_HEIGHT: i32 = 420;
 
 /// Which way an arrow key leaves a cell.
 #[derive(Clone, Copy, PartialEq)]
@@ -142,8 +156,13 @@ pub struct NotebookView {
     /// Deleted cells and where they were, newest last (`Z`).
     deleted: RefCell<Vec<(usize, Vec<Cell>)>>,
     dirty: StdCell<bool>,
+    /// `editor.auto_save`: the save waiting for edits to pause.
+    auto_save: crate::tile_view::Debounce,
     kernel: RefCell<Option<Kernel>>,
     events: RefCell<Option<std::sync::mpsc::Receiver<Event>>>,
+    /// Cells whose outputs changed since they were last shown: shown once per poll, not
+    /// once per kernel message (a long-printing loop sends thousands).
+    unshown: RefCell<Vec<u64>>,
     /// Cells sent to the kernel before it was ready.
     waiting: RefCell<Vec<u64>>,
     ready: StdCell<bool>,
@@ -285,8 +304,10 @@ impl NotebookView {
             clipboard: RefCell::new(Vec::new()),
             deleted: RefCell::new(Vec::new()),
             dirty: StdCell::new(false),
+            auto_save: Default::default(),
             kernel: RefCell::new(None),
             events: RefCell::new(None),
+            unshown: RefCell::new(Vec::new()),
             waiting: RefCell::new(Vec::new()),
             ready: StdCell::new(false),
             starting: StdCell::new(false),
@@ -432,6 +453,17 @@ impl NotebookView {
 
     fn mark_dirty(&self) {
         self.dirty.set(true);
+        if crate::tile_view::auto_save_on() {
+            let me = self.me.borrow().clone();
+            self.auto_save.call(crate::tile_view::AUTO_SAVE_DELAY, move || {
+                if let Some(v) = me.upgrade()
+                    && v.dirty.get()
+                    && crate::tile_view::auto_save_on()
+                {
+                    v.save();
+                }
+            });
+        }
     }
 
     pub fn set_theme(&self, theme: Rc<Theme>) {
@@ -623,10 +655,7 @@ impl NotebookView {
                     title.add_css_class("kernel");
                     bar.append(&title);
                     root.append(&bar);
-                    let scroll = gtk::ScrolledWindow::new();
-                    scroll.set_vexpand(true);
-                    scroll.set_child(Some(&table_widget(&table)));
-                    root.append(&scroll);
+                    root.append(&table_widget(table, true));
                     (v.open_panel)(root.upcast());
                 }
                 Err(e) => {
@@ -969,7 +998,7 @@ impl NotebookView {
                 Some(Shown::Text(text)) | Some(Shown::Error(text)) if text.is_empty() => continue,
                 Some(Shown::Text(text)) => folded(text.trim_end_matches('\n')),
                 Some(Shown::Error(text)) => self.error_output(&text).upcast(),
-                Some(Shown::Table(table, _)) => table_widget(&table),
+                Some(Shown::Table(table, _)) => table_widget(table, false),
                 Some(Shown::Image(png)) => match gdk::Texture::from_bytes(&glib::Bytes::from_owned(png)) {
                     Ok(texture) => {
                         let picture = gtk::Picture::for_paintable(&texture);
@@ -1611,6 +1640,35 @@ impl NotebookView {
                     .collect();
                 println!("notebook: {} mode, cells:\n  {}", if self.command.get() { "command" } else { "edit" }, list.join("\n  "));
             }
+            // `unfold:N`: clicks cell N's first "Show all" button.
+            v if v.starts_with("unfold:") => {
+                let n: usize = v["unfold:".len()..].parse().unwrap_or(0);
+                let outputs = self.cells.borrow().get(n).map(|c| c.outputs.clone());
+                let mut stack: Vec<gtk::Widget> = outputs.into_iter().map(|o| o.upcast()).collect();
+                while let Some(w) = stack.pop() {
+                    if let Some(b) = w.downcast_ref::<gtk::Button>().filter(|b| b.has_css_class("fold")) {
+                        b.emit_clicked();
+                        break;
+                    }
+                    let mut child = w.first_child();
+                    while let Some(c) = child {
+                        child = c.next_sibling();
+                        stack.push(c);
+                    }
+                }
+            }
+            // `outputs`: each cell's outputs, as the widgets showing them.
+            "outputs" => {
+                for (n, c) in self.cells.borrow().iter().enumerate() {
+                    let mut shown = Vec::new();
+                    let mut child = c.outputs.first_child();
+                    while let Some(w) = child {
+                        shown.push(describe_output(&w));
+                        child = w.next_sibling();
+                    }
+                    println!("notebook: outputs {n}: {}", shown.join(", "));
+                }
+            }
             v if v.starts_with("focus-") => {
                 if let Some(n) = v[6..].parse().ok().filter(|&n: &usize| n < self.cells.borrow().len()) {
                     self.focus_cell(n);
@@ -1790,8 +1848,25 @@ impl NotebookView {
                 alive &= !matches!(e, Event::Exited | Event::Fatal(_));
                 v.apply(e);
             }
+            v.show_changed();
             if alive { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
         });
+    }
+
+    fn outputs_changed(&self, cell: u64) {
+        let mut unshown = self.unshown.borrow_mut();
+        if !unshown.contains(&cell) {
+            unshown.push(cell);
+        }
+    }
+
+    fn show_changed(&self) {
+        let keys = std::mem::take(&mut *self.unshown.borrow_mut());
+        for key in keys {
+            if let Some(ui) = self.cells.borrow().iter().find(|c| c.key == key) {
+                self.show_outputs(ui);
+            }
+        }
     }
 
     fn apply(&self, event: Event) {
@@ -1844,17 +1919,14 @@ impl NotebookView {
                     crate::alerts::missing(tileide_core::python::install_hint(&module, &python));
                 }
                 with_cell(cell, &|ui| push_output(&mut ui.cell.outputs, output.clone()));
-                if let Some(ui) = self.cells.borrow().iter().find(|c| c.key == cell) {
-                    self.show_outputs(ui);
-                }
+                self.outputs_changed(cell);
             }
             Event::Clear { cell } => {
                 with_cell(cell, &|ui| ui.cell.outputs.clear());
-                if let Some(ui) = self.cells.borrow().iter().find(|c| c.key == cell) {
-                    self.show_outputs(ui);
-                }
+                self.outputs_changed(cell);
             }
             Event::Done { cell } => {
+                self.show_changed();
                 crate::debug::kernel_idle();
                 if let Some(ui) = self.cells.borrow_mut().iter_mut().find(|c| c.key == cell) {
                     ui.took = ui.started.take().map(|s| s.elapsed());
@@ -1931,30 +2003,131 @@ fn output_label(text: &str, error: bool) -> gtk::Label {
     l
 }
 
-/// A text output; past `FOLD_LINES` lines, the first `FOLD_SHOWN` and a button for all.
+/// A text output; past `FOLD_LINES` lines or `FOLD_CHARS` characters, its start and a
+/// button for all.
 fn folded(text: &str) -> gtk::Widget {
-    let lines = text.lines().count();
-    if lines <= FOLD_LINES {
+    let Some(head) = fold_head(text) else {
         return output_label(text, false).upcast();
-    }
-    let head: String = text.lines().take(FOLD_SHOWN).collect::<Vec<_>>().join("\n");
+    };
+    let (lines, chars) = (text.lines().count(), text.chars().count());
+    let size = if lines > 1 { format!("{lines} lines") } else { format!("{chars} characters") };
     let label = output_label(&head, false);
-    let more = gtk::Button::with_label(&format!("Show all {lines} lines"));
+    let more = gtk::Button::with_label(&format!("Show all {size}"));
     more.add_css_class("fold");
     more.set_halign(gtk::Align::Start);
-    let (full, short) = (text.to_string(), head);
+    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    box_.append(&label);
+    let show: Box<dyn Fn(bool)> = if lines > LABEL_LINES || chars > LABEL_CHARS {
+        // Made on the first click: most long outputs are never opened.
+        let (l, b, full, all) = (label.clone(), box_.clone(), text.to_string(), RefCell::new(None::<gtk::Widget>));
+        Box::new(move |on| {
+            l.set_visible(!on);
+            let mut all = all.borrow_mut();
+            let all = all.get_or_insert_with(|| {
+                let w = long_text(&full);
+                b.insert_child_after(&w, Some(&l));
+                w
+            });
+            all.set_visible(on);
+        })
+    } else {
+        let (l, full, short) = (label.clone(), text.to_string(), head);
+        Box::new(move |on| l.set_text(if on { &full } else { &short }))
+    };
     let shown_all = StdCell::new(false);
-    let l = label.clone();
     more.connect_clicked(move |b| {
         let all = !shown_all.get();
         shown_all.set(all);
-        l.set_text(if all { &full } else { &short });
-        b.set_label(&if all { "Show less".to_string() } else { format!("Show all {lines} lines") });
+        show(all);
+        b.set_label(&if all { "Show less".to_string() } else { format!("Show all {size}") });
     });
-    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    box_.append(&label);
     box_.append(&more);
     box_.upcast()
+}
+
+/// What a long text output shows folded (its first `FOLD_SHOWN` lines, at most
+/// `FOLD_CHARS` characters), or `None` when it is short enough to show whole. A label
+/// lays out all its text at once, so one huge line (a long repr) must be cut too.
+fn fold_head(text: &str) -> Option<String> {
+    let head: String = text.lines().take(FOLD_SHOWN).collect::<Vec<_>>().join("\n");
+    let many_lines = text.lines().nth(FOLD_LINES).is_some();
+    let cut = head.char_indices().nth(FOLD_CHARS).map(|(i, _)| i);
+    match cut {
+        Some(i) => Some(format!("{}…", &head[..i])),
+        None if many_lines || text.chars().nth(FOLD_CHARS).is_some() => Some(head),
+        None => None,
+    }
+}
+
+/// `text` with lines longer than `max` characters broken into pieces: a text view lays
+/// out a whole line at once, and an 8 MB line froze it.
+fn break_long_lines(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / max);
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        while let Some((i, _)) = rest.char_indices().nth(max) {
+            out.push_str(&rest[..i]);
+            out.push('\n');
+            rest = &rest[i..];
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
+/// For the `outputs` test verb: an output widget's kind, a table's rows and how many
+/// widgets the output holds.
+fn describe_output(w: &gtk::Widget) -> String {
+    fn count(w: &gtk::Widget) -> usize {
+        let mut n = 1;
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            n += count(&c);
+            child = c.next_sibling();
+        }
+        n
+    }
+    fn find<T: IsA<gtk::Widget>>(w: &gtk::Widget) -> Option<T> {
+        if let Some(t) = w.downcast_ref::<T>() {
+            return Some(t.clone());
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            if let Some(t) = find(&c) {
+                return Some(t);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    let kind = if let Some(view) = find::<gtk::ColumnView>(w) {
+        format!("table list ({} rows)", view.model().map_or(0, |m| m.n_items()))
+    } else if find::<gtk::Grid>(w).is_some() {
+        "table grid".into()
+    } else if find::<gtk::Button>(w).is_some() {
+        "folded text".into()
+    } else {
+        w.type_().name().to_string()
+    };
+    format!("{kind}, {} widgets", count(w))
+}
+
+/// Read-only text that scrolls inside the cell.
+fn long_text(text: &str) -> gtk::Widget {
+    let view = gtk::TextView::new();
+    view.add_css_class("output");
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.buffer().set_text(&break_long_lines(text, LONG_LINE));
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_size_request(-1, LONG_HEIGHT);
+    scroll.set_child(Some(&view));
+    scroll.upcast()
 }
 
 /// Where focus goes in a cell: its editor, or its rendered Markdown.
@@ -2016,9 +2189,38 @@ fn without_links(markup: &str) -> String {
     out.replace("</a>", "")
 }
 
-/// An HTML table output (a DataFrame) as a grid: header rows, the index in bold, zebra
-/// rows; wide tables scroll sideways. pandas' "N rows × M columns" goes under it.
-fn table_widget(table: &tileide_notebook::table::Table) -> gtk::Widget {
+/// An HTML table output (a DataFrame): header rows, the index in bold, zebra rows; wide
+/// tables scroll sideways. pandas' "N rows × M columns" goes under it. `fill`: the table
+/// has a tile to itself and takes its height.
+fn table_widget(table: tileide_notebook::table::Table, fill: bool) -> gtk::Widget {
+    let note = table.note.clone();
+    let scroll = gtk::ScrolledWindow::new();
+    if fill || table.head.len() + table.body.len() > GRID_ROWS {
+        scroll.set_child(Some(&table_list(Rc::new(table))));
+        if fill {
+            scroll.set_vexpand(true);
+        } else {
+            scroll.set_size_request(-1, LONG_HEIGHT);
+        }
+    } else {
+        // Short frames: only width scrolls (the page keeps the wheel).
+        scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_child(Some(&table_grid(&table)));
+    }
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    column.append(&scroll);
+    if let Some(note) = note {
+        let label = gtk::Label::new(Some(&note));
+        label.add_css_class("frame-table-note");
+        label.set_xalign(0.0);
+        column.append(&label);
+    }
+    column.upcast()
+}
+
+/// A short table as a grid, every cell a label.
+fn table_grid(table: &tileide_notebook::table::Table) -> gtk::Grid {
     let grid = gtk::Grid::new();
     grid.add_css_class("frame-table");
     grid.set_halign(gtk::Align::Start);
@@ -2038,20 +2240,49 @@ fn table_widget(table: &tileide_notebook::table::Table) -> gtk::Widget {
             grid.attach(&label, x as i32, y as i32, 1, 1);
         }
     }
-    let scroll = gtk::ScrolledWindow::new();
-    // Pandas already shortens long frames; only width scrolls (the page keeps the wheel).
-    scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
-    scroll.set_propagate_natural_height(true);
-    scroll.set_child(Some(&grid));
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    column.append(&scroll);
-    if let Some(note) = &table.note {
-        let label = gtk::Label::new(Some(note));
-        label.add_css_class("frame-table-note");
-        label.set_xalign(0.0);
-        column.append(&label);
+    grid
+}
+
+/// A long table as a column view: labels exist only for the rows on screen and are
+/// refilled as it scrolls. The header rows become the column titles.
+fn table_list(table: Rc<tileide_notebook::table::Table>) -> gtk::ColumnView {
+    let rows = gtk::gio::ListStore::new::<glib::BoxedAnyObject>();
+    rows.extend_from_slice(&(0..table.body.len()).map(glib::BoxedAnyObject::new).collect::<Vec<_>>());
+    let view = gtk::ColumnView::new(Some(gtk::NoSelection::new(Some(rows))));
+    view.add_css_class("frame-table");
+    view.set_reorderable(false);
+    let width = table.head.iter().chain(&table.body).map(Vec::len).max().unwrap_or(0);
+    for x in 0..width {
+        let title = table.head.iter().filter_map(|r| r.get(x)).map(|c| c.text.as_str()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ");
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let label = gtk::Label::new(None);
+            label.set_selectable(true);
+            label.set_can_focus(false);
+            if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+                item.set_child(Some(&label));
+            }
+        });
+        let t = table.clone();
+        factory.connect_bind(move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+            let (Some(row), Some(label)) = (item.item().and_downcast::<glib::BoxedAnyObject>(), item.child().and_downcast::<gtk::Label>()) else { return };
+            let y = *row.borrow::<usize>();
+            let cell = t.body.get(y).and_then(|r| r.get(x));
+            label.set_text(cell.map_or("", |c| c.text.as_str()));
+            let th = cell.is_some_and(|c| c.header);
+            label.set_xalign(if th { 0.0 } else { 1.0 });
+            for (on, class) in [(th, "th"), (y % 2 == 1, "odd")] {
+                if on {
+                    label.add_css_class(class);
+                } else {
+                    label.remove_css_class(class);
+                }
+            }
+        });
+        view.append_column(&gtk::ColumnViewColumn::new(Some(&title), Some(factory)));
     }
-    column.upcast()
+    view
 }
 
 #[cfg(test)]
@@ -2064,5 +2295,19 @@ mod tests {
         assert_eq!(run_time(Duration::from_millis(85)), "85 ms");
         assert_eq!(run_time(Duration::from_millis(2_440)), "2.4 s");
         assert_eq!(run_time(Duration::from_secs(185)), "3 min 5 s");
+    }
+
+    #[test]
+    fn long_text_folds_by_lines_and_characters() {
+        assert_eq!(fold_head("a\nb"), None);
+        let many: String = (0..100).map(|n| format!("{n}\n")).collect();
+        assert_eq!(fold_head(&many).unwrap().lines().count(), FOLD_SHOWN);
+        // One huge line: cut to FOLD_CHARS characters.
+        let one = "é".repeat(1_000_000);
+        let head = fold_head(&one).unwrap();
+        assert_eq!(head.chars().count(), FOLD_CHARS + 1);
+        assert!(head.ends_with('…'));
+        assert_eq!(break_long_lines("abcdefg\nhi", 3), "abc\ndef\ng\nhi");
+        assert_eq!(break_long_lines(&one, LONG_LINE).lines().count(), 500);
     }
 }

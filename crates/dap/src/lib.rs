@@ -31,6 +31,8 @@ pub struct Plan {
     pub cwd: PathBuf,
     /// The adapter listens on a port it prints (`Session::serve`), not on stdio.
     pub listens: bool,
+    /// The adapter's environment (the project's toolchains; the app sets it).
+    pub env: Vec<(String, String)>,
 }
 
 /// What `plan` may ask about this machine (closures, so tests can fake it).
@@ -81,6 +83,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
         launch: json!({ "program": path(program), "cwd": path(cwd), "stopAtBeginningOfMainSubprogram": false }),
         cwd: cwd.to_path_buf(),
         listens: false,
+        env: Vec::new(),
     };
     let native = |compiler: &str, args: &[&str]| -> Result<Plan, String> {
         if !found("gdb") {
@@ -123,6 +126,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
                 launch: json!({ "program": path(file), "cwd": path(&cwd), "console": "internalConsole", "justMyCode": true, "redirectOutput": true }),
                 cwd,
                 listens: false,
+                env: Vec::new(),
             })
         }
         "java" => {
@@ -133,6 +137,26 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
             }
             let source = std::fs::read_to_string(file).unwrap_or_default();
             let package = jdb::package_of(&source);
+            if let Some(build) = tileide_core::java::build_of(file, host.folder.as_deref()) {
+                let program = build.program();
+                if !program.contains('/') && !found(&program) {
+                    let package = if program == "mvn" { "maven" } else { "gradle" };
+                    return Err(format!("{program} is not installed (this is a {package} project). Install it with: sudo pacman -S {package}"));
+                }
+                let classpath_file = out_dir.join(format!("{stem}-classpath"));
+                let class = package.map_or_else(|| stem.clone(), |p| format!("{p}.{stem}"));
+                let classes: Vec<String> = build.classes().iter().map(|c| path(c)).collect();
+                let roots: Vec<String> = build.source_roots().iter().map(|r| path(r)).collect();
+                return Ok(Plan {
+                    adapter: "jdb".into(),
+                    cmd: vec![path(&host.bridge), "dap-jdb".into()],
+                    build: vec![build.compile(&classpath_file, out_dir)?],
+                    launch: json!({ "mainClass": class, "classPath": classes.join(":"), "classPathFile": path(&classpath_file), "sourceRoot": roots.join(":"), "cwd": path(&build.module) }),
+                    cwd: build.module.clone(),
+                    listens: false,
+                    env: Vec::new(),
+                });
+            }
             let root = jdb::source_root(&cwd, package.as_deref());
             let class = package.map_or_else(|| stem.clone(), |p| format!("{p}.{stem}"));
             let classes = out_dir.join(format!("{stem}-classes"));
@@ -144,6 +168,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
                 launch: json!({ "mainClass": class, "classPath": path(&classes), "sourceRoot": path(&root), "cwd": path(&cwd) }),
                 cwd,
                 listens: false,
+                env: Vec::new(),
             })
         }
         // TypeScript runs as Node runs it (type stripping, Node ≥ 22.6), or through
@@ -162,6 +187,7 @@ pub fn plan(file: &Path, out_dir: &Path, host: &Host) -> Result<Plan, String> {
                 launch: json!({ "type": "pwa-node", "name": stem, "program": path(file), "cwd": path(&cwd), "runtimeExecutable": path(node), "console": "internalConsole", "outputCapture": "std", "skipFiles": ["<node_internals>/**"] }),
                 cwd,
                 listens: true,
+                env: Vec::new(),
             })
         }
         "" => Err("This file has no extension, so TileIDE can't pick a debugger.".into()),
@@ -190,6 +216,7 @@ pub fn plan_launch(launch: &tileide_core::launch::Resolved, out_dir: &Path, host
                     launch: json!({ "program": program.to_string_lossy(), "cwd": cwd.to_string_lossy(), "stopAtBeginningOfMainSubprogram": false }),
                     cwd,
                     listens: false,
+                    env: Vec::new(),
                 }
             }
             other => other?,
@@ -285,11 +312,12 @@ fn send(shared: &Shared, to: &Input, command: &str, arguments: Value) -> Result<
     Ok(seq)
 }
 
-/// Starts `cmd` in `cwd`, ending with TileIDE (and the debuggee with it).
-fn spawn(cmd: &[String], cwd: &Path) -> Result<Child, String> {
+/// Starts `cmd` in `cwd` with `env` (the project's toolchains), ending with TileIDE
+/// (and the debuggee with it).
+fn spawn(cmd: &[String], cwd: &Path, env: &[(String, String)]) -> Result<Child, String> {
     let (program, args) = cmd.split_first().ok_or("empty adapter command")?;
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.args(args).current_dir(cwd).envs(env.iter().map(|(k, v)| (k, v))).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     unsafe {
         use std::os::unix::process::CommandExt;
         command.pre_exec(|| {
@@ -344,8 +372,8 @@ fn start_child(shared: &Arc<Shared>, arguments: &Value) -> Result<(), String> {
 
 impl Session {
     /// Starts the adapter; messages arrive through `deliver` on a reader thread.
-    pub fn start(cmd: &[String], cwd: &Path, deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
-        let mut child = spawn(cmd, cwd)?;
+    pub fn start(cmd: &[String], cwd: &Path, env: &[(String, String)], deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
+        let mut child = spawn(cmd, cwd, env)?;
         let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().ok_or("no stdin")?);
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let shared = Self::read_first(stdin, stdout, deliver, None);
@@ -354,8 +382,8 @@ impl Session {
 
     /// Starts an adapter that listens on a port it prints ("… listening at HOST:PORT",
     /// js-debug's `dapDebugServer.js 0 127.0.0.1`) and connects to it.
-    pub fn serve(cmd: &[String], cwd: &Path, deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
-        let mut child = spawn(cmd, cwd)?;
+    pub fn serve(cmd: &[String], cwd: &Path, env: &[(String, String)], deliver: impl Fn(Incoming) + Send + Sync + 'static) -> Result<Session, String> {
+        let mut child = spawn(cmd, cwd, env)?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         // The adapter writes on: its stdout stays read until it ends.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -500,7 +528,7 @@ mod tests {
         let p = plan_launch(&launch, &dir, &Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None, node: None, js_debug: None }).unwrap();
         assert!(Command::new(&p.build[0][0]).args(&p.build[0][1..]).status().unwrap().success());
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut s = Session::start(&p.cmd, &p.cwd, move |m| {
+        let mut s = Session::start(&p.cmd, &p.cwd, &[], move |m| {
             let _ = tx.send(m);
         })
         .unwrap();
@@ -556,7 +584,7 @@ mod tests {
         let status = Command::new(&p.build[0][0]).args(&p.build[0][1..]).status().unwrap();
         assert!(status.success());
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut s = Session::start(&p.cmd, &p.cwd, move |m| {
+        let mut s = Session::start(&p.cmd, &p.cwd, &[], move |m| {
             let _ = tx.send(m);
         })
         .unwrap();
@@ -603,7 +631,7 @@ mod tests {
         let host = Host { found: &on, pythons: Vec::new(), python_has: &|_, _| false, bridge: PathBuf::new(), folder: None, node: Some(PathBuf::from("node")), js_debug: Some(server) };
         let p = plan(&src, &dir, &host).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut s = Session::serve(&p.cmd, &p.cwd, move |m| {
+        let mut s = Session::serve(&p.cmd, &p.cwd, &[], move |m| {
             let _ = tx.send(m);
         })
         .unwrap();

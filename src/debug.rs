@@ -346,24 +346,27 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked:
     std::thread::spawn(move || {
         let _ = std::fs::create_dir_all(&out_dir);
         let dir = file.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+        let tools = tileide_core::toolchain::env(&dir);
         let host = tileide_dap::Host {
-            found: &tileide_core::run::on_path,
+            found: &|p| tools.find(p).is_some(),
             pythons: tileide_core::python::candidates(&dir, folder.as_deref()),
             python_has: &tileide_core::python::imports,
             bridge: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tileide")),
             folder,
-            node: node(&dir),
+            node: node(&dir, &tools),
             js_debug: tileide_dap::js_debug(std::env::var_os("HOME").map(PathBuf::from).as_deref()),
         };
         let plan = match &config {
             Some(config) => tileide_dap::plan_launch(config, &out_dir, &host),
             None => tileide_dap::plan(&file, &out_dir, &host),
         };
-        let result = plan.map_err(Failure::Missing).and_then(|plan| {
+        let result = plan.map_err(Failure::Missing).and_then(|mut plan| {
+            // A launch config's variables reach the program through the launch request.
+            plan.env = tools.vars.clone();
             let mut log = String::new();
             for step in &plan.build {
                 log += &format!("$ {}\n", step.join(" "));
-                let out = std::process::Command::new(&step[0]).args(&step[1..]).current_dir(&plan.cwd).output().map_err(|e| Failure::Build(format!("cannot run {}: {e}", step[0])))?;
+                let out = tools.apply(&mut std::process::Command::new(&step[0])).args(&step[1..]).current_dir(&plan.cwd).stdin(std::process::Stdio::null()).output().map_err(|e| Failure::Build(format!("cannot run {}: {e}", step[0])))?;
                 log += &tileide_core::run::strip_ansi(&String::from_utf8_lossy(&out.stderr));
                 if !out.status.success() {
                     return Err(Failure::Build(log + "\nThe build failed; fix the errors above and press F5 again.\n"));
@@ -397,10 +400,10 @@ pub fn start_or_continue(file: Option<PathBuf>, folder: Option<PathBuf>, picked:
     });
 }
 
-/// A `node` that runs in `dir`: PATH's first (a mise shim fails outside a project
-/// that pins one), else one from the user's tool folders.
-fn node(dir: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+/// A `node` that runs in `dir`: the project toolchains' first (a mise shim fails
+/// outside a project that pins one), else one from the user's tool folders.
+fn node(dir: &Path, tools: &tileide_core::toolchain::Env) -> Option<PathBuf> {
+    let path = tools.path();
     let user = tileide_lsp::servers::user_dirs(std::env::var_os("HOME").map(PathBuf::from).as_deref());
     path.iter().chain(&user).map(|d| d.join("node")).filter(|n| n.is_file()).find(|n| {
         std::process::Command::new(n).arg("--version").current_dir(dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
@@ -415,7 +418,7 @@ fn launch(plan: Plan) {
     let deliver = move |m: Incoming| {
         glib::MainContext::default().invoke(move || receive(generation, m));
     };
-    let started = if plan.listens { Session::serve(&plan.cmd, &plan.cwd, deliver) } else { Session::start(&plan.cmd, &plan.cwd, deliver) };
+    let started = if plan.listens { Session::serve(&plan.cmd, &plan.cwd, &plan.env, deliver) } else { Session::start(&plan.cmd, &plan.cwd, &plan.env, deliver) };
     let session = match started {
         Ok(s) => s,
         Err(e) => {

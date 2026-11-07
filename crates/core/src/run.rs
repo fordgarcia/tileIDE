@@ -105,6 +105,11 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
     {
         return cargo(root);
     }
+    if ext == "java"
+        && let Some(build) = crate::java::build_of(file, folder)
+    {
+        return java_build(&build, file, out_dir, found);
+    }
     let Some((_, program, steps)) = BUILT_IN.iter().find(|(exts, ..)| exts.contains(&ext.as_str())) else {
         return Err(match ext.as_str() {
             "" => format!("{name}: no extension, so TileIDE doesn't know how to run it. Add one with tileide.runner(\".ext\", \"command {{file}}\")."),
@@ -123,6 +128,30 @@ pub fn plan(file: Option<&Path>, folder: Option<&Path>, runners: &BTreeMap<Strin
         steps[0][0] = python.to_string_lossy().into_owned();
     }
     Ok(Plan { label: name, steps, cwd: dir, env: Vec::new() })
+}
+
+/// A Java file in a Maven or Gradle project: the build compiles it and writes its
+/// classpath, then `java` runs its class with that classpath.
+fn java_build(build: &crate::java::Build, file: &Path, out_dir: &Path, found: impl Fn(&str) -> bool) -> Result<Plan, String> {
+    let program = build.program();
+    if !program.contains('/') && !found(&program) {
+        let package = if program == "mvn" { "maven" } else { "gradle" };
+        return Err(format!("{program} is not installed (this is a {package} project). Install it with: sudo pacman -S {package}"));
+    }
+    if !found("java") {
+        return Err(format!("java is not installed. Install it with: sudo pacman -S {}", package_for("java")));
+    }
+    let stem = file.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let classpath_file = out_dir.join(format!("{stem}-classpath"));
+    let compile = build.compile(&classpath_file, out_dir)?;
+    let source = std::fs::read_to_string(file).unwrap_or_default();
+    let class = crate::java::package_of(&source).map_or_else(|| stem.clone(), |p| format!("{p}.{stem}"));
+    // Quoted parts join into one word: 'classes':"$(cat 'file')".
+    let mut classpath: Vec<String> = build.classes().iter().map(|c| quote(&c.to_string_lossy())).collect();
+    classpath.push(format!("\"$(cat {})\"", quote(&classpath_file.to_string_lossy())));
+    let run = format!("exec java -cp {} {}", classpath.join(":"), quote(&class));
+    let name = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    Ok(Plan { label: name, steps: vec![compile, vec!["sh".into(), "-c".into(), run]], cwd: build.module.clone(), env: Vec::new() })
 }
 
 /// Plans a launch config's run: its program as `plan` would run it (a folder runs its

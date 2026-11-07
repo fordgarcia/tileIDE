@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.2 (2026-11-07): one-line outputs
+
+- **Fixed: opening a notebook with a huge one-line output froze TileIDE** (100% CPU). Text outputs now fold past 3,000 characters as well as past 60 lines ("Show all 8530762 characters"), and the full text view breaks lines longer than 2,000 characters so it lays them out piece by piece. Opening a notebook never runs it; its saved outputs are what get drawn.
+
+## 0.6.1 (2026-11-07): big outputs, auto-save
+
+- **Fixed: huge notebook outputs froze TileIDE.** A DataFrame shown with 100k rows made one widget per cell (hundreds of thousands), held the UI at 100% CPU and blocked Interrupt. Tables over 200 rows now scroll in a list that only builds the rows on screen (420 px tall in a cell; the variable view's table tile uses it too), and a cell's outputs are redrawn at most once per poll instead of once per kernel message.
+- **Changed:** "Show all" on text outputs over 1,000 lines opens a scrolling text view.
+- **Added: auto-save** (Settings → Editor → Auto-save, `tileide.editor { auto_save = true }`, on by default): files and notebooks are written a second after you stop typing. Format on save stays on Ctrl+S; untitled buffers wait for Ctrl+S.
+
+## 0.6.0 (2026-11-06): language parity
+
+The alphas below in one release:
+- **Every first-class language checked** (C/C++, Rust, Java, JavaScript/TypeScript): completion with Tab, signature help, hover, definition, rename, references, formatting, outline and inlay hints. The file tree refreshes on its own.
+- **Linters and formatters per language:** Biome (or ESLint when the project configures it), Clippy, google-java-format, clang-tidy via clangd.
+- **Launch configs** (`Alt+L`) from `tileide.lua` or `.vscode/launch.json`, used by both `Alt+R` and `F5`.
+- **JavaScript and TypeScript debugging** with js-debug (`yay -S vscode-js-debug-bin`).
+- **Toolchains per project:** pin Node.js, Java or Go per workspace with `Alt+P`; mise and asdf versions are used; Java in **Maven and Gradle** projects runs and debugs with the project's classpath.
+- Also: a smooth Gaussian blur, blur over See-through, smoother motion with big files, code colours from the theme, settings fixes.
+
+## 0.6.0-alpha.8 (2026-11-06): toolchains per project, Maven and Gradle
+
+### Added
+- **Pin a toolchain per workspace:** `Alt+P` in a JavaScript/TypeScript, Java or Go file lists the Node.js, JDK or Go installs found (mise, asdf, `/usr/lib/jvm`, `/usr/bin`) and pins one for the workspace; "The project's own" removes the pin. Pins are kept by TileIDE (`~/.local/state/tileide/toolchains`), never written into the project. Language servers in that folder restart with the new version.
+- **mise and asdf awareness:** `Alt+R`, `F5` and language servers run with the folder's tools as mise gives them (`mise env`, so `mise.toml` tools and `[env]` variables apply even when TileIDE starts from the desktop launcher, where mise's shims have no version). Without mise, or for an untrusted mise config, the versions in `.tool-versions` / `mise.toml` are looked up among mise's and asdf's installs. `JAVA_HOME` follows the JDK.
+- **Maven and Gradle projects:** `Alt+R` and `F5` on a Java file inside one compile it with the build (`./mvnw` / `./gradlew` when present, else `mvn` / `gradle`; multi-module builds build only the needed modules) and run or debug its class with the project's classpath, dependencies included. Files under `src/test` get the test classpath.
+- Settings → Toolchains → This project shows pinned or requested Node.js, Java and Go versions.
+
 ## 0.6.0-alpha.7 (2026-11-06): JavaScript and TypeScript debugging
 
 ### Added

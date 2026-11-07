@@ -122,6 +122,7 @@ const SECTIONS: &[(&str, &[Spec])] = &[
         &[
             ("editor.auto_close", "Close brackets and quotes", "Typing ( [ { \" ' adds the closing one; typing it again steps over", "auto pair autoclose brackets parentheses quotes complete"),
             ("editor.match_brackets", "Highlight matching brackets", "The bracket that pairs with the one at the cursor", "bracket match highlight parentheses pair"),
+            ("editor.auto_save", "Auto-save", "Edited files and notebooks are saved a second after you stop typing (without formatting; Ctrl+S still formats)", "auto save autosave write disk automatic"),
             ("editor.format_on_save", "Format on save", "Saving sorts the imports and formats the file first (Python: Ruff)", "format save ruff black organize sort imports isort tidy"),
             ("editor.theme_syntax", "Code colours from the theme", "Keywords, types, strings … in the theme's accent and its neighbouring hues (themes from the theme editor too); off: the terminal's colours", "syntax highlighting code colours theme accent palette match"),
             ("editor.inlay_hints", "Inlay hints", "Inferred types and parameter names at the end of the line (basedpyright, clangd, rust-analyzer; pyright has none)", "inlay hints types inferred parameter names annotations"),
@@ -874,6 +875,25 @@ fn fill_project(page: &gtk::Box, start: &Path, stop: Option<&Path>) {
         path.set_wrap(true);
         path.set_wrap_mode(pango::WrapMode::WordChar);
         row.append(&path);
+        page.append(&row);
+    }
+    // Pinned or asked-for toolchains (from the files and pins, no subprocess either).
+    let requested = tileide_core::toolchain::requested(start, home.as_deref());
+    for tool in tileide_core::toolchain::TOOLS {
+        let text = match tileide_core::toolchain::pinned(start, tool.name) {
+            Some(dir) => format!("pinned: {}", dir.display()),
+            None => match requested.iter().find(|(t, _)| t == tool.name) {
+                Some((_, version)) => format!("{version} (mise or asdf config)"),
+                None => continue,
+            },
+        };
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        row.add_css_class("item");
+        row.append(&label(&format!("{} · Run, debugging, language servers", tool.label), "title"));
+        let detail = label(&format!("{text} · Alt+P in a {} file pins another", tool.label), "subtitle");
+        detail.set_wrap(true);
+        detail.set_wrap_mode(pango::WrapMode::WordChar);
+        row.append(&detail);
         page.append(&row);
     }
     for s in sections {

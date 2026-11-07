@@ -776,6 +776,32 @@ pub fn python_changed(project: &Path) {
     });
 }
 
+/// A toolchain was pinned for `folder`: its language servers restart in the new
+/// environment, and their open files attach to the new ones.
+pub fn toolchain_changed(folder: &Path) {
+    type Reopen = (sourceview5::Buffer, sourceview5::View, PathBuf, PathBuf, Goto, Option<Rc<Cells>>);
+    let (stopped, reopen): (Vec<Server>, Vec<Reopen>) = HUB.with_borrow_mut(|hub| {
+        let ids: Vec<usize> = hub.servers.iter().enumerate().filter(|(_, s)| s.as_ref().is_some_and(|s| s.root.starts_with(folder) || folder.starts_with(&s.root))).map(|(i, _)| i).collect();
+        let reopen = hub
+            .docs
+            .iter()
+            .filter_map(|d| {
+                let root = hub.servers.get(*d.servers.first()?)?.as_ref().filter(|_| ids.contains(&d.servers[0]))?.root.clone();
+                Some((d.buffer.upgrade()?, d.view.upgrade()?, d.path.clone(), root, d.goto.clone(), d.cells.clone()))
+            })
+            .collect();
+        // A server that failed under the old toolchain gets another try.
+        hub.failed.retain(|(root, _)| !(root.starts_with(folder) || folder.starts_with(root)));
+        (ids.iter().filter_map(|&i| hub.servers[i].take()).collect(), reopen)
+    });
+    for server in stopped {
+        server.conn.shutdown(SHUTDOWN_GRACE);
+    }
+    for (buffer, view, path, root, goto, cells) in reopen {
+        attach_doc(&buffer, &view, path, Some(&root), goto, cells);
+    }
+}
+
 fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
     if let Some(i) = hub.servers.iter().position(|s| s.as_ref().is_some_and(|s| s.root == root && s.spec.name == spec.name)) {
         return Some(i);
@@ -818,7 +844,8 @@ fn start(hub: &mut Hub, root: &Path, spec: &'static Spec) -> Option<usize> {
     let id = hub.servers.len();
     let deliver = move |message: Incoming| glib::MainContext::default().invoke(move || receive(id, message));
     println!("lsp: starting {} for {}", cmd.join(" "), root.display());
-    let mut conn = match Connection::spawn(&cmd, root, settings, deliver) {
+    let tools = tileide_core::toolchain::env(root);
+    let mut conn = match Connection::spawn(&cmd, root, &tools.vars, settings, deliver) {
         Ok(conn) => conn,
         Err(e) => {
             hub.failed.insert(key);

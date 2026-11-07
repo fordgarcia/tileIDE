@@ -37,7 +37,7 @@ fn clangd_end_to_end() {
     let text = std::fs::read_to_string(&file).unwrap().replacen("    return 0;", "    int b = undefined_name;\n    return 0;", 1);
 
     let (tx, rx) = mpsc::channel();
-    let mut c = Connection::spawn(&cmd, &fixture, serde_json::Value::Null, move |m| {
+    let mut c = Connection::spawn(&cmd, &fixture, &[], serde_json::Value::Null, move |m| {
         let _ = tx.send(m);
     })
     .unwrap();

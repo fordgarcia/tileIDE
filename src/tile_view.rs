@@ -284,6 +284,37 @@ thread_local! {
     static LIMIT_ALERT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// `editor.format_on_save`.
     static FORMAT_ON_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `editor.auto_save`.
+    static AUTO_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// How long after the last edit auto-save writes.
+pub const AUTO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub fn set_auto_save(on: bool) {
+    AUTO_SAVE.set(on);
+}
+
+pub fn auto_save_on() -> bool {
+    AUTO_SAVE.get()
+}
+
+/// Runs a function once calls have stopped for a while: each call restarts the wait.
+#[derive(Clone, Default)]
+pub struct Debounce(Rc<RefCell<Option<glib::SourceId>>>);
+
+impl Debounce {
+    pub fn call(&self, after: std::time::Duration, f: impl FnOnce() + 'static) {
+        if let Some(pending) = self.0.take() {
+            pending.remove();
+        }
+        let slot = self.0.clone();
+        *self.0.borrow_mut() = Some(glib::timeout_add_local_once(after, move || {
+            // Fired: nothing left to remove.
+            slot.take();
+            f();
+        }));
+    }
 }
 
 pub fn set_limit_alert(on: bool) {
@@ -611,6 +642,7 @@ impl TileView {
             }
             Kind::Editor(path) => {
                 let (scroll, view, buffer) = editor(path, self.wrap, &self.theme);
+                self.auto_save(id, &buffer);
                 (scroll, view, Some(buffer), path.map(Path::to_path_buf))
             }
             Kind::Panel(widget) => {
@@ -841,8 +873,9 @@ impl TileView {
         }
         tile.frame.append(&content);
         tile.input = input;
-        tile.buffer = Some(buffer);
+        tile.buffer = Some(buffer.clone());
         tile.path = Some(path.to_path_buf());
+        self.auto_save(id, &buffer);
         self.attach_lsp(id);
         self.apply_focus(true);
         (self.on_change)();
@@ -937,6 +970,32 @@ impl TileView {
         self.layout.move_focused(direction, self.area, self.gap);
         self.relayout();
         self.apply_focus(true);
+    }
+
+    /// With `editor.auto_save`, tile `id` writes `buffer` to its file once edits pause.
+    /// Untitled buffers wait for Ctrl+S; format on save is left to Ctrl+S (formatting
+    /// while typing would move the text under the cursor).
+    fn auto_save(&self, id: TileId, buffer: &sourceview5::Buffer) {
+        let (me, b, wait) = (self.me.clone(), buffer.downgrade(), Debounce::default());
+        buffer.connect_changed(move |_| {
+            if !AUTO_SAVE.get() {
+                return;
+            }
+            let (me, b) = (me.clone(), b.clone());
+            wait.call(AUTO_SAVE_DELAY, move || {
+                let (Some(view), Some(buffer)) = (me.upgrade(), b.upgrade()) else { return };
+                let Ok(view) = view.try_borrow() else { return };
+                // Still this tile's buffer (not replaced or closed), with a file and edits.
+                if let Some(tile) = view.tiles.get(&id)
+                    && tile.buffer.as_ref() == Some(&buffer)
+                    && let Some(path) = &tile.path
+                    && buffer.is_modified()
+                    && AUTO_SAVE.get()
+                {
+                    write(path, &buffer);
+                }
+            });
+        });
     }
 
     /// Ctrl+S: writes the focused editor to its file; an untitled buffer asks for a path.

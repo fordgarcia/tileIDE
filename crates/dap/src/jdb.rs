@@ -19,28 +19,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use tileide_lsp::rpc::{encode, read_message};
 
-/// The `package` a Java source declares (`package a.b;`), if any.
-pub fn package_of(source: &str) -> Option<String> {
-    let mut in_comment = false;
-    for line in source.lines() {
-        let mut line = line.trim();
-        if in_comment {
-            let Some(end) = line.find("*/") else { continue };
-            line = line[end + 2..].trim();
-            in_comment = false;
-        }
-        if line.starts_with("/*") {
-            in_comment = !line.contains("*/");
-            continue;
-        }
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        let rest = line.strip_prefix("package")?.trim_start();
-        return rest.split(';').next().map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
-    }
-    None
-}
+pub use tileide_core::java::package_of;
 
 /// The source root of a file in `dir` declaring `package`: `dir` without the package's
 /// folders when it ends with them (`src/com/x` for `com.x` → `src`), else `dir`.
@@ -191,7 +170,7 @@ struct Bridge {
     /// The frame jdb's `up`/`down` point at (1 = top).
     frame: i64,
     thread: String,
-    source_root: PathBuf,
+    source_roots: Vec<PathBuf>,
     /// Breakpoints per source file, as jdb names them (`com.x.Main:12`).
     breakpoints: HashMap<String, Vec<String>>,
     refs: BTreeMap<i64, Reference>,
@@ -274,11 +253,13 @@ impl Bridge {
     fn source_of(&self, frame: &Frame) -> Option<PathBuf> {
         let file = frame.file.as_ref()?;
         let package = frame.class.rsplit_once('.').map(|(p, _)| p.replace('.', "/"));
-        let path = match package {
-            Some(p) => self.source_root.join(p).join(file),
-            None => self.source_root.join(file),
-        };
-        path.is_file().then_some(path)
+        self.source_roots
+            .iter()
+            .map(|root| match &package {
+                Some(p) => root.join(p).join(file),
+                None => root.join(file),
+            })
+            .find(|path| path.is_file())
     }
 
     fn frames(&mut self) -> Vec<Frame> {
@@ -412,11 +393,18 @@ impl Bridge {
 
     fn launch(&mut self, args: &Value, tx: Sender<Msg>) -> Result<Value, String> {
         let class = args["mainClass"].as_str().ok_or("no mainClass")?;
-        let classpath = args["classPath"].as_str().unwrap_or(".");
-        self.source_root = PathBuf::from(args["sourceRoot"].as_str().unwrap_or("."));
-        let cwd = args["cwd"].as_str().map_or_else(|| self.source_root.clone(), PathBuf::from);
+        // A build's classpath (Maven, Gradle) is in a file written by its compile step.
+        let mut classpath: Vec<String> = args["classPath"].as_str().filter(|c| !c.is_empty()).map(String::from).into_iter().collect();
+        if let Some(file) = args["classPathFile"].as_str() {
+            classpath.push(std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?.trim().to_string());
+        }
+        let classpath = if classpath.is_empty() { ".".to_string() } else { classpath.join(":") };
+        // `sourceRoot` may list several folders (`a:b`), as jdb's `-sourcepath` does.
+        let roots = args["sourceRoot"].as_str().unwrap_or(".");
+        self.source_roots = std::env::split_paths(roots).collect();
+        let cwd = args["cwd"].as_str().map_or_else(|| self.source_roots[0].clone(), PathBuf::from);
         let mut cmd = Command::new("jdb");
-        cmd.args(["-classpath", classpath, "-sourcepath"]).arg(&self.source_root).arg(class).current_dir(&cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(["-classpath", &classpath, "-sourcepath", roots, class]).current_dir(&cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // A launch config's arguments (after the class, for `main`) and environment.
         cmd.args(args["args"].as_array().into_iter().flatten().filter_map(Value::as_str));
         cmd.envs(args["env"].as_object().into_iter().flatten().filter_map(|(k, v)| Some((k, v.as_str()?))));
@@ -555,7 +543,7 @@ pub fn serve(input: impl Read + Send + 'static, output: impl Write + 'static) {
         state: State::Configuring,
         frame: 1,
         thread: "main".into(),
-        source_root: PathBuf::from("."),
+        source_roots: vec![PathBuf::from(".")],
         breakpoints: HashMap::new(),
         refs: BTreeMap::new(),
         stop: None,
